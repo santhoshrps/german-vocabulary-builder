@@ -5,6 +5,9 @@ interface Env {
 
 const ALLOWED_TABLES = new Set(["verbs", "nouns", "adverbs_adjectives"]);
 
+// Max ids per DELETE statement — keeps bound parameters well under SQLite/D1 limits
+const DELETE_CHUNK_SIZE = 100;
+
 // Fixed column order per table — drives parameterised INSERT, never sourced from user input
 const TABLE_COLUMNS: Record<string, string[]> = {
   verbs: [
@@ -105,7 +108,8 @@ async function handleGetState(table: string, env: Env): Promise<Response> {
       state[row.id] = row.content_hash;
     }
     return json(state);
-  } catch {
+  } catch (err) {
+    console.error("get_state failed", { table, err: String(err) });
     return json({ error: "database error" }, 500);
   }
 }
@@ -129,7 +133,8 @@ async function handlePostSync(
   let body: SyncBody;
   try {
     body = await request.json<SyncBody>();
-  } catch {
+  } catch (err) {
+    console.error("sync invalid JSON body", { table, err: String(err) });
     return json({ error: "invalid JSON body" }, 400);
   }
 
@@ -156,12 +161,15 @@ async function handlePostSync(
     );
   }
 
-  if (body.delete.length > 0) {
-    const idPlaceholders = body.delete.map(() => "?").join(", ");
+  // Chunk deletes into multiple statements so a large deletion never exceeds
+  // SQLite/D1's bound-parameter limit on a single IN (...) clause.
+  for (let i = 0; i < body.delete.length; i += DELETE_CHUNK_SIZE) {
+    const idChunk = body.delete.slice(i, i + DELETE_CHUNK_SIZE);
+    const idPlaceholders = idChunk.map(() => "?").join(", ");
     statements.push(
       env.DB.prepare(
         `DELETE FROM ${table} WHERE id IN (${idPlaceholders})`
-      ).bind(...body.delete)
+      ).bind(...idChunk)
     );
   }
 
@@ -172,7 +180,13 @@ async function handlePostSync(
   try {
     await env.DB.batch(statements);
     return json({ upserted: body.upsert.length, deleted: body.delete.length });
-  } catch {
+  } catch (err) {
+    console.error("sync batch failed", {
+      table,
+      upserts: body.upsert.length,
+      deletes: body.delete.length,
+      err: String(err),
+    });
     return json({ error: "database error" }, 500);
   }
 }

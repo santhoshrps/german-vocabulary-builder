@@ -37,3 +37,7 @@ pip install -r requirements.txt
 
 # 6. Place Excel files in data/ and run
 python sync.py
+
+
+
+Use 'npx wrangler deploy'.
