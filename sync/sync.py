@@ -1,6 +1,7 @@
 import argparse
 import hashlib
 import hmac
+import logging
 import os
 import re
 import sys
@@ -13,6 +14,8 @@ import openpyxl
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
+
+logger = logging.getLogger("sync")
 
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
 API_KEY = os.environ.get("API_KEY", "")
@@ -70,6 +73,26 @@ MAX_RETRIES = 3
 
 class ValidationError(Exception):
     """Raised when an Excel file fails structural or row-level validation."""
+
+
+class _LevelAwareFormatter(logging.Formatter):
+    """Plain message for INFO/DEBUG; level-prefixed for WARNING and above."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+        if record.levelno >= logging.WARNING:
+            return f"[{record.levelname}] {msg}"
+        return msg
+
+
+def _setup_logging(verbose: bool, quiet: bool) -> None:
+    level = logging.DEBUG if verbose else logging.WARNING if quiet else logging.INFO
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_LevelAwareFormatter())
+    logging.basicConfig(level=level, handlers=[handler], force=True)
+    # Keep third-party HTTP libraries quiet even in --verbose mode
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 # ---------------------------------------------------------------------------
@@ -208,9 +231,9 @@ def read_excel(table: str) -> list[dict[str, Any]]:
 
             row_id = compute_id(level_str, str(word_raw))
             if row_id in seen_ids:
-                print(
-                    f"  [WARNING] Row {row_num}: duplicate '{level_raw} + {word_raw}' "
-                    f"after lowercasing — keeping first occurrence"
+                logger.warning(
+                    "Row %d: duplicate '%s + %s' after lowercasing — keeping first occurrence",
+                    row_num, level_raw, word_raw,
                 )
                 continue
 
@@ -267,7 +290,10 @@ def _request_with_retry(call) -> httpx.Response:
             response = call()
             if response.status_code >= 500 and attempt < MAX_RETRIES - 1:
                 wait = 2 ** attempt
-                print(f"  [WARN] Server error {response.status_code}, retrying in {wait}s... ({attempt + 1}/{MAX_RETRIES})")
+                logger.warning(
+                    "Server error %s, retrying in %ds... (%d/%d)",
+                    response.status_code, wait, attempt + 1, MAX_RETRIES,
+                )
                 time.sleep(wait)
                 continue
             return response
@@ -275,7 +301,10 @@ def _request_with_retry(call) -> httpx.Response:
             if attempt == MAX_RETRIES - 1:
                 raise
             wait = 2 ** attempt
-            print(f"  [WARN] {exc.__class__.__name__}, retrying in {wait}s... ({attempt + 1}/{MAX_RETRIES})")
+            logger.warning(
+                "%s, retrying in %ds... (%d/%d)",
+                exc.__class__.__name__, wait, attempt + 1, MAX_RETRIES,
+            )
             time.sleep(wait)
     raise RuntimeError("retry loop exhausted")  # unreachable
 
@@ -333,31 +362,34 @@ def sync_table(
     dry_run: bool,
 ) -> dict[str, int]:
     """Sync one table. Returns counts of inserted, updated, and deleted rows."""
-    print(f"\n[{table}]")
+    logger.info("\n[%s]", table)
 
-    print("  Reading and validating Excel...")
+    logger.debug("  Reading and validating Excel...")
     excel_rows = read_excel(table)
-    print(f"  {len(excel_rows)} valid rows in Excel.")
+    logger.info("  %d valid rows in Excel.", len(excel_rows))
 
-    print("  Fetching DB state...")
+    logger.debug("  Fetching DB state...")
     db_state = get_db_state(client, table)
-    print(f"  {len(db_state)} rows in DB.")
+    logger.info("  %d rows in DB.", len(db_state))
 
     to_insert, to_update, to_delete = compute_diff(excel_rows, db_state)
     counts = {"inserted": len(to_insert), "updated": len(to_update), "deleted": len(to_delete)}
 
-    print(f"  Diff: {counts['inserted']} to add, {counts['updated']} to update, {counts['deleted']} to delete.")
+    logger.info(
+        "  Diff: %d to add, %d to update, %d to delete.",
+        counts["inserted"], counts["updated"], counts["deleted"],
+    )
 
     if not to_insert and not to_update and not to_delete:
-        print("  Already in sync.")
+        logger.info("  Already in sync.")
         return counts
 
     if dry_run:
-        print("  [DRY RUN] No changes written.")
+        logger.info("  [DRY RUN] No changes written.")
         return counts
 
     post_sync(client, table, to_insert + to_update, to_delete)
-    print(f"  Done.")
+    logger.info("  Done.")
     return counts
 
 
@@ -380,23 +412,36 @@ def main() -> None:
         metavar="TABLE",
         help=f"Sync only one table. Choices: {', '.join(TABLE_CONFIG.keys())}.",
     )
+    verbosity = parser.add_mutually_exclusive_group()
+    verbosity.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show debug-level detail (per-step progress).",
+    )
+    verbosity.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        help="Only show warnings and errors (the final summary still prints).",
+    )
     args = parser.parse_args()
+
+    _setup_logging(args.verbose, args.quiet)
 
     missing = [k for k in ("WORKER_URL", "API_KEY") if not os.environ.get(k)]
     if missing:
-        print(f"Error: missing environment variables: {', '.join(missing)}")
-        print("Copy sync/.env.example to sync/.env and fill in the values.")
+        logger.error("Missing environment variables: %s", ", ".join(missing))
+        logger.error("Copy sync/.env.example to sync/.env and fill in the values.")
         sys.exit(1)
 
     if not WORKER_URL.startswith("https://"):
-        print(f"Error: WORKER_URL must use https:// (got {WORKER_URL!r}).")
-        print("Plaintext http would expose signed requests in transit.")
+        logger.error("WORKER_URL must use https:// (got %r).", WORKER_URL)
+        logger.error("Plaintext http would expose signed requests in transit.")
         sys.exit(1)
 
     tables = [args.table] if args.table else list(TABLE_CONFIG.keys())
 
     if args.dry_run:
-        print("[DRY RUN] No changes will be written to the DB.\n")
+        logger.info("[DRY RUN] No changes will be written to the DB.")
 
     totals: dict[str, int] = {"inserted": 0, "updated": 0, "deleted": 0}
     failures: list[str] = []
@@ -406,11 +451,11 @@ def main() -> None:
             try:
                 result = sync_table(client, table, dry_run=args.dry_run)
             except ValidationError as exc:
-                print(f"  [ERROR] {table}: {exc}")
+                logger.error("%s: %s", table, exc)
                 failures.append(table)
                 continue
             except httpx.HTTPError as exc:
-                print(f"  [ERROR] {table}: request failed: {exc}")
+                logger.error("%s: request failed: %s", table, exc)
                 failures.append(table)
                 continue
             for key in totals:

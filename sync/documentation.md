@@ -11,9 +11,30 @@ python sync.py                        # sync all three tables
 python sync.py --table verbs          # sync only verbs
 python sync.py --dry-run              # preview changes without writing to DB
 python sync.py --dry-run --table nouns
+python sync.py -v                     # verbose (per-step debug detail)
+python sync.py -q                     # quiet (warnings + errors + summary only)
 ```
 
 Requires `sync/.env` with `WORKER_URL` and `API_KEY` set (copy from `.env.example`).
+
+### Installing dependencies
+
+Dependencies are pinned in a lockfile for reproducible installs:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+`requirements.in` holds the direct dependencies (human-edited); `requirements.txt`
+is the generated lockfile with every direct and transitive package pinned. To
+change a dependency, edit `requirements.in` and regenerate:
+
+```bash
+pip-compile requirements.in                          # pip-tools
+uv pip compile requirements.in -o requirements.txt   # uv
+```
 
 ---
 
@@ -23,6 +44,13 @@ Requires `sync/.env` with `WORKER_URL` and `API_KEY` set (copy from `.env.exampl
 |------|-------------|
 | `--dry-run` | Fetches DB state and computes the diff, but does not call `POST /sync`. Prints what would be added, updated, and deleted. Safe to run at any time. |
 | `--table TABLE` | Restricts the sync to one table. Choices: `verbs`, `nouns`, `adverbs_adjectives`. |
+| `-v`, `--verbose` | Debug-level output: per-step progress (reading Excel, fetching DB state). |
+| `-q`, `--quiet` | Suppresses progress chatter — only warnings, errors, and the final summary print. Mutually exclusive with `--verbose`. |
+
+Output uses Python's `logging` module. Progress lines go to `INFO` (default) or
+`DEBUG` (`-v`); data warnings (duplicate rows, retries) and failures go to
+`WARNING`/`ERROR` and always show unless overridden. The final summary block is
+always printed regardless of verbosity.
 
 ---
 
