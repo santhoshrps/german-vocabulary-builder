@@ -161,19 +161,35 @@ def read_excel(table: str) -> list[dict[str, Any]]:
             str(c).replace("\xa0", " ").strip() if c is not None else ""
             for c in header_row
         ]
-        if actual != headers:
+        # Drop trailing empty header cells — openpyxl commonly pads the header row.
+        while actual and actual[-1] == "":
+            actual.pop()
+
+        expected_cols = actual[: len(headers)]
+        extra_cols = actual[len(headers):]
+
+        if expected_cols != headers:
             lines = [
                 f"'{filename}' column mismatch:",
                 f"  Expected : {headers}",
                 f"  Got      : {actual}",
             ]
             missing = [h for h in headers if h not in actual]
-            extra = [h for h in actual if h and h not in headers]
+            unexpected = [h for h in expected_cols if h and h not in headers]
             if missing:
                 lines.append(f"  Missing  : {missing}")
-            if extra:
-                lines.append(f"  Unexpected: {extra}")
+            if unexpected:
+                lines.append(f"  Unexpected: {unexpected}")
             raise ValidationError("\n".join(lines))
+
+        # Extra columns beyond the expected set are ignored (only their headers
+        # are noted). Data in these columns is never read — the row loop below
+        # only iterates the expected headers.
+        if extra_cols:
+            logger.warning(
+                "'%s' has %d unrecognised column(s) beyond the expected set — ignoring: %s",
+                filename, len(extra_cols), extra_cols,
+            )
 
         level_idx = headers.index("Level")
         word_idx = headers.index("Word")
