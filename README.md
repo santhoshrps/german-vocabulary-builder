@@ -24,28 +24,28 @@ Script to create the vocabulary from the Excel files in compliance with the data
 
 
 ### 1. Create D1 database 
-wrangler d1 create german-vocabulary
+`wrangler d1 create german-vocabulary`
 
 (copy the database_id into worker/wrangler.toml)
 
 ### 2. Apply schema
-wrangler d1 execute german-vocabulary --file=schema/init.sql
+`wrangler d1 execute german-vocabulary --file=schema/init.sql`
 
 ### 3. Set API key secret
-wrangler secret put API_KEY   
+`wrangler secret put API_KEY`   
 
 (paste output of: openssl rand -hex 32)
 
 ### 4. Deploy worker
-cd worker && npm install && npm run deploy
+`cd worker && npm install && npm run deploy`
 
 ### 5. Set up Python env
-cd ../sync && python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+`cd ../sync && python3 -m venv .venv && source .venv/bin/activate`
+`pip install -r requirements.txt`
 
 ### 6. Place Excel files in data/ and run
-python sync.py
+`python sync.py`
 
 
 
-Use 'npx wrangler deploy'.
+Use `npx wrangler deploy`.
