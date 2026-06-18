@@ -1,22 +1,26 @@
 # german-vocabulary-builder
-Script to create the vocabulary from the CSV files in compliance with the data set in Cloudflare. 
+Script to create the vocabulary from the Excel files in compliance with the data set in Cloudflare. 
 
 
 
 
-Files created:
+## Files created
 
-File	Purpose
-.gitignore	Excludes data/, sync/.env, node_modules, .wrangler
-schema/init.sql	D1 schema for all 3 tables
-worker/wrangler.toml	Wrangler config — fill in your database_id
-worker/package.json	Worker deps (wrangler, typescript, workers-types)
-worker/tsconfig.json	TS config for Workers runtime
-worker/src/index.ts	Worker API — auth, GET /state/:table, POST /sync/:table
-sync/requirements.txt	Python deps
-sync/.env.example	Env var template
-sync/sync.py	Main sync script
-To get started:
+| File | Purpose |
+|------|---------|
+| `.gitignore` | Excludes `data/`, `sync/.env`, `node_modules`, `.wrangler` |
+| `schema/init.sql` | D1 schema for all 3 tables |
+| `worker/wrangler.toml` | Wrangler config — fill in your `database_id` |
+| `worker/package.json` | Worker deps (wrangler, typescript, workers-types) |
+| `worker/tsconfig.json` | TS config for Workers runtime |
+| `worker/src/index.ts` | Worker API — HMAC auth, `GET /state/:table`, `POST /sync/:table` |
+| `sync/sync.py` | Main sync script |
+| `sync/requirements.in` | Direct Python dependencies (source) |
+| `sync/requirements.txt` | Pinned dependency lockfile |
+| `sync/.env.example` | Env var template |
+| `sync/documentation.md` | How the sync script works |
+
+## To get started
 
 
 # 1. Create D1 database (copy the database_id into worker/wrangler.toml)
