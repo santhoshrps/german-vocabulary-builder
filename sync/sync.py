@@ -68,6 +68,10 @@ UPSERT_CHUNK_SIZE = 200
 MAX_RETRIES = 3
 
 
+class ValidationError(Exception):
+    """Raised when an Excel file fails structural or row-level validation."""
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -102,130 +106,131 @@ def compute_content_hash(row: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 def read_excel(table: str) -> list[dict[str, Any]]:
+    """Read and validate the Excel file for a table.
+
+    Raises ValidationError on any structural or row-level problem.
+    """
     filename, headers = TABLE_CONFIG[table]
     path = DATA_DIR / filename
 
     if not path.exists():
-        print(f"[ERROR] '{filename}' not found at {path}")
-        sys.exit(1)
+        raise ValidationError(f"'{filename}' not found at {path}")
 
     wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-
-    # Multiple sheets → abort: only one sheet is expected
-    if len(wb.sheetnames) > 1:
-        print(f"[ERROR] '{filename}' has multiple sheets: {wb.sheetnames}")
-        print(f"        Remove all but one sheet and retry.")
-        wb.close()
-        sys.exit(1)
-
-    ws = wb.active
-    rows_iter = ws.iter_rows(values_only=True)
-
-    # Read and validate the header row
     try:
-        header_row = next(rows_iter)
-    except StopIteration:
-        print(f"[ERROR] '{filename}' is completely empty.")
-        wb.close()
-        sys.exit(1)
-
-    actual = [
-        str(c).replace("\xa0", " ").strip() if c is not None else ""
-        for c in header_row
-    ]
-    if actual != headers:
-        print(f"[ERROR] '{filename}' column mismatch — aborting.")
-        print(f"  Expected : {headers}")
-        print(f"  Got      : {actual}")
-        missing = [h for h in headers if h not in actual]
-        extra = [h for h in actual if h and h not in headers]
-        if missing:
-            print(f"  Missing  : {missing}")
-        if extra:
-            print(f"  Unexpected: {extra}")
-        wb.close()
-        sys.exit(1)
-
-    level_idx = headers.index("Level")
-    word_idx = headers.index("Word")
-    image_idx = headers.index("Image") if "Image" in headers else -1
-
-    rows: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    validation_errors: list[str] = []
-
-    for row_num, raw_row in enumerate(rows_iter, start=2):  # row 1 is the header
-        # Silently skip completely blank rows
-        if all(_clean(c) is None for c in raw_row):
-            continue
-
-        # Build record — coerce unexpected types (datetime, float) to string
-        image_raw: Any = raw_row[image_idx] if image_idx >= 0 and image_idx < len(raw_row) else None
-        record: dict[str, Any] = {}
-        for j, header in enumerate(headers):
-            db_col = _db_col(header)
-            val = _clean(raw_row[j] if j < len(raw_row) else None)
-            if val is not None and not isinstance(val, str):
-                val = str(val)
-            record[db_col] = val
-
-        # Image is a boolean — handle separately so it stays 0/1
-        if table == "nouns":
-            record["image"] = 1 if image_raw else 0
-
-        # Collect all validation errors for this row before skipping
-        row_errors: list[str] = []
-
-        level_raw = _clean(raw_row[level_idx] if level_idx < len(raw_row) else None)
-        word_raw = _clean(raw_row[word_idx] if word_idx < len(raw_row) else None)
-        level_str = str(level_raw) if level_raw is not None else ""
-
-        if not level_str:
-            row_errors.append(f"  Row {row_num}: 'Level' is empty")
-        elif not VALID_LEVEL.match(level_str):
-            row_errors.append(
-                f"  Row {row_num}: invalid Level {level_str!r} "
-                f"(must be A1/A2/B1/B2/C1/C2, optionally followed by .1 or .2)"
+        # Multiple sheets → abort: only one sheet is expected
+        if len(wb.sheetnames) > 1:
+            raise ValidationError(
+                f"'{filename}' has multiple sheets: {wb.sheetnames}\n"
+                f"  Remove all but one sheet and retry."
             )
 
-        if not word_raw:
-            row_errors.append(f"  Row {row_num}: 'Word' is empty")
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
 
-        for field in REQUIRED_FIELDS[table]:
-            if not record.get(field):
-                label = repr(word_raw) if word_raw else "(unknown word)"
-                row_errors.append(f"  Row {row_num}: required field '{field}' is empty (word={label})")
+        # Read and validate the header row
+        try:
+            header_row = next(rows_iter)
+        except StopIteration:
+            raise ValidationError(f"'{filename}' is completely empty.")
 
-        if row_errors:
-            validation_errors.extend(row_errors)
-            continue
+        actual = [
+            str(c).replace("\xa0", " ").strip() if c is not None else ""
+            for c in header_row
+        ]
+        if actual != headers:
+            lines = [
+                f"'{filename}' column mismatch:",
+                f"  Expected : {headers}",
+                f"  Got      : {actual}",
+            ]
+            missing = [h for h in headers if h not in actual]
+            extra = [h for h in actual if h and h not in headers]
+            if missing:
+                lines.append(f"  Missing  : {missing}")
+            if extra:
+                lines.append(f"  Unexpected: {extra}")
+            raise ValidationError("\n".join(lines))
 
-        row_id = compute_id(level_str, str(word_raw))
-        if row_id in seen_ids:
-            print(
-                f"  [WARNING] Row {row_num}: duplicate '{level_raw} + {word_raw}' "
-                f"after lowercasing — keeping first occurrence"
+        level_idx = headers.index("Level")
+        word_idx = headers.index("Word")
+        image_idx = headers.index("Image") if "Image" in headers else -1
+
+        rows: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        validation_errors: list[str] = []
+
+        for row_num, raw_row in enumerate(rows_iter, start=2):  # row 1 is the header
+            # Silently skip completely blank rows
+            if all(_clean(c) is None for c in raw_row):
+                continue
+
+            # Build record — coerce unexpected types (datetime, float) to string
+            image_raw: Any = raw_row[image_idx] if image_idx >= 0 and image_idx < len(raw_row) else None
+            record: dict[str, Any] = {}
+            for j, header in enumerate(headers):
+                db_col = _db_col(header)
+                val = _clean(raw_row[j] if j < len(raw_row) else None)
+                if val is not None and not isinstance(val, str):
+                    val = str(val)
+                record[db_col] = val
+
+            # Image is a boolean — handle separately so it stays 0/1
+            if table == "nouns":
+                record["image"] = 1 if image_raw else 0
+
+            # Collect all validation errors for this row before skipping
+            row_errors: list[str] = []
+
+            level_raw = _clean(raw_row[level_idx] if level_idx < len(raw_row) else None)
+            word_raw = _clean(raw_row[word_idx] if word_idx < len(raw_row) else None)
+            level_str = str(level_raw) if level_raw is not None else ""
+
+            if not level_str:
+                row_errors.append(f"  Row {row_num}: 'Level' is empty")
+            elif not VALID_LEVEL.match(level_str):
+                row_errors.append(
+                    f"  Row {row_num}: invalid Level {level_str!r} "
+                    f"(must be A1/A2/B1/B2/C1/C2, optionally followed by .1 or .2)"
+                )
+
+            if not word_raw:
+                row_errors.append(f"  Row {row_num}: 'Word' is empty")
+
+            for field in REQUIRED_FIELDS[table]:
+                if not record.get(field):
+                    label = repr(word_raw) if word_raw else "(unknown word)"
+                    row_errors.append(f"  Row {row_num}: required field '{field}' is empty (word={label})")
+
+            if row_errors:
+                validation_errors.extend(row_errors)
+                continue
+
+            row_id = compute_id(level_str, str(word_raw))
+            if row_id in seen_ids:
+                print(
+                    f"  [WARNING] Row {row_num}: duplicate '{level_raw} + {word_raw}' "
+                    f"after lowercasing — keeping first occurrence"
+                )
+                continue
+
+            seen_ids.add(row_id)
+            record["id"] = row_id
+            record["content_hash"] = compute_content_hash(record)
+            rows.append(record)
+
+        if validation_errors:
+            raise ValidationError(
+                f"'{filename}' has {len(validation_errors)} validation error(s):\n"
+                + "\n".join(validation_errors)
             )
-            continue
 
-        seen_ids.add(row_id)
-        record["id"] = row_id
-        record["content_hash"] = compute_content_hash(record)
-        rows.append(record)
+        if not rows:
+            raise ValidationError(f"'{filename}' contains no valid data rows.")
 
-    wb.close()
-
-    if validation_errors:
-        print(f"[ERROR] '{filename}' has {len(validation_errors)} validation error(s) — aborting:")
-        for err in validation_errors:
-            print(err)
-        sys.exit(1)
-
-    if not rows:
-        print(f"[ERROR] '{filename}' contains no valid data rows — aborting.")
-        sys.exit(1)
-
-    return rows
+        return rows
+    finally:
+        wb.close()
 
 
 # ---------------------------------------------------------------------------
@@ -384,10 +389,20 @@ def main() -> None:
         print("[DRY RUN] No changes will be written to the DB.\n")
 
     totals: dict[str, int] = {"inserted": 0, "updated": 0, "deleted": 0}
+    failures: list[str] = []
 
     with httpx.Client(event_hooks={"request": [_sign_request]}) as client:
         for table in tables:
-            result = sync_table(client, table, dry_run=args.dry_run)
+            try:
+                result = sync_table(client, table, dry_run=args.dry_run)
+            except ValidationError as exc:
+                print(f"  [ERROR] {table}: {exc}")
+                failures.append(table)
+                continue
+            except httpx.HTTPError as exc:
+                print(f"  [ERROR] {table}: request failed: {exc}")
+                failures.append(table)
+                continue
             for key in totals:
                 totals[key] += result[key]
 
@@ -397,7 +412,12 @@ def main() -> None:
     print(f"  Added   : {totals['inserted']}")
     print(f"  Updated : {totals['updated']}")
     print(f"  Deleted : {totals['deleted']}")
+    if failures:
+        print(f"  Failed  : {len(failures)} table(s) — {', '.join(failures)}")
     print(f"{'─' * 44}")
+
+    if failures:
+        sys.exit(1)
     if not args.dry_run:
         print("Sync complete.")
 
