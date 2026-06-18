@@ -1,0 +1,11 @@
+data/
+sync/.env
+node_modules/
+worker/node_modules/
+sync/.venv/
+__pycache__/
+*.pyc
+.wrangler/
+.claude
+.venv/
+.DS_Store
