@@ -388,6 +388,11 @@ def main() -> None:
         print("Copy sync/.env.example to sync/.env and fill in the values.")
         sys.exit(1)
 
+    if not WORKER_URL.startswith("https://"):
+        print(f"Error: WORKER_URL must use https:// (got {WORKER_URL!r}).")
+        print("Plaintext http would expose signed requests in transit.")
+        sys.exit(1)
+
     tables = [args.table] if args.table else list(TABLE_CONFIG.keys())
 
     if args.dry_run:

@@ -147,6 +147,18 @@ async function handlePostSync(
     return json({ error: "body must have upsert and delete arrays" }, 400);
   }
 
+  // Each upsert row must be a plain object; each delete id must be a string.
+  // Without this, a malformed element reaches .bind() and surfaces as an opaque 500.
+  const isPlainObject = (v: unknown): v is SyncRow =>
+    typeof v === "object" && v !== null && !Array.isArray(v);
+
+  if (!body.upsert.every(isPlainObject)) {
+    return json({ error: "every upsert entry must be an object" }, 400);
+  }
+  if (!body.delete.every((id) => typeof id === "string")) {
+    return json({ error: "every delete entry must be a string" }, 400);
+  }
+
   const columns = TABLE_COLUMNS[table];
   const placeholders = columns.map(() => "?").join(", ");
   const updateSet = columns
