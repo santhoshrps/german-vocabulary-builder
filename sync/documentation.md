@@ -158,9 +158,16 @@ Every request is signed with HMAC-SHA256. The raw `API_KEY` secret **never trave
 For each outgoing request, `_sign_request` computes:
 
 ```
-canonical = METHOD + "\n" + URL + "\n" + TIMESTAMP + "\n" + SHA256(body_bytes)
+canonical = METHOD + "\n" + PATH + "\n" + TIMESTAMP + "\n" + SHA256(body_bytes)
 signature = HMAC-SHA256(API_KEY, canonical)
 ```
+
+`PATH` is the request path and query string only (e.g. `/state/verbs`) — **not** the
+full URL. Scheme, host, and port are deliberately excluded so that proxy
+normalisation, trailing-slash handling, or default-port differences between the
+client and the Worker can never silently break signature verification. The client
+derives it from `request.url.raw_path`; the Worker derives the identical string
+from `url.pathname + url.search`.
 
 Two headers are added to the request:
 

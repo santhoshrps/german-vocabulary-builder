@@ -240,13 +240,18 @@ def read_excel(table: str) -> list[dict[str, Any]]:
 def _sign_request(request: httpx.Request) -> None:
     """Sign every outgoing request with HMAC-SHA256.
 
-    Canonical string: METHOD\\nURL\\nTIMESTAMP\\nSHA256(body_bytes)
+    Canonical string: METHOD\\nPATH\\nTIMESTAMP\\nSHA256(body_bytes)
+    PATH is the request path + query string only (e.g. "/state/verbs") — not the
+    full URL. The scheme/host/port are excluded so that proxy normalisation,
+    trailing-slash, or default-port differences between client and Worker can
+    never silently break signature verification.
     The raw API_KEY never travels over the wire — only the signed digest does.
     The Worker rejects signatures with a timestamp older than 5 minutes.
     """
     timestamp = str(int(time.time()))
     body_hash = hashlib.sha256(request.content).hexdigest()
-    canonical = f"{request.method}\n{request.url}\n{timestamp}\n{body_hash}"
+    path = request.url.raw_path.decode("ascii")  # path + query, e.g. "/sync/verbs"
+    canonical = f"{request.method}\n{path}\n{timestamp}\n{body_hash}"
     signature = hmac.new(API_KEY.encode(), canonical.encode(), hashlib.sha256).hexdigest()
     request.headers["X-Timestamp"] = timestamp
     request.headers["X-Signature"] = signature

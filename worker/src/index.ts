@@ -65,7 +65,12 @@ async function verifyHmac(request: Request, env: Env): Promise<Response | null> 
   const bodyText = await request.clone().text();
   const bodyHash = bytesToHex(await crypto.subtle.digest("SHA-256", enc.encode(bodyText)));
 
-  const canonical = `${request.method}\n${request.url}\n${timestamp}\n${bodyHash}`;
+  // Sign path + query only (e.g. "/sync/verbs") — never scheme/host/port — so
+  // proxy or normalisation differences can't break verification. Must match the
+  // client's signing input exactly (sync.py _sign_request).
+  const sigUrl = new URL(request.url);
+  const path = `${sigUrl.pathname}${sigUrl.search}`;
+  const canonical = `${request.method}\n${path}\n${timestamp}\n${bodyHash}`;
 
   const key = await crypto.subtle.importKey(
     "raw",
