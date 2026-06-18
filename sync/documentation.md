@@ -7,76 +7,120 @@ Reads the three local Excel files and synchronises their contents into the Cloud
 ```bash
 cd sync
 source .venv/bin/activate
-python sync.py
+python sync.py                        # sync all three tables
+python sync.py --table verbs          # sync only verbs
+python sync.py --dry-run              # preview changes without writing to DB
+python sync.py --dry-run --table nouns
 ```
 
 Requires `sync/.env` with `WORKER_URL` and `API_KEY` set (copy from `.env.example`).
 
 ---
 
+## Flags
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Fetches DB state and computes the diff, but does not call `POST /sync`. Prints what would be added, updated, and deleted. Safe to run at any time. |
+| `--table TABLE` | Restricts the sync to one table. Choices: `verbs`, `nouns`, `adverbs_adjectives`. |
+
+---
+
 ## Sync Flow (per table)
 
 ```
-Excel file  ──read──▶  compute IDs & hashes
-                              │
-                              ▼
-DB (via Worker) ──fetch──▶  { id: content_hash }
-                              │
-                              ▼
-                          diff
-                         /    \
-                    upsert    delete
-                         \    /
-                          POST /sync/:table
+Excel file  ──read + validate──▶  rows with IDs and hashes
+                                          │
+                                          ▼
+DB (via Worker)  ──fetch──▶  { id: content_hash }
+                                          │
+                                          ▼
+                                       diff
+                                   ┌────┴────┐
+                               insert/update  delete
+                                   └────┬────┘
+                                        ▼
+                               POST /sync/:table
+                               (skipped on --dry-run)
 ```
 
-### Step 1 — Read Excel
+### Step 1 — Read and validate Excel
 
-`read_excel(table)` opens the `.xlsx` file with openpyxl and builds a list of row dicts using the column headers defined in `TABLE_CONFIG`. It:
+`read_excel(table)` opens the `.xlsx` file and validates it before processing any rows. The following issues cause an immediate abort:
 
-- Skips the first row (headers) and any rows where `Level` or `Word` is blank (guards against trailing empty rows).
-- Strips leading/trailing whitespace from all string values.
-- Normalises the `Image` column for nouns to `1`/`0` (boolean stored as integer).
-- Warns and skips duplicate rows that produce the same ID (same level + word after lowercasing).
+| Issue | Behaviour |
+|-------|-----------|
+| File not found | Error + abort |
+| More than one sheet | Error + abort (remove extra sheets) |
+| File is completely empty | Error + abort |
+| Header row doesn't match expected columns exactly | Error + abort (lists missing and unexpected columns) |
+| Any data row has validation errors (see below) | All errors listed, then abort |
+| No valid rows after parsing | Error + abort |
 
-### Step 2 — Compute row identity and content hash
+For each data row:
+- **Non-breaking spaces** (`\xa0`) are stripped alongside regular whitespace, so visually identical cells that differ only in invisible characters are treated as equal.
+- **Blank rows** (every cell empty) are silently skipped.
+- **Unexpected cell types** (datetime, float from formula results) are coerced to their string representation.
+- **Image column** (nouns only) is treated as a boolean: any truthy value → `1`, empty/False → `0`.
 
-Each row gets two derived fields:
+### Step 2 — Row-level validation
+
+Validation errors are collected for all rows and reported together before aborting, so you see every problem in one run.
+
+**Level** must be one of `A1 A2 B1 B2 C1 C2` with an optional sub-level suffix `.1` or `.2`:
+
+```
+A1   A1.1   A1.2
+B2   B2.1   B2.2
+C1   C1.1   C1.2   ... etc.
+```
+
+**Required fields per table** (must be non-empty):
+
+| Table | Required fields |
+|-------|-----------------|
+| verbs | Type, Word, English, German_Sentence, English_Sentence |
+| nouns | Type, Article, Word, English, German_Sentence, English_Sentence |
+| adverbs_adjectives | Type, Word, English, German_Sentence, English_Sentence |
+
+### Step 3 — Compute row identity and content hash
+
+Each valid row gets two derived fields:
 
 **`id`** — a stable 16-character hex string uniquely identifying the row:
 ```
 id = sha256(lower(level) + "|" + lower(word))[:16]
 ```
-The same word at the same level always produces the same `id`, regardless of any other field values. A word at A1 and the same word at B2 are two distinct rows.
+The same word at the same level always produces the same `id`. A word at A1 and the same word at B2 are two distinct rows.
 
 **`content_hash`** — a fingerprint of all field values:
 ```
 content_hash = sha256(field1_value + "|" + field2_value + ...)
 ```
-Fields are sorted alphabetically by key before concatenation so the hash is always stable. `None` values are treated as empty strings.
+Fields are sorted alphabetically by key before concatenation so the hash is always stable regardless of dict insertion order. `None` values are treated as empty strings.
 
-### Step 3 — Fetch DB state
+### Step 4 — Fetch DB state
 
 `GET /state/:table` returns a flat map of every row currently in the DB:
 ```json
 { "<id>": "<content_hash>", ... }
 ```
-This is cheap: only IDs and hashes are transferred, not full row data.
+Only IDs and hashes are transferred, not full row data.
 
-### Step 4 — Diff
+### Step 5 — Diff
 
-`compute_diff` compares the Excel rows against the DB state:
+`compute_diff` compares Excel rows against the DB state, distinguishing three cases:
 
 | Situation | Action |
 |-----------|--------|
-| `id` is in Excel but **not** in DB | **Add** — row is new |
-| `id` is in both, but `content_hash` differs | **Update** — a field value changed |
-| `id` is in DB but **not** in Excel | **Delete** — row was removed from the file |
-| `id` is in both and hashes match | **Skip** — no change |
+| `id` in Excel, not in DB | **Insert** — new word |
+| `id` in both, `content_hash` differs | **Update** — a field changed |
+| `id` in DB, not in Excel | **Delete** — word removed |
+| `id` in both, hashes match | **Skip** — no change |
 
-Additions and updates are handled identically: both become an upsert (`INSERT … ON CONFLICT DO UPDATE`). The DB never needs to know whether it's a new row or a changed one.
+Inserts and updates are combined into a single upsert list (`INSERT … ON CONFLICT DO UPDATE`). The DB does not need to know which is which.
 
-### Step 5 — Apply changes
+### Step 6 — Apply changes
 
 `POST /sync/:table` sends:
 ```json
@@ -86,7 +130,22 @@ Additions and updates are handled identically: both become an upsert (`INSERT �
 }
 ```
 
-Upserts and deletes are executed as a single atomic D1 batch — either all succeed or none do. Large upsert sets are split into chunks of 200 rows to stay within D1's batch statement limit; deletes are always sent in the first chunk.
+Upserts and deletes run as a single atomic D1 batch. Large upsert sets are split into chunks of 200 rows to stay within D1's batch limit; deletes are always sent in the first chunk.
+
+This step is skipped entirely when `--dry-run` is active.
+
+---
+
+## What triggers each operation
+
+| You do this in Excel | sync.py does this |
+|----------------------|-------------------|
+| Add a new row | Inserts it into the DB |
+| Delete a row | Removes it from the DB |
+| Change any field in a row | Updates that row (all columns overwritten) |
+| Move a word to a different level | Old level+word is deleted; new one is inserted |
+| Rename a word | Old id is deleted; new id is inserted |
+| Run with no changes | Nothing sent to the DB |
 
 ---
 
@@ -112,9 +171,9 @@ Two headers are added to the request:
 
 ### How the Worker verifies
 
-1. **Presence check** — rejects immediately if either header is missing.
-2. **Replay window** — rejects if `|now - X-Timestamp| > 300 seconds` (5 minutes). An intercepted request is useless after this window.
-3. **Signature check** — recomputes the canonical string from the live request and compares the expected HMAC against `X-Signature` using a timing-safe byte comparison. Any mismatch returns `401`.
+1. **Presence check** — rejects if either header is missing.
+2. **Replay window** — rejects if `|now − X-Timestamp| > 300 seconds` (5 minutes). An intercepted request is useless after this window.
+3. **Signature check** — recomputes the canonical string and compares the expected HMAC against `X-Signature` using a timing-safe byte comparison.
 
 ### Why this is stronger than a static key
 
@@ -122,20 +181,29 @@ Two headers are added to the request:
 |--------------------|-------------|
 | Key travels in every request | Key never leaves the local machine |
 | Intercepted request replayable forever | Intercepted request expires in 5 minutes |
-| Compromised in transit = full access | Compromised signature = one request, already expired |
 
 ---
 
-## What triggers each operation
+## Retry on network errors
 
-| You do this in Excel | sync.py does this |
-|----------------------|-------------------|
-| Add a new row | Inserts it into the DB |
-| Delete a row | Removes it from the DB |
-| Change any field in a row | Updates that row in the DB (all columns are overwritten) |
-| Move a word to a different level | The old level+word combination is deleted; the new one is inserted (level is part of the ID) |
-| Rename a word | Same as above — old ID is deleted, new ID is inserted |
-| Run with no changes | Nothing sent to the DB |
+HTTP calls to the Worker are wrapped with `_request_with_retry`. On a network error (`NetworkError`, `TimeoutException`) or a 5xx response, the call is retried up to `MAX_RETRIES` (3) times with exponential backoff: 1 s, 2 s, 4 s. 4xx errors (auth failure, bad request) are not retried.
+
+---
+
+## Summary output
+
+At the end of every run, a summary is printed across all synced tables:
+
+```
+────────────────────────────────────────────
+Summary
+  Added   : 12
+  Updated : 3
+  Deleted : 1
+────────────────────────────────────────────
+```
+
+With `--dry-run`, the header says `Summary (dry run — no changes written)`.
 
 ---
 
@@ -144,6 +212,7 @@ Two headers are added to the request:
 | Variable | File | Purpose |
 |----------|------|---------|
 | `WORKER_URL` | `sync/.env` | Base URL of the deployed Cloudflare Worker |
-| `API_KEY` | `sync/.env` | Secret that authorises requests to the Worker |
+| `API_KEY` | `sync/.env` | Secret used to sign requests (never sent raw) |
 | `DATA_DIR` | hardcoded | Parent directory's `data/` folder |
 | `UPSERT_CHUNK_SIZE` | hardcoded (200) | Max rows per DB batch call |
+| `MAX_RETRIES` | hardcoded (3) | Max retry attempts on transient errors |

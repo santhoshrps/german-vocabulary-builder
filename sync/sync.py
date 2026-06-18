@@ -1,6 +1,8 @@
+import argparse
 import hashlib
 import hmac
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -12,11 +14,10 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
-WORKER_URL = os.environ["WORKER_URL"].rstrip("/")
-API_KEY = os.environ["API_KEY"]
+WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
+API_KEY = os.environ.get("API_KEY", "")
 DATA_DIR = Path(__file__).parent.parent / "data"
 
-# Table name → (xlsx filename, Excel column headers in order)
 TABLE_CONFIG: dict[str, tuple[str, list[str]]] = {
     "verbs": (
         "verbs.xlsx",
@@ -43,7 +44,6 @@ TABLE_CONFIG: dict[str, tuple[str, list[str]]] = {
     ),
 }
 
-# Excel header → DB column name for headers that don't simply .lower() correctly
 HEADER_TO_DB: dict[str, str] = {
     "sie_Sie": "sie_sie",
     "German_Sentence": "german_sentence",
@@ -54,11 +54,33 @@ HEADER_TO_DB: dict[str, str] = {
     "Superlative": "superlative",
 }
 
-UPSERT_CHUNK_SIZE = 200
+# Required DB column names that must be non-empty for each table
+REQUIRED_FIELDS: dict[str, list[str]] = {
+    "verbs": ["type", "english", "german_sentence", "english_sentence"],
+    "nouns": ["type", "article", "english", "german_sentence", "english_sentence"],
+    "adverbs_adjectives": ["type", "english", "german_sentence", "english_sentence"],
+}
 
+# A1, A2, B1, B2, C1, C2 with optional .1 or .2 sub-level
+VALID_LEVEL = re.compile(r"^(A1|A2|B1|B2|C1|C2)(\.[12])?$")
+
+UPSERT_CHUNK_SIZE = 200
+MAX_RETRIES = 3
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _db_col(header: str) -> str:
     return HEADER_TO_DB.get(header, header.lower())
+
+
+def _clean(value: Any) -> Any:
+    """Strip regular and non-breaking whitespace from strings; return None for empty."""
+    if isinstance(value, str):
+        return value.replace("\xa0", " ").strip() or None
+    return value
 
 
 def compute_id(level: str, word: str) -> str:
@@ -67,7 +89,6 @@ def compute_id(level: str, word: str) -> str:
 
 
 def compute_content_hash(row: dict[str, Any]) -> str:
-    # Sort keys alphabetically for a stable, reproducible order
     concatenated = "|".join(
         str(row[k]) if row[k] is not None else ""
         for k in sorted(row.keys())
@@ -76,57 +97,114 @@ def compute_content_hash(row: dict[str, Any]) -> str:
     return hashlib.sha256(concatenated.encode()).hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# Excel reading and validation
+# ---------------------------------------------------------------------------
+
 def read_excel(table: str) -> list[dict[str, Any]]:
     filename, headers = TABLE_CONFIG[table]
     path = DATA_DIR / filename
+
     if not path.exists():
-        print(f"  [WARNING] {path} not found — skipping table '{table}'")
-        return []
+        print(f"[ERROR] '{filename}' not found at {path}")
+        sys.exit(1)
+
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+
+    # Multiple sheets → abort: only one sheet is expected
+    if len(wb.sheetnames) > 1:
+        print(f"[ERROR] '{filename}' has multiple sheets: {wb.sheetnames}")
+        print(f"        Remove all but one sheet and retry.")
+        wb.close()
+        sys.exit(1)
+
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+
+    # Read and validate the header row
+    try:
+        header_row = next(rows_iter)
+    except StopIteration:
+        print(f"[ERROR] '{filename}' is completely empty.")
+        wb.close()
+        sys.exit(1)
+
+    actual = [
+        str(c).replace("\xa0", " ").strip() if c is not None else ""
+        for c in header_row
+    ]
+    if actual != headers:
+        print(f"[ERROR] '{filename}' column mismatch — aborting.")
+        print(f"  Expected : {headers}")
+        print(f"  Got      : {actual}")
+        missing = [h for h in headers if h not in actual]
+        extra = [h for h in actual if h and h not in headers]
+        if missing:
+            print(f"  Missing  : {missing}")
+        if extra:
+            print(f"  Unexpected: {extra}")
+        wb.close()
+        sys.exit(1)
 
     level_idx = headers.index("Level")
     word_idx = headers.index("Word")
+    image_idx = headers.index("Image") if "Image" in headers else -1
 
-    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-    ws = wb.active
     rows: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    validation_errors: list[str] = []
 
-    for i, raw_row in enumerate(ws.iter_rows(values_only=True)):
-        if i == 0:
-            # Validate header row to catch misaligned files early
-            actual = [str(c).strip() if c is not None else "" for c in raw_row[: len(headers)]]
-            if actual != headers:
-                print(
-                    f"  [WARNING] '{filename}' header mismatch.\n"
-                    f"    Expected: {headers}\n"
-                    f"    Got:      {actual}"
-                )
+    for row_num, raw_row in enumerate(rows_iter, start=2):  # row 1 is the header
+        # Silently skip completely blank rows
+        if all(_clean(c) is None for c in raw_row):
             continue
 
-        level_val = raw_row[level_idx] if level_idx < len(raw_row) else None
-        word_val = raw_row[word_idx] if word_idx < len(raw_row) else None
-
-        if not level_val or not word_val:
-            continue  # skip blank/trailing rows
-
+        # Build record — coerce unexpected types (datetime, float) to string
+        image_raw: Any = raw_row[image_idx] if image_idx >= 0 and image_idx < len(raw_row) else None
         record: dict[str, Any] = {}
         for j, header in enumerate(headers):
             db_col = _db_col(header)
-            value = raw_row[j] if j < len(raw_row) else None
-            if isinstance(value, str):
-                value = value.strip() or None
-            record[db_col] = value
+            val = _clean(raw_row[j] if j < len(raw_row) else None)
+            if val is not None and not isinstance(val, str):
+                val = str(val)
+            record[db_col] = val
 
-        # Normalise Image boolean for nouns
+        # Image is a boolean — handle separately so it stays 0/1
         if table == "nouns":
-            record["image"] = 1 if record.get("image") else 0
+            record["image"] = 1 if image_raw else 0
 
-        row_id = compute_id(str(level_val), str(word_val))
+        # Collect all validation errors for this row before skipping
+        row_errors: list[str] = []
 
+        level_raw = _clean(raw_row[level_idx] if level_idx < len(raw_row) else None)
+        word_raw = _clean(raw_row[word_idx] if word_idx < len(raw_row) else None)
+        level_str = str(level_raw) if level_raw is not None else ""
+
+        if not level_str:
+            row_errors.append(f"  Row {row_num}: 'Level' is empty")
+        elif not VALID_LEVEL.match(level_str):
+            row_errors.append(
+                f"  Row {row_num}: invalid Level {level_str!r} "
+                f"(must be A1/A2/B1/B2/C1/C2, optionally followed by .1 or .2)"
+            )
+
+        if not word_raw:
+            row_errors.append(f"  Row {row_num}: 'Word' is empty")
+
+        for field in REQUIRED_FIELDS[table]:
+            if not record.get(field):
+                label = repr(word_raw) if word_raw else "(unknown word)"
+                row_errors.append(f"  Row {row_num}: required field '{field}' is empty (word={label})")
+
+        if row_errors:
+            validation_errors.extend(row_errors)
+            continue
+
+        row_id = compute_id(level_str, str(word_raw))
         if row_id in seen_ids:
             print(
-                f"  [WARNING] Duplicate row (same level+word after lowercasing): "
-                f"level={level_val!r} word={word_val!r} — keeping first occurrence"
+                f"  [WARNING] Row {row_num}: duplicate '{level_raw} + {word_raw}' "
+                f"after lowercasing — keeping first occurrence"
             )
             continue
 
@@ -136,83 +214,28 @@ def read_excel(table: str) -> list[dict[str, Any]]:
         rows.append(record)
 
     wb.close()
+
+    if validation_errors:
+        print(f"[ERROR] '{filename}' has {len(validation_errors)} validation error(s) — aborting:")
+        for err in validation_errors:
+            print(err)
+        sys.exit(1)
+
+    if not rows:
+        print(f"[ERROR] '{filename}' contains no valid data rows — aborting.")
+        sys.exit(1)
+
     return rows
 
 
-def get_db_state(client: httpx.Client, table: str) -> dict[str, str]:
-    response = client.get(f"{WORKER_URL}/state/{table}")
-    response.raise_for_status()
-    return response.json()
-
-
-def post_sync(
-    client: httpx.Client,
-    table: str,
-    upsert: list[dict[str, Any]],
-    delete: list[str],
-) -> dict[str, int]:
-    total_upserted = 0
-    total_deleted = 0
-
-    # Chunk upserts to stay within D1 batch limits; include deletes on the first chunk only
-    chunks = [upsert[i : i + UPSERT_CHUNK_SIZE] for i in range(0, max(len(upsert), 1), UPSERT_CHUNK_SIZE)]
-    for chunk_idx, chunk in enumerate(chunks):
-        chunk_delete = delete if chunk_idx == 0 else []
-        response = client.post(
-            f"{WORKER_URL}/sync/{table}",
-            json={"upsert": chunk, "delete": chunk_delete},
-            timeout=60.0,
-        )
-        response.raise_for_status()
-        result = response.json()
-        total_upserted += result.get("upserted", 0)
-        total_deleted += result.get("deleted", 0)
-
-    return {"upserted": total_upserted, "deleted": total_deleted}
-
-
-def compute_diff(
-    excel_rows: list[dict[str, Any]],
-    db_state: dict[str, str],
-) -> tuple[list[dict[str, Any]], list[str]]:
-    excel_by_id = {row["id"]: row for row in excel_rows}
-
-    to_upsert = [
-        row
-        for row_id, row in excel_by_id.items()
-        if row_id not in db_state or db_state[row_id] != row["content_hash"]
-    ]
-    to_delete = [row_id for row_id in db_state if row_id not in excel_by_id]
-
-    return to_upsert, to_delete
-
-
-def sync_table(client: httpx.Client, table: str) -> None:
-    print(f"\n[{table}]")
-
-    print("  Reading Excel...")
-    excel_rows = read_excel(table)
-    print(f"  {len(excel_rows)} rows in Excel.")
-
-    print("  Fetching DB state...")
-    db_state = get_db_state(client, table)
-    print(f"  {len(db_state)} rows in DB.")
-
-    to_upsert, to_delete = compute_diff(excel_rows, db_state)
-    print(f"  Diff: {len(to_upsert)} to upsert, {len(to_delete)} to delete.")
-
-    if not to_upsert and not to_delete:
-        print("  Already in sync.")
-        return
-
-    result = post_sync(client, table, to_upsert, to_delete)
-    print(f"  Done: upserted={result['upserted']}, deleted={result['deleted']}")
-
+# ---------------------------------------------------------------------------
+# HTTP layer with HMAC signing and retry
+# ---------------------------------------------------------------------------
 
 def _sign_request(request: httpx.Request) -> None:
-    """Attach HMAC-SHA256 signature headers to every outgoing request.
+    """Sign every outgoing request with HMAC-SHA256.
 
-    Canonical string: METHOD\nURL\nTIMESTAMP\nSHA256(body_bytes)
+    Canonical string: METHOD\\nURL\\nTIMESTAMP\\nSHA256(body_bytes)
     The raw API_KEY never travels over the wire — only the signed digest does.
     The Worker rejects signatures with a timestamp older than 5 minutes.
     """
@@ -224,18 +247,159 @@ def _sign_request(request: httpx.Request) -> None:
     request.headers["X-Signature"] = signature
 
 
+def _request_with_retry(call) -> httpx.Response:
+    """Call call() up to MAX_RETRIES times with exponential backoff.
+
+    Retries on network errors and 5xx responses. Does not retry 4xx errors.
+    """
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = call()
+            if response.status_code >= 500 and attempt < MAX_RETRIES - 1:
+                wait = 2 ** attempt
+                print(f"  [WARN] Server error {response.status_code}, retrying in {wait}s... ({attempt + 1}/{MAX_RETRIES})")
+                time.sleep(wait)
+                continue
+            return response
+        except (httpx.NetworkError, httpx.TimeoutException) as exc:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            wait = 2 ** attempt
+            print(f"  [WARN] {exc.__class__.__name__}, retrying in {wait}s... ({attempt + 1}/{MAX_RETRIES})")
+            time.sleep(wait)
+    raise RuntimeError("retry loop exhausted")  # unreachable
+
+
+def get_db_state(client: httpx.Client, table: str) -> dict[str, str]:
+    response = _request_with_retry(lambda: client.get(f"{WORKER_URL}/state/{table}"))
+    response.raise_for_status()
+    return response.json()
+
+
+def post_sync(
+    client: httpx.Client,
+    table: str,
+    upsert: list[dict[str, Any]],
+    delete: list[str],
+) -> None:
+    # Chunk upserts to stay within D1 batch limits; deletes go on the first chunk only
+    chunks = [upsert[i: i + UPSERT_CHUNK_SIZE] for i in range(0, max(len(upsert), 1), UPSERT_CHUNK_SIZE)]
+    for chunk_idx, chunk in enumerate(chunks):
+        chunk_delete = delete if chunk_idx == 0 else []
+        response = _request_with_retry(lambda: client.post(
+            f"{WORKER_URL}/sync/{table}",
+            json={"upsert": chunk, "delete": chunk_delete},
+            timeout=60.0,
+        ))
+        response.raise_for_status()
+
+
+# ---------------------------------------------------------------------------
+# Diff and sync orchestration
+# ---------------------------------------------------------------------------
+
+def compute_diff(
+    excel_rows: list[dict[str, Any]],
+    db_state: dict[str, str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Returns (to_insert, to_update, to_delete)."""
+    excel_by_id = {row["id"]: row for row in excel_rows}
+
+    to_insert: list[dict[str, Any]] = []
+    to_update: list[dict[str, Any]] = []
+    for row_id, row in excel_by_id.items():
+        if row_id not in db_state:
+            to_insert.append(row)
+        elif db_state[row_id] != row["content_hash"]:
+            to_update.append(row)
+
+    to_delete = [row_id for row_id in db_state if row_id not in excel_by_id]
+    return to_insert, to_update, to_delete
+
+
+def sync_table(
+    client: httpx.Client,
+    table: str,
+    dry_run: bool,
+) -> dict[str, int]:
+    """Sync one table. Returns counts of inserted, updated, and deleted rows."""
+    print(f"\n[{table}]")
+
+    print("  Reading and validating Excel...")
+    excel_rows = read_excel(table)
+    print(f"  {len(excel_rows)} valid rows in Excel.")
+
+    print("  Fetching DB state...")
+    db_state = get_db_state(client, table)
+    print(f"  {len(db_state)} rows in DB.")
+
+    to_insert, to_update, to_delete = compute_diff(excel_rows, db_state)
+    counts = {"inserted": len(to_insert), "updated": len(to_update), "deleted": len(to_delete)}
+
+    print(f"  Diff: {counts['inserted']} to add, {counts['updated']} to update, {counts['deleted']} to delete.")
+
+    if not to_insert and not to_update and not to_delete:
+        print("  Already in sync.")
+        return counts
+
+    if dry_run:
+        print("  [DRY RUN] No changes written.")
+        return counts
+
+    post_sync(client, table, to_insert + to_update, to_delete)
+    print(f"  Done.")
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Sync German vocabulary Excel files to Cloudflare D1.",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would change without writing anything to the DB.",
+    )
+    parser.add_argument(
+        "--table",
+        choices=list(TABLE_CONFIG.keys()),
+        metavar="TABLE",
+        help=f"Sync only one table. Choices: {', '.join(TABLE_CONFIG.keys())}.",
+    )
+    args = parser.parse_args()
+
     missing = [k for k in ("WORKER_URL", "API_KEY") if not os.environ.get(k)]
     if missing:
         print(f"Error: missing environment variables: {', '.join(missing)}")
         print("Copy sync/.env.example to sync/.env and fill in the values.")
         sys.exit(1)
 
-    with httpx.Client(event_hooks={"request": [_sign_request]}) as client:
-        for table in TABLE_CONFIG:
-            sync_table(client, table)
+    tables = [args.table] if args.table else list(TABLE_CONFIG.keys())
 
-    print("\nSync complete.")
+    if args.dry_run:
+        print("[DRY RUN] No changes will be written to the DB.\n")
+
+    totals: dict[str, int] = {"inserted": 0, "updated": 0, "deleted": 0}
+
+    with httpx.Client(event_hooks={"request": [_sign_request]}) as client:
+        for table in tables:
+            result = sync_table(client, table, dry_run=args.dry_run)
+            for key in totals:
+                totals[key] += result[key]
+
+    dry_label = " (dry run — no changes written)" if args.dry_run else ""
+    print(f"\n{'─' * 44}")
+    print(f"Summary{dry_label}")
+    print(f"  Added   : {totals['inserted']}")
+    print(f"  Updated : {totals['updated']}")
+    print(f"  Deleted : {totals['deleted']}")
+    print(f"{'─' * 44}")
+    if not args.dry_run:
+        print("Sync complete.")
 
 
 if __name__ == "__main__":
