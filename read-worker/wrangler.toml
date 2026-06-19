@@ -1,0 +1,38 @@
+name = "german-vocabulary-read-worker"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+# Same D1 database as the write worker — this worker only reads from it.
+[[d1_databases]]
+binding = "DB"
+database_name = "german-vocabulary"
+database_id = "b84997d9-5e78-493e-a43e-9d8aafd1ca95"
+
+# KV for short-lived challenges (nonces) and rate-limit counters.
+[[kv_namespaces]]
+binding = "KV"
+id = "2c0cb0115b0f4e0bacbc0475f2f72737"
+
+[observability]
+enabled = true
+
+[vars]
+# Your Apple Developer Team ID and the app's bundle id (used for App Attest appId hash).
+APP_TEAM_ID = "REPLACE_TEAM_ID"
+APP_BUNDLE_ID = "com.example.germanvocab"
+# Comma-separated StoreKit product ids that grant access.
+ENTITLEMENT_PRODUCT_IDS = "com.example.germanvocab.pro"
+# Session JWT lifetime in seconds.
+SESSION_TTL_SECONDS = "3600"
+# App Attest environment: "production" or "development".
+APP_ATTEST_ENV = "production"
+
+# Secrets (set with `wrangler secret put <NAME>`), never committed:
+#   SESSION_JWT_SECRET          random 32+ byte secret for signing session JWTs (openssl rand -hex 32)
+#   APPLE_APPATTEST_ROOT_CA     base64 DER of Apple App Attest Root CA (from Apple)
+#   APPLE_STOREKIT_ROOT_CA      base64 DER of Apple Root CA - G3 (from Apple)
+
+# Optional: large snapshot blobs served from R2 with range/resume support.
+# [[r2_buckets]]
+# binding = "SNAPSHOTS"
+# bucket_name = "german-vocabulary-snapshots"
