@@ -108,7 +108,7 @@ check fails, and it re-syncs to pick up the rest of the dataset automatically.
 | Built-in free code | `VocabularySyncConfig.freePromoCode` | Ships in the binary. Safe — it only unlocks 200 words. |
 | User's full code | `EntitlementStore` | Persisted in `UserDefaults`; survives restarts, removed on uninstall, not synced across devices. |
 | Which code is used | `EntitlementStore.activePromoCode` | The user's full code if present, otherwise the free code. |
-| Entering a full code | `AccessCodeView` | Reachable from the skippable post-onboarding sheet **and** Settings → "Full Access". |
+| Entering a full code | `UnlockFullAccessView` | Reachable from the skippable post-onboarding sheet **and** Settings → "Full Access". |
 | Redeeming | `EntitlementStore.redeemFullAccessCode` | Saves the code, re-syncs, and verifies the server actually granted `full`. If not, it drops the code and reverts to free. |
 
 So a user enters a full code **once**; it's remembered and re-used on every sync.
@@ -204,6 +204,31 @@ issued remain valid until the JWT expires (default 1 hour, `SESSION_TTL_SECONDS`
   **Keychain** (encrypted, optionally iCloud-synced across devices) is a planned
   hardening step.
 
+### Abuse prevention (rate limiting & cooldown)
+
+Code redemption is guessing-resistant on several layers:
+
+- **Server rate limit (authoritative).** The worker caps the auth endpoints —
+  `/v1/session`, `/v1/challenge`, `/v1/devices` — at **5 requests per 60 seconds
+  per IP** ([`src/index.ts`](../src/index.ts) → `rateLimit`); excess requests get
+  `429`. This is the real protection, since it applies even to scripted clients
+  that bypass the app. Tune the `5` there if needed.
+- **One session mint per attempt.** A failed redeem performs a single
+  `/v1/session` call — no wasteful "revert" re-sync — so legitimate retries stay
+  well under the limit (`EntitlementStore.redeemFullAccessCode`).
+- **Client-side cooldown.** After **3 consecutive failed attempts**, the app
+  disables the Redeem button for **30 seconds** with a live countdown, so users
+  hit a clear message instead of an opaque `429`
+  (`UnlockFullAccessView` → `AccessCodeEntryView`). It's a UX guard, not the
+  security boundary — the server limit is. Constants:
+  `maxAttemptsBeforeCooldown`, `cooldownSeconds`.
+- **Input hardening.** The code field accepts only `A–Z a–z 0–9 - _`, capped at
+  **64 characters** — no unbounded paste, control characters, or odd input
+  reaches the request.
+- **Hashes only.** Codes are stored as `sha256` hashes; a database leak doesn't
+  expose usable codes. Sessions issued before a code is revoked stay valid until
+  the JWT expires (`SESSION_TTL_SECONDS`, default 1h).
+
 ---
 
 ## 9. Troubleshooting
@@ -256,4 +281,4 @@ After onboarding the prompt is skippable; the persistent entry point is
 | Builder `Free` column → D1 | `sync/sync.py`, `worker/src/index.ts` |
 | App: built-in free code | `flashcard-german/Sync/VocabularySyncConfig.swift` |
 | App: tier state, persistence, redeem | `flashcard-german/Sync/EntitlementStore.swift` |
-| App: code entry UI | `flashcard-german/AccessCodeView.swift` |
+| App: code entry UI | `flashcard-german/UnlockFullAccessView.swift` |
