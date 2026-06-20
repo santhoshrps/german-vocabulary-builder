@@ -4,13 +4,18 @@ import { signSession, verifySession, SessionClaims } from "./jwt";
 import { issueChallenge, consumeChallenge, rateLimit } from "./kv";
 import { serveCachedByVersion } from "./cache";
 import { verifyAttestation, verifyAssertion } from "./appattest";
-import { verifyPromoCode, verifyStoreKitTransaction, Entitlement } from "./entitlement";
+import { verifyPromoCode, verifyStoreKitTransaction, Entitlement, Scope } from "./entitlement";
 import {
   getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP,
 } from "./data";
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+// Coerce the JWT's scope claim to a known Scope (unknown -> free, least privilege).
+function scopeOf(claims: SessionClaims): Scope {
+  return claims.scope === "full" ? "full" : "free";
 }
 
 // ---- Auth endpoints ---------------------------------------------------------
@@ -110,8 +115,10 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
   }
 
   const ttl = parseInt(env.SESSION_TTL_SECONDS || "3600", 10);
-  const token = await signSession(env.SESSION_JWT_SECRET, subject, entitlement.type, ttl, nowSeconds());
-  return json({ token, expiresIn: ttl, entitlement: entitlement.type });
+  const token = await signSession(
+    env.SESSION_JWT_SECRET, subject, entitlement.type, entitlement.scope, ttl, nowSeconds()
+  );
+  return json({ token, expiresIn: ttl, entitlement: entitlement.type, scope: entitlement.scope });
 }
 
 // ---- Data endpoints (require a valid session JWT) ---------------------------
@@ -168,8 +175,8 @@ async function requireFreshAssertion(
   ).bind(result.newSignCount, deviceId).run();
 }
 
-async function handleVersion(env: Env): Promise<Response> {
-  const version = await getVersion(env);
+async function handleVersion(env: Env, scope: Scope): Promise<Response> {
+  const version = await getVersion(env, scope);
   return json({ version }, 200, {
     ETag: `"${version}"`,
     "Cache-Control": "public, max-age=30",
@@ -177,17 +184,17 @@ async function handleVersion(env: Env): Promise<Response> {
 }
 
 async function handleManifest(
-  env: Env, request: Request, ctx: ExecutionContext
+  env: Env, request: Request, ctx: ExecutionContext, scope: Scope
 ): Promise<Response> {
-  const version = await getVersion(env);
-  return serveCachedByVersion(request, ctx, version, "manifest", 300, async () => ({
-    body: JSON.stringify({ version, manifest: await getManifest(env) }),
+  const version = await getVersion(env, scope);
+  return serveCachedByVersion(request, ctx, version, `manifest:${scope}`, 300, async () => ({
+    body: JSON.stringify({ version, manifest: await getManifest(env, scope) }),
     contentType: "application/json",
   }));
 }
 
 async function handleRows(
-  env: Env, request: Request, ctx: ExecutionContext, table: string
+  env: Env, request: Request, ctx: ExecutionContext, table: string, scope: Scope
 ): Promise<Response> {
   if (!isTable(table)) throw new HttpError(400, "invalid table");
   const url = new URL(request.url);
@@ -196,20 +203,20 @@ async function handleRows(
   if (ids.length === 0) throw new HttpError(400, "no ids");
   if (ids.length > ROWS_CAP) throw new HttpError(400, `too many ids (max ${ROWS_CAP})`);
 
-  const version = await getVersion(env);
-  const tag = `rows:${table}:${ids.slice().sort().join(",")}`;
+  const version = await getVersion(env, scope);
+  const tag = `rows:${scope}:${table}:${ids.slice().sort().join(",")}`;
   return serveCachedByVersion(request, ctx, version, tag, 300, async () => ({
-    body: JSON.stringify({ version, table, rows: await getRows(env, table, ids) }),
+    body: JSON.stringify({ version, table, rows: await getRows(env, table, ids, scope) }),
     contentType: "application/json",
   }));
 }
 
 async function handleSnapshot(
-  env: Env, request: Request, ctx: ExecutionContext
+  env: Env, request: Request, ctx: ExecutionContext, scope: Scope
 ): Promise<Response> {
-  const version = await getVersion(env);
-  return serveCachedByVersion(request, ctx, version, "snapshot", 86400, async () => ({
-    body: await buildSnapshotNdjson(env),
+  const version = await getVersion(env, scope);
+  return serveCachedByVersion(request, ctx, version, `snapshot:${scope}`, 86400, async () => ({
+    body: await buildSnapshotNdjson(env, scope),
     contentType: "application/x-ndjson",
   }));
 }
@@ -242,23 +249,24 @@ export default {
         return await handleSession(env, request);
       }
 
-      // Everything below requires a valid session.
+      // Everything below requires a valid session. The session's scope decides
+      // whether free (200-word preview) or the full dataset is served.
       if (request.method === "GET" && route === "version") {
-        await requireSession(env, request);
-        return await handleVersion(env);
+        const claims = await requireSession(env, request);
+        return await handleVersion(env, scopeOf(claims));
       }
       if (request.method === "GET" && route === "manifest") {
-        await requireSession(env, request);
-        return await handleManifest(env, request, ctx);
+        const claims = await requireSession(env, request);
+        return await handleManifest(env, request, ctx, scopeOf(claims));
       }
       if (request.method === "GET" && route === "rows" && sub) {
-        await requireSession(env, request);
-        return await handleRows(env, request, ctx, sub);
+        const claims = await requireSession(env, request);
+        return await handleRows(env, request, ctx, sub, scopeOf(claims));
       }
       if (request.method === "GET" && route === "snapshot") {
         const claims = await requireSession(env, request);
         await requireFreshAssertion(env, request, claims);
-        return await handleSnapshot(env, request, ctx);
+        return await handleSnapshot(env, request, ctx, scopeOf(claims));
       }
 
       return json({ error: "not found" }, 404);

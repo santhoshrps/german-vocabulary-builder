@@ -11,16 +11,16 @@ const DELETE_CHUNK_SIZE = 100;
 // Fixed column order per table — drives parameterised INSERT, never sourced from user input
 const TABLE_COLUMNS: Record<string, string[]> = {
   verbs: [
-    "id", "content_hash", "level", "capital", "type", "word", "english",
+    "id", "content_hash", "free", "level", "capital", "type", "word", "english",
     "german_sentence", "english_sentence", "ich", "du", "er_sie_es",
     "wir", "ihr", "sie_sie", "past_participle", "simple_past",
   ],
   nouns: [
-    "id", "content_hash", "level", "capital", "type", "article", "word",
+    "id", "content_hash", "free", "level", "capital", "type", "article", "word",
     "plural", "image", "english", "german_sentence", "english_sentence",
   ],
   adverbs_adjectives: [
-    "id", "content_hash", "level", "capital", "type", "word", "english",
+    "id", "content_hash", "free", "level", "capital", "type", "word", "english",
     "german_sentence", "english_sentence", "comparative", "superlative",
   ],
 };

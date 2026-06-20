@@ -28,21 +28,21 @@ TABLE_CONFIG: dict[str, tuple[str, list[str]]] = {
             "Level", "Capital", "Type", "Word", "English",
             "German_Sentence", "English_Sentence",
             "ich", "du", "er_sie_es", "wir", "ihr", "sie_Sie",
-            "past_participle", "simple_past",
+            "past_participle", "simple_past", "Free",
         ],
     ),
     "nouns": (
         "nouns.xlsx",
         [
             "Level", "Capital", "Type", "Article", "Word", "Plural", "Image",
-            "English", "German_Sentence", "English_Sentence",
+            "English", "German_Sentence", "English_Sentence", "Free",
         ],
     ),
     "adverbs_adjectives": (
         "adverbs_adjectives.xlsx",
         [
             "Level", "Capital", "Type", "Word", "English",
-            "German_Sentence", "English_Sentence", "Comparative", "Superlative",
+            "German_Sentence", "English_Sentence", "Comparative", "Superlative", "Free",
         ],
     ),
 }
@@ -194,6 +194,7 @@ def read_excel(table: str) -> list[dict[str, Any]]:
         level_idx = headers.index("Level")
         word_idx = headers.index("Word")
         image_idx = headers.index("Image") if "Image" in headers else -1
+        free_idx = headers.index("Free") if "Free" in headers else -1
 
         rows: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
@@ -217,6 +218,12 @@ def read_excel(table: str) -> list[dict[str, Any]]:
             # Image is a boolean — handle separately so it stays 0/1
             if table == "nouns":
                 record["image"] = 1 if image_raw else 0
+
+            # Free is a boolean flag gating the paid tier — coerce to 0/1 robustly
+            # (a literal "0" string must NOT read as truthy).
+            free_raw: Any = raw_row[free_idx] if 0 <= free_idx < len(raw_row) else None
+            free_str = str(free_raw).strip().lower() if free_raw is not None else ""
+            record["free"] = 1 if free_str in ("1", "true", "yes", "x", "y") else 0
 
             # Collect all validation errors for this row before skipping
             row_errors: list[str] = []

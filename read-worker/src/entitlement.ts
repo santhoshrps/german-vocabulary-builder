@@ -12,8 +12,13 @@ import { Env } from "./env";
 import { utf8, sha256, bytesToHex, b64UrlToBytes, b64ToBytes } from "./bytes";
 import { extractSPKI, tbsBytes, signatureDer, ecdsaDerToRaw } from "./crypto/der";
 
+/// Access scope an entitlement grants. "free" = the curated 200-word preview
+/// (rows with free = 1); "full" = the entire dataset.
+export type Scope = "free" | "full";
+
 export interface Entitlement {
   type: "storekit" | "promo";
+  scope: Scope; // how much of the dataset this entitlement unlocks
   label: string; // productId or promo label, for the JWT subject/audit
 }
 
@@ -23,12 +28,14 @@ export async function verifyPromoCode(env: Env, code: string): Promise<Entitleme
   if (!code) return null;
   const hash = bytesToHex(await sha256(utf8(code)));
   const row = await env.DB.prepare(
-    "SELECT label, active, expires_at FROM promo_codes WHERE code_hash = ?"
-  ).bind(hash).first<{ label: string | null; active: number; expires_at: string | null }>();
+    "SELECT label, tier, active, expires_at FROM promo_codes WHERE code_hash = ?"
+  ).bind(hash).first<{ label: string | null; tier: string | null; active: number; expires_at: string | null }>();
 
   if (!row || !row.active) return null;
   if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) return null;
-  return { type: "promo", label: row.label || "promo" };
+  // Anything other than an explicit "full" tier is treated as free (least privilege).
+  const scope: Scope = row.tier === "full" ? "full" : "free";
+  return { type: "promo", scope, label: row.label || "promo" };
 }
 
 // ---- StoreKit 2 signed transaction (JWS) ------------------------------------
@@ -89,7 +96,8 @@ export async function verifyStoreKitTransaction(
   if (payload.revocationDate && payload.revocationDate <= now) return null;
   if (payload.expiresDate && payload.expiresDate <= now) return null;
 
-  return { type: "storekit", label: payload.productId };
+  // A valid StoreKit purchase/subscription always grants full access.
+  return { type: "storekit", scope: "full", label: payload.productId };
 }
 
 async function verifyChainToAppleRoot(

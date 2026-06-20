@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS verbs (
   id              TEXT PRIMARY KEY,
   content_hash    TEXT NOT NULL,
+  free            INTEGER NOT NULL DEFAULT 0,   -- 1 = part of the free 200-word preview tier
   level           TEXT NOT NULL,
   capital         TEXT NOT NULL,
   type            TEXT NOT NULL,
@@ -22,6 +23,7 @@ CREATE TABLE IF NOT EXISTS verbs (
 CREATE TABLE IF NOT EXISTS nouns (
   id              TEXT PRIMARY KEY,
   content_hash    TEXT NOT NULL,
+  free            INTEGER NOT NULL DEFAULT 0,   -- 1 = part of the free 200-word preview tier
   level           TEXT NOT NULL,
   capital         TEXT NOT NULL,
   type            TEXT NOT NULL,
@@ -38,6 +40,7 @@ CREATE TABLE IF NOT EXISTS nouns (
 CREATE TABLE IF NOT EXISTS adverbs_adjectives (
   id              TEXT PRIMARY KEY,
   content_hash    TEXT NOT NULL,
+  free            INTEGER NOT NULL DEFAULT 0,   -- 1 = part of the free 200-word preview tier
   level           TEXT NOT NULL,
   capital         TEXT NOT NULL,
   type            TEXT NOT NULL,

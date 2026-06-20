@@ -3,8 +3,9 @@ import { utf8, bytesToB64Url, b64UrlToBytes, timingSafeEqualBytes } from "./byte
 // Minimal HS256 JWT. The same worker signs and verifies, so a symmetric secret is fine.
 
 export interface SessionClaims {
-  sub: string;   // device_id (or "promo:<label>" for test sessions)
-  ent: string;   // entitlement type: "storekit" | "promo"
+  sub: string;     // device_id (or "promo:<label>" for test sessions)
+  ent: string;     // entitlement type: "storekit" | "promo"
+  scope: string;   // access scope: "free" | "full"
   iat: number;
   exp: number;
 }
@@ -23,11 +24,12 @@ export async function signSession(
   secret: string,
   sub: string,
   ent: string,
+  scope: string,
   ttlSeconds: number,
   now: number
 ): Promise<string> {
   const header = bytesToB64Url(utf8(JSON.stringify({ alg: "HS256", typ: "JWT" })));
-  const claims: SessionClaims = { sub, ent, iat: now, exp: now + ttlSeconds };
+  const claims: SessionClaims = { sub, ent, scope, iat: now, exp: now + ttlSeconds };
   const payload = bytesToB64Url(utf8(JSON.stringify(claims)));
   const signingInput = `${header}.${payload}`;
   const key = await hmacKey(secret);
