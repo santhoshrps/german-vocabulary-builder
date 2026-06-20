@@ -249,7 +249,7 @@ export default {
       // Rate-limit the expensive auth endpoints per client IP.
       const ip = clientIp(request);
       const limited = route === "challenge" || route === "session" || route === "devices";
-      if (limited && !(await rateLimit(env, `${route}:${ip}`, 5, 60, nowSeconds()))) {
+      if (limited && !(await rateLimit(env, `${route}:${ip}`, 10, 60, nowSeconds()))) {
         return json({ error: "rate limited" }, 429);
       }
 
