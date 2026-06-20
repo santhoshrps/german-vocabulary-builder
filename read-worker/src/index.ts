@@ -78,6 +78,17 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
     entitlement = await verifyPromoCode(env, body.promoCode);
     if (!entitlement) throw new HttpError(403, "invalid promo code");
     subject = `promo:${entitlement.label}`;
+  } else if (env.STOREKIT_ENV === "xcode" && body.signedTransaction && !body.assertion) {
+    // ---- Local Xcode testing: StoreKit transaction only, no App Attest ----
+    // Enabled solely by STOREKIT_ENV="xcode". The transaction is locally signed
+    // (StoreKit Configuration File), so verifyStoreKitTransaction decodes its
+    // claims without Apple verification. NEVER enable this in production.
+    entitlement = await verifyStoreKitTransaction(env, body.signedTransaction).catch((e) => {
+      console.error("storekit (xcode) failed", { err: String(e) });
+      throw new HttpError(403, "entitlement verification failed");
+    });
+    if (!entitlement) throw new HttpError(403, "no active entitlement");
+    subject = `storekit:${entitlement.label}`;
   } else {
     // ---- Production path: App Attest assertion + StoreKit entitlement ----
     if (!body.deviceId || !body.assertion || !body.challenge || !body.signedTransaction) {
@@ -145,6 +156,9 @@ async function requireFreshAssertion(
   env: Env, request: Request, claims: SessionClaims
 ): Promise<void> {
   if (claims.ent === "promo") return;
+  // Local Xcode StoreKit sessions have no attested device key, so they can't
+  // present an assertion — exempt them (dev only; guarded by STOREKIT_ENV).
+  if (claims.ent === "storekit" && env.STOREKIT_ENV === "xcode") return;
 
   const challenge = request.headers.get("X-Challenge") || "";
   const assertionB64 = request.headers.get("X-Assertion") || "";

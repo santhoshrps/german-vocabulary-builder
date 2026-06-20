@@ -60,6 +60,17 @@ export async function verifyStoreKitTransaction(
   if (parts.length !== 3) throw new Error("storekit: malformed JWS");
   const [headerB64, payloadB64, sigB64] = parts;
 
+  // ---- Local Xcode testing path -------------------------------------------
+  // StoreKit Configuration File transactions are signed by Xcode's local test
+  // certificate, not Apple's CA, so they can't be verified against the Apple
+  // root. In "xcode" mode we DECODE the payload and validate its claims only —
+  // no signature/chain check. This is insecure by design and MUST be off
+  // ("production") for any real build.
+  if (env.STOREKIT_ENV === "xcode") {
+    const payload = JSON.parse(new TextDecoder().decode(b64UrlToBytes(payloadB64))) as TransactionPayload;
+    return validateTransactionClaims(env, payload);
+  }
+
   const header = JSON.parse(new TextDecoder().decode(b64UrlToBytes(headerB64))) as JwsHeader;
   if (header.alg !== "ES256" || !header.x5c?.length) throw new Error("storekit: bad header");
 
@@ -87,6 +98,12 @@ export async function verifyStoreKitTransaction(
 
   // 3. Validate the payload claims.
   const payload = JSON.parse(new TextDecoder().decode(b64UrlToBytes(payloadB64))) as TransactionPayload;
+  return validateTransactionClaims(env, payload);
+}
+
+// Shared claim checks: bundle id, allowed product, not expired/revoked. A valid
+// StoreKit purchase always grants full access.
+function validateTransactionClaims(env: Env, payload: TransactionPayload): Entitlement | null {
   if (payload.bundleId !== env.APP_BUNDLE_ID) throw new Error("storekit: bundleId mismatch");
 
   const allowed = env.ENTITLEMENT_PRODUCT_IDS.split(",").map((s) => s.trim()).filter(Boolean);
@@ -96,7 +113,6 @@ export async function verifyStoreKitTransaction(
   if (payload.revocationDate && payload.revocationDate <= now) return null;
   if (payload.expiresDate && payload.expiresDate <= now) return null;
 
-  // A valid StoreKit purchase/subscription always grants full access.
   return { type: "storekit", scope: "full", label: payload.productId };
 }
 
