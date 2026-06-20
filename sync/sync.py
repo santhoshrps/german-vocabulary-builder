@@ -110,6 +110,26 @@ def _clean(value: Any) -> Any:
     return value
 
 
+_TRUTHY = {"1", "true", "yes", "x", "y"}
+
+
+def _to_bool01(value: Any) -> int:
+    """Coerce a spreadsheet cell to 0/1.
+
+    openpyxl returns numeric cells as floats (a '1' becomes 1.0), so a plain
+    string check would miss it. Handle numerics and booleans explicitly, then
+    fall back to common string markers; everything else (incl. None, '0', '0.0',
+    blank) is 0.
+    """
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, (int, float)):
+        return 1 if value != 0 else 0
+    return 1 if str(value).strip().lower() in _TRUTHY else 0
+
+
 def compute_id(level: str, word: str) -> str:
     raw = f"{level.lower()}|{word.lower()}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
@@ -217,13 +237,12 @@ def read_excel(table: str) -> list[dict[str, Any]]:
 
             # Image is a boolean — handle separately so it stays 0/1
             if table == "nouns":
-                record["image"] = 1 if image_raw else 0
+                record["image"] = _to_bool01(image_raw)
 
-            # Free is a boolean flag gating the paid tier — coerce to 0/1 robustly
-            # (a literal "0" string must NOT read as truthy).
+            # Free is a boolean flag gating the paid tier. openpyxl yields 1.0 for
+            # a '1' cell, so coerce numerics too (a literal "0" must stay 0).
             free_raw: Any = raw_row[free_idx] if 0 <= free_idx < len(raw_row) else None
-            free_str = str(free_raw).strip().lower() if free_raw is not None else ""
-            record["free"] = 1 if free_str in ("1", "true", "yes", "x", "y") else 0
+            record["free"] = _to_bool01(free_raw)
 
             # Collect all validation errors for this row before skipping
             row_errors: list[str] = []
