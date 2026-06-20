@@ -8,6 +8,9 @@ import { verifyPromoCode, verifyStoreKitTransaction, Entitlement, Scope } from "
 import {
   getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP,
 } from "./data";
+import {
+  loadManifest, scopedManifest, allowedPacks, normalizePackName, getPackObject,
+} from "./audio";
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -235,6 +238,60 @@ async function handleSnapshot(
   }));
 }
 
+// ---- Audio media endpoints --------------------------------------------------
+
+// Pack manifest, filtered to the caller's scope (free sees only the "free" pack).
+async function handleAudioManifest(
+  env: Env, request: Request, ctx: ExecutionContext, scope: Scope
+): Promise<Response> {
+  const scoped = scopedManifest(await loadManifest(env), scope);
+  return serveCachedByVersion(request, ctx, scoped.version, `audiomanifest:${scope}`, 300, async () => ({
+    body: JSON.stringify(scoped),
+    contentType: "application/json",
+  }));
+}
+
+// Stream one pack blob from R2. Scope is enforced BEFORE the edge-cache lookup so
+// a free session can never receive a cached full-tier pack. Cached by pack hash.
+async function handleAudioPack(
+  env: Env, request: Request, ctx: ExecutionContext, scope: Scope, name: string
+): Promise<Response> {
+  const manifest = await loadManifest(env);
+  const norm = normalizePackName(name);
+
+  // Paywall: must run before any cache read.
+  if (!allowedPacks(manifest, scope).has(norm)) {
+    throw new HttpError(403, "pack not available for this scope");
+  }
+
+  const hash = manifest.packs[norm]?.hash ?? "0";
+  const etag = `"${hash}"`;
+  if (request.headers.get("If-None-Match") === etag) {
+    return new Response(null, { status: 304, headers: { ETag: etag } });
+  }
+
+  const url = new URL(request.url);
+  const cache = caches.default;
+  const cacheKey = new Request(`https://media-cache.internal${url.pathname}?h=${hash}`, { method: "GET" });
+  const hit = await cache.match(cacheKey);
+  if (hit) {
+    const headers = new Headers(hit.headers);
+    headers.set("X-Cache", "HIT");
+    return new Response(hit.body, { status: hit.status, headers });
+  }
+
+  const obj = await getPackObject(env, manifest, scope, norm);
+  const headers = new Headers({
+    "Content-Type": "application/octet-stream",
+    "Cache-Control": "public, max-age=86400",
+    ETag: etag,
+    "X-Cache": "MISS",
+  });
+  const response = new Response(obj.body, { status: 200, headers });
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return response;
+}
+
 // ---- Router -----------------------------------------------------------------
 
 export default {
@@ -281,6 +338,17 @@ export default {
         const claims = await requireSession(env, request);
         await requireFreshAssertion(env, request, claims);
         return await handleSnapshot(env, request, ctx, scopeOf(claims));
+      }
+      if (request.method === "GET" && route === "audio" && sub === "manifest") {
+        const claims = await requireSession(env, request);
+        return await handleAudioManifest(env, request, ctx, scopeOf(claims));
+      }
+      if (request.method === "GET" && route === "audio" && sub === "pack") {
+        const claims = await requireSession(env, request);
+        // Pack name may contain a slash ("nouns/a1.1"): join the trailing parts.
+        const name = parts.slice(3).join("/");
+        if (!name) throw new HttpError(400, "missing pack name");
+        return await handleAudioPack(env, request, ctx, scopeOf(claims), name);
       }
 
       return json({ error: "not found" }, 404);

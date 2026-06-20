@@ -36,6 +36,12 @@ STOREKIT_ENV = "xcode"
 #   APPLE_APPATTEST_ROOT_CA     base64 DER of Apple App Attest Root CA (from Apple)
 #   APPLE_STOREKIT_ROOT_CA      base64 DER of Apple Root CA - G3 (from Apple)
 
+# Audio (and future image) assets: packs + manifest written by sync/audio_sync.py.
+# Create the bucket once:  wrangler r2 bucket create german-vocabulary-media
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "german-vocabulary-media"
+
 # Optional: large snapshot blobs served from R2 with range/resume support.
 # [[r2_buckets]]
 # binding = "SNAPSHOTS"

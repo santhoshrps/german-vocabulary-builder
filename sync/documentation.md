@@ -251,3 +251,54 @@ With `--dry-run`, the header says `Summary (dry run — no changes written)`.
 | `DATA_DIR` | hardcoded | Parent directory's `data/` folder |
 | `UPSERT_CHUNK_SIZE` | hardcoded (200) | Max rows per DB batch call |
 | `MAX_RETRIES` | hardcoded (3) | Max retry attempts on transient errors |
+
+---
+
+## Audio pipeline (`audio_sync.py`)
+
+Synthesizes a pronunciation MP3 per word and uploads grouped **packs** to
+Cloudflare R2. Runs independently of the text sync (`sync.py`) but reuses its
+Excel reader, so word ids match exactly (`sha256(level|word)[:16]`).
+
+```bash
+# one-time: add the audio deps and regenerate the lockfile
+#   uv pip compile requirements.in -o requirements.txt   (or pip-compile)
+#   pip install -r requirements.txt
+
+python audio_sync.py            # synth changed words, build packs, upload changed
+python audio_sync.py --dry-run  # synth + build locally, upload nothing
+python audio_sync.py --no-synth # rebuild/upload packs from the existing cache
+```
+
+What it does:
+1. Reads every table; for each word derives `(text, voice)` — nouns spoken as
+   `"<article> <word>"`, other types as the bare word — and an `audio_hash` of
+   that synthesis input.
+2. Synthesizes only words whose `audio_hash` changed or whose MP3 is missing
+   (local cache in `sync/audio_cache/`). Text-only edits never re-synthesize.
+3. Groups words into packs: `free` (every `Free=1` word) and `<type>s/<level>`
+   (e.g. `nouns/a1.1`). Each pack is a single `.pack` file:
+   `[4-byte BE header length][JSON header][concatenated mp3 bytes]`.
+4. Uploads only packs whose hash changed, then writes `audio/manifest.json`
+   (pack hashes/bytes + which packs each scope may download). The read worker
+   serves the manifest scope-filtered and streams packs from R2.
+
+### Audio configuration
+
+| Variable | File | Purpose |
+|----------|------|---------|
+| `R2_ACCOUNT_ID` | `sync/.env` | Cloudflare account id (R2 S3 endpoint) |
+| `R2_ACCESS_KEY_ID` | `sync/.env` | R2 API token access key |
+| `R2_SECRET_ACCESS_KEY` | `sync/.env` | R2 API token secret |
+| `R2_BUCKET` | `sync/.env` | Target R2 bucket (e.g. `german-vocabulary-media`) |
+
+Voices/prosody live in `audio_engine.py`. Bump `ENGINE_VERSION` there to force a
+full re-synthesis when the recipe changes.
+
+
+### Manual setup before it runs
+`wrangler r2 bucket create german-vocabulary-media`
+Add R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET to sync/.env; regenerate requirements.txt (uv pip compile / pip-compile) and pip install.
+`python audio_sync.py` (synthesizes + uploads packs + manifest).
+Redeploy the read worker (wrangler deploy).
+Build the app in Xcode.

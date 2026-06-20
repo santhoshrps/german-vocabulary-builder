@@ -1,5 +1,6 @@
 data/
 sync/.env
+sync/audio_cache
 node_modules/
 worker/node_modules/
 sync/.venv/

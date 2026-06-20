@@ -2,6 +2,9 @@ export interface Env {
   DB: D1Database;
   KV: KVNamespace;
   SNAPSHOTS?: R2Bucket;
+  // Audio (and future image) assets: packs + manifest written by the build
+  // pipeline (sync/audio_sync.py). Optional so the worker still boots if unbound.
+  MEDIA?: R2Bucket;
 
   // vars
   APP_TEAM_ID: string;
