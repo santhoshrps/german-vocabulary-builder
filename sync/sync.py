@@ -130,6 +130,22 @@ def _to_bool01(value: Any) -> int:
     return 1 if str(value).strip().lower() in _TRUTHY else 0
 
 
+_NOUN_ARTICLES = {"der", "die", "das"}
+
+
+def _capitalize_noun(value: str) -> str:
+    """Capitalize a German noun's first letter, preserving an optional leading
+    article. 'hund' -> 'Hund', 'die hunde' -> 'die Hunde'. Done once at ingest so
+    the app never capitalizes (and mutates) nouns at runtime."""
+    text = value.strip()
+    if not text:
+        return text
+    head, sep, tail = text.partition(" ")
+    if sep and head.lower() in _NOUN_ARTICLES and tail:
+        return f"{head.lower()} {tail[:1].upper()}{tail[1:]}"
+    return text[:1].upper() + text[1:]
+
+
 def compute_id(level: str, word: str) -> str:
     raw = f"{level.lower()}|{word.lower()}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
@@ -281,6 +297,21 @@ def read_excel(table: str) -> list[dict[str, Any]]:
 
             seen_ids.add(row_id)
             record["id"] = row_id
+
+            # Normalize once here so the app never does it at runtime:
+            #  - canonical lowercase `type` (and `article` for nouns)
+            #  - capitalized German nouns + plurals
+            # (content_hash is computed AFTER this, so normalized values sync.)
+            if record.get("type"):
+                record["type"] = str(record["type"]).strip().lower()
+            if table == "nouns":
+                if record.get("article"):
+                    record["article"] = str(record["article"]).strip().lower()
+                if record.get("word"):
+                    record["word"] = _capitalize_noun(str(record["word"]))
+                if record.get("plural"):
+                    record["plural"] = _capitalize_noun(str(record["plural"]))
+
             record["content_hash"] = compute_content_hash(record)
             rows.append(record)
 
