@@ -68,16 +68,29 @@ export async function getManifest(env: Env, scope: Scope): Promise<Record<string
 
 // ---- Rows -------------------------------------------------------------------
 // Full rows for specific ids (the changed set from a manifest diff).
+//
+// D1 limits bound parameters to ~100 per query, so the id list is split into
+// sub-batches well under that limit and merged — otherwise a full-tier delta
+// sync (which requests up to ROWS_PER_REQUEST_CAP ids at once) would throw and
+// surface as a 500.
+const ROWS_BIND_CHUNK = 90;
+
 export async function getRows(env: Env, table: TableName, ids: string[], scope: Scope): Promise<unknown[]> {
   const capped = ids.slice(0, ROWS_PER_REQUEST_CAP);
   if (capped.length === 0) return [];
-  const placeholders = capped.map(() => "?").join(", ");
-  // The scope filter is essential here too: a free client must not be able to
-  // pull a full-tier row by guessing its id.
-  const res = await readOnlySelect(env,
-    `SELECT * FROM ${table} WHERE id IN (${placeholders}) AND ${scopeWhere(scope)}`
-  ).bind(...capped).all();
-  return res.results;
+
+  const rows: unknown[] = [];
+  for (let i = 0; i < capped.length; i += ROWS_BIND_CHUNK) {
+    const chunk = capped.slice(i, i + ROWS_BIND_CHUNK);
+    const placeholders = chunk.map(() => "?").join(", ");
+    // The scope filter is essential here too: a free client must not be able to
+    // pull a full-tier row by guessing its id.
+    const res = await readOnlySelect(env,
+      `SELECT * FROM ${table} WHERE id IN (${placeholders}) AND ${scopeWhere(scope)}`
+    ).bind(...chunk).all();
+    rows.push(...res.results);
+  }
+  return rows;
 }
 
 export const ROWS_CAP = ROWS_PER_REQUEST_CAP;

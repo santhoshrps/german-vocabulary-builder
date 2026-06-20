@@ -12,11 +12,11 @@ can download. There are two access tiers:
 
 | Tier   | What it unlocks                          | How a user gets it |
 |--------|------------------------------------------|--------------------|
-| `free` | The curated **200-word preview** (rows flagged `free = 1`) | The **built-in** code, shipped in the app — every user has it automatically |
+| `free` | The curated **100-word preview** (rows flagged `free = 1`) | The **built-in** code, shipped in the app — every user has it automatically |
 | `full` | The **entire dataset**                   | A **StoreKit purchase** (not yet implemented) **or** a `tier = 'full'` promo code the user enters |
 
 The limit is enforced **on the server**, not in the app. A `free` session
-literally cannot fetch beyond the 200 preview words — the worker filters every
+literally cannot fetch beyond the 100 preview words — the worker filters every
 query by the session's scope. Hiding rows client-side would be pointless because
 the data would already be on the device.
 
@@ -47,7 +47,7 @@ Key points:
   the database).
 - `tier` **defaults to `'free'`** (least privilege). A code only grants full
   access if you set `tier = 'full'` explicitly.
-- The free 200-word set is defined separately, by a `free = 1` flag on rows in
+- The free 100-word set is defined separately, by a `free = 1` flag on rows in
   the `verbs`, `nouns`, and `adverbs_adjectives` tables (see
   [`../../schema/init.sql`](../../schema/init.sql) and the
   [`add_free_tier.sql`](../../schema/add_free_tier.sql) migration).
@@ -105,7 +105,7 @@ check fails, and it re-syncs to pick up the rest of the dataset automatically.
 
 | Concern | Where | Notes |
 |---------|-------|-------|
-| Built-in free code | `VocabularySyncConfig.freePromoCode` | Ships in the binary. Safe — it only unlocks 200 words. |
+| Built-in free code | `VocabularySyncConfig.freePromoCode` | Ships in the binary. Safe — it only unlocks 100 words. |
 | User's full code | `EntitlementStore` | Persisted in `UserDefaults`; survives restarts, removed on uninstall, not synced across devices. |
 | Which code is used | `EntitlementStore.activePromoCode` | The user's full code if present, otherwise the free code. |
 | Entering a full code | `UnlockFullAccessView` | Reachable from the skippable post-onboarding sheet **and** Settings → "Full Access". |
@@ -195,10 +195,10 @@ issued remain valid until the JWT expires (default 1 hour, `SESSION_TTL_SECONDS`
 ## 8. Security notes
 
 - **The free code is public** (it ships in the app binary). That's acceptable —
-  it only unlocks the 200-word preview.
+  it only unlocks the 100-word preview.
 - **Full codes are secrets.** Store only their hashes, hand them out
   individually, and scope/expire them. One full code grants the entire dataset.
-- The free tier's 200 words are whatever you mark `free = 1`. If you mark
+- The free tier's 100 words are whatever you mark `free = 1`. If you mark
   **zero** rows, free users sync **nothing**.
 - App-side, the user's full code is currently in `UserDefaults`. Moving it to the
   **Keychain** (encrypted, optionally iCloud-synced across devices) is a planned

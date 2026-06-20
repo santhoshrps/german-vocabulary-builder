@@ -82,7 +82,7 @@ selects from it.
 
 ## Free vs full tiers
 
-A `free` boolean column on each table marks the curated preview set (the free 200-word
+A `free` boolean column on each table marks the curated preview set (the free 100-word
 tier). The session JWT carries a `scope` claim (`free` | `full`), and **every** data
 query is filtered by it ([`scopeWhere` in src/data.ts](../src/data.ts)). A free session
 literally cannot see — or fetch by id — anything outside the preview. This is the

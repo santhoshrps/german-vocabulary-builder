@@ -321,7 +321,7 @@ export default {
       }
 
       // Everything below requires a valid session. The session's scope decides
-      // whether free (200-word preview) or the full dataset is served.
+      // whether free (100-word preview) or the full dataset is served.
       if (request.method === "GET" && route === "version") {
         const claims = await requireSession(env, request);
         return await handleVersion(env, scopeOf(claims));

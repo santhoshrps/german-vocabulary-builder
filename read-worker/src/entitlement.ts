@@ -12,7 +12,7 @@ import { Env } from "./env";
 import { utf8, sha256, bytesToHex, b64UrlToBytes, b64ToBytes } from "./bytes";
 import { extractSPKI, tbsBytes, signatureDer, ecdsaDerToRaw } from "./crypto/der";
 
-/// Access scope an entitlement grants. "free" = the curated 200-word preview
+/// Access scope an entitlement grants. "free" = the curated 100-word preview
 /// (rows with free = 1); "full" = the entire dataset.
 export type Scope = "free" | "full";
 

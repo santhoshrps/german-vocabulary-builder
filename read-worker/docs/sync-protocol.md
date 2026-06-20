@@ -79,7 +79,7 @@ every query returns ([`scopeWhere` in src/data.ts](../src/data.ts)):
 
 | scope | sees |
 |-------|------|
-| `free` | only rows with `free = 1` (the ~200-word preview) |
+| `free` | only rows with `free = 1` (the ~100-word preview) |
 | `full` | the entire dataset |
 
 The filter is applied to **version, manifest, rows, and snapshot alike** — including the

@@ -12,7 +12,7 @@ Design (mirrors the agreed concept):
     new/changed words are re-synthesized. Text-only edits never re-synthesize.
   - Downloaded in PACKS, not per file: one ".pack" container per group so the
     app fetches a few dozen files instead of thousands.
-      * "free"            -> every free=1 word (the 200-word preview)
+      * "free"            -> every free=1 word (the 100-word preview)
       * "<type>s/<level>" -> the full dataset, grouped (e.g. "nouns/a1.1")
   - Pack container format (no zip dependency on the client):
       [4-byte big-endian header length][UTF-8 JSON header][concatenated mp3 bytes]
