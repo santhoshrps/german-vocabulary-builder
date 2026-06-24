@@ -15,7 +15,9 @@ import { HttpError } from "./http";
 
 export interface AudioManifest {
   version: string;
-  packs: Record<string, { hash: string; bytes: number; count: number }>;
+  // `hash`: content-identity (id:audio_hash) for diffing. `sha`: digest of the actual
+  // .pack blob, for client-side integrity verification of the downloaded bytes.
+  packs: Record<string, { hash: string; sha?: string; bytes: number; count: number }>;
   scopes: Record<string, string[]>;
 }
 

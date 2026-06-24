@@ -247,6 +247,10 @@ def build_and_upload(words: list[dict[str, Any]], dry_run: bool) -> None:
         pack_bytes[name] = data
         new_packs[name] = {
             "hash": _pack_hash(members),
+            # Digest of the ACTUAL .pack blob, so the client can verify integrity of the
+            # downloaded bytes (the `hash` above is a content-identity over id:audio_hash
+            # pairs, used for diffing — it does NOT detect a truncated/corrupt download).
+            "sha": hashlib.sha256(data).hexdigest(),
             "bytes": len(data),
             "count": len(members),
         }
