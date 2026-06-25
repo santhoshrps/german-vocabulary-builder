@@ -95,6 +95,44 @@ export async function getRows(env: Env, table: TableName, ids: string[], scope: 
 
 export const ROWS_CAP = ROWS_PER_REQUEST_CAP;
 
+// ---- Search -----------------------------------------------------------------
+// Look up a word across all tables by its German text OR English translation.
+// Unlike the sync endpoints this is deliberately NOT scope-filtered: it searches
+// the WHOLE vocabulary so a free user can discover full-set words (the teaser).
+// Each hit carries its table and `free` flag so the client can mark which results
+// are part of full access and must NOT be added to the local store. Still a SELECT,
+// so it goes through the same read-only guard.
+export interface SearchHit {
+  table: TableName;
+  free: boolean;
+  row: Record<string, unknown>;
+}
+
+const SEARCH_LIMIT_PER_TABLE = 25;
+
+export async function searchWord(env: Env, query: string, type?: string): Promise<SearchHit[]> {
+  const like = `%${query.toLowerCase()}%`;
+
+  // Optional logical type narrows which table(s) we search.
+  let tables: TableName[] = [...TABLES];
+  if (type === "verb") tables = ["verbs"];
+  else if (type === "noun") tables = ["nouns"];
+  else if (type === "adjective" || type === "adverb") tables = ["adverbs_adjectives"];
+
+  const hits: SearchHit[] = [];
+  for (const t of tables) {
+    const res = await readOnlySelect(env,
+      `SELECT * FROM ${t} WHERE LOWER(word) LIKE ? OR LOWER(english) LIKE ? LIMIT ${SEARCH_LIMIT_PER_TABLE}`
+    ).bind(like, like).all<Record<string, unknown>>();
+    for (const row of res.results) {
+      // adverbs_adjectives holds both; an adjective/adverb filter narrows by its `type` column.
+      if ((type === "adjective" || type === "adverb") && row.type !== type) continue;
+      hits.push({ table: t, free: Number(row.free) === 1, row });
+    }
+  }
+  return hits;
+}
+
 // ---- Snapshot ---------------------------------------------------------------
 // Full dataset as NDJSON (one row per line). Cloudflare compresses the response;
 // the phone streams + inserts line-by-line without buffering it all in memory.

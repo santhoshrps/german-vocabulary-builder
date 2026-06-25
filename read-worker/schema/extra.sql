@@ -31,6 +31,23 @@ CREATE TABLE IF NOT EXISTS promo_codes (
   expires_at TEXT                                    -- ISO8601 or NULL for no expiry
 );
 
+-- User-submitted words awaiting curation. Inserted by POST /v1/submissions when a
+-- searched word isn't found locally or in the backend. NEVER published automatically —
+-- a curator reviews these and (if accepted) adds them to the vocabulary tables in a
+-- later update. `source` is the requesting session subject (device id or promo label),
+-- kept for rate-limiting / abuse review, not personal data.
+CREATE TABLE IF NOT EXISTS submissions (
+  id         TEXT PRIMARY KEY,                       -- random uuid
+  word       TEXT NOT NULL,                          -- the German word the user typed
+  type       TEXT,                                   -- optional: 'noun' | 'verb' | 'adjective' | 'adverb'
+  source     TEXT,                                   -- session subject (e.g. 'promo:label' or device id)
+  scope      TEXT,                                   -- caller scope at submit time ('free' | 'full')
+  status     TEXT NOT NULL DEFAULT 'pending',        -- 'pending' | 'approved' | 'rejected'
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions (status, created_at);
+
 -- Example: the app's built-in free-tier code (200-word preview):
 --   printf 'flashcard-free-2026' | shasum -a 256
 --   INSERT INTO promo_codes (code_hash, label, tier) VALUES ('<hash>', 'builtin-free', 'free');

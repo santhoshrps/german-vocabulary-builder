@@ -6,7 +6,7 @@ import { serveCachedByVersion } from "./cache";
 import { verifyAttestation, verifyAssertion } from "./appattest";
 import { verifyPromoCode, verifyStoreKitTransaction, Entitlement, Scope } from "./entitlement";
 import {
-  getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP,
+  getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP, searchWord,
 } from "./data";
 import {
   loadManifest, scopedManifest, allowedPacks, normalizePackName, getPackObject,
@@ -238,6 +238,52 @@ async function handleSnapshot(
   }));
 }
 
+// ---- Search & submissions ---------------------------------------------------
+
+// Look up a word for the in-app search. Authenticated, but intentionally searches the
+// WHOLE vocabulary (free + full) so a free user can find — and preview — full-set words;
+// each hit's `free` flag lets the client mark/lock those. Read-only.
+async function handleSearch(env: Env, request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const q = (url.searchParams.get("q") || "").trim();
+  if (q.length < 2) throw new HttpError(400, "query too short");
+  const type = url.searchParams.get("type") || undefined;
+  const results = await searchWord(env, q, type);
+  return json({ query: q, results }, 200, { "Cache-Control": "private, max-age=60" });
+}
+
+interface SubmissionBody {
+  word?: string;
+  type?: string;
+}
+
+// Submit a missing word for curation. A write path (like /devices/register), so it does
+// NOT use the read-only content layer. Rate-limited per session subject; stored as
+// 'pending' and never published into the live vocabulary automatically.
+async function handleSubmission(
+  env: Env, request: Request, claims: SessionClaims
+): Promise<Response> {
+  const body = (await request.json().catch(() => null)) as SubmissionBody | null;
+  const word = (body?.word || "").trim();
+  if (!word) throw new HttpError(400, "missing word");
+  if (word.length > 80) throw new HttpError(400, "word too long");
+  const allowedTypes = ["noun", "verb", "adjective", "adverb"];
+  const type = body?.type && allowedTypes.includes(body.type) ? body.type : null;
+
+  // Per-session-subject rate limit: a handful of submissions per 10 minutes.
+  const subject = claims.sub || "anon";
+  if (!(await rateLimit(env, `submit:${subject}`, 10, 600, nowSeconds()))) {
+    throw new HttpError(429, "rate limited");
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO submissions (id, word, type, source, scope, status)
+     VALUES (?, ?, ?, ?, ?, 'pending')`
+  ).bind(crypto.randomUUID(), word, type, subject, scopeOf(claims)).run();
+
+  return json({ status: "pending" }, 201);
+}
+
 // ---- Audio media endpoints --------------------------------------------------
 
 // Pack manifest, filtered to the caller's scope (free sees only the "free" pack).
@@ -342,6 +388,14 @@ export default {
         const claims = await requireSession(env, request);
         await requireFreshAssertion(env, request, claims);
         return await handleSnapshot(env, request, ctx, scopeOf(claims));
+      }
+      if (request.method === "GET" && route === "search") {
+        await requireSession(env, request);
+        return await handleSearch(env, request);
+      }
+      if (request.method === "POST" && route === "submissions") {
+        const claims = await requireSession(env, request);
+        return await handleSubmission(env, request, claims);
       }
       if (request.method === "GET" && route === "audio" && sub === "manifest") {
         const claims = await requireSession(env, request);
