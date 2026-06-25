@@ -21,6 +21,19 @@ function scopeOf(claims: SessionClaims): Scope {
   return claims.scope === "full" ? "full" : "free";
 }
 
+// Per-client rate-limit key. Device-backed (StoreKit) sessions are keyed by their device id;
+// promo (free) sessions share ONE subject across ALL free users, so they fall back to the
+// client IP (per network) — otherwise the limit would be collective for everyone on free.
+function rateSubjectKey(claims: SessionClaims, ip: string): string {
+  return claims.ent === "promo" ? `ip:${ip}` : `dev:${claims.sub || "anon"}`;
+}
+
+// Keep only letters (incl. German ä/ö/ü/ß) and spaces; strips junk AND SQL LIKE wildcards
+// (% and _). The client enforces this too, but the server must never trust the client.
+function sanitizeTerm(s: string): string {
+  return s.replace(/[^\p{L} ]/gu, "").trim();
+}
+
 // ---- Auth endpoints ---------------------------------------------------------
 
 async function handleChallenge(env: Env): Promise<Response> {
@@ -243,10 +256,23 @@ async function handleSnapshot(
 // Look up a word for the in-app search. Authenticated, but intentionally searches the
 // WHOLE vocabulary (free + full) so a free user can find — and preview — full-set words;
 // each hit's `free` flag lets the client mark/lock those. Read-only.
-async function handleSearch(env: Env, request: Request): Promise<Response> {
+async function handleSearch(
+  env: Env, request: Request, claims: SessionClaims
+): Promise<Response> {
   const url = new URL(request.url);
-  const q = (url.searchParams.get("q") || "").trim();
+  const ip = clientIp(request);
+  // Sanitize server-side (letters + spaces only, capped) — strips junk and SQL LIKE wildcards.
+  const q = sanitizeTerm(url.searchParams.get("q") || "").slice(0, 64);
   if (q.length < 2) throw new HttpError(400, "query too short");
+
+  // Rate limit per device (StoreKit) or per IP (free/promo, which share a subject). A search is a
+  // LIKE scan across all tables, so cap it above human use but below scripted scraping.
+  const key = rateSubjectKey(claims, ip);
+  if (!(await rateLimit(env, `search:${key}`, 50, 600, nowSeconds()))) {
+    console.warn("search rate limited", { key });
+    throw new HttpError(429, "rate limited");
+  }
+
   const type = url.searchParams.get("type") || undefined;
   const results = await searchWord(env, q, type);
   return json({ query: q, results }, 200, { "Cache-Control": "private, max-age=60" });
@@ -264,22 +290,39 @@ async function handleSubmission(
   env: Env, request: Request, claims: SessionClaims
 ): Promise<Response> {
   const body = (await request.json().catch(() => null)) as SubmissionBody | null;
-  const word = (body?.word || "").trim();
-  if (!word) throw new HttpError(400, "missing word");
-  if (word.length > 80) throw new HttpError(400, "word too long");
+  const ip = clientIp(request);
+  // Sanitize server-side (letters + spaces only, capped) — never trust the client.
+  const word = sanitizeTerm(body?.word || "").slice(0, 80);
+  if (word.length < 2) throw new HttpError(400, "missing or invalid word");
   const allowedTypes = ["noun", "verb", "adjective", "adverb"];
   const type = body?.type && allowedTypes.includes(body.type) ? body.type : null;
+  const key = rateSubjectKey(claims, ip);
 
-  // Per-session-subject rate limit: a handful of submissions per 10 minutes.
-  const subject = claims.sub || "anon";
-  if (!(await rateLimit(env, `submit:${subject}`, 10, 600, nowSeconds()))) {
+  // Burst limit: a handful of submissions per 10 minutes, per device (StoreKit) or IP (free).
+  if (!(await rateLimit(env, `submit:${key}`, 10, 600, nowSeconds()))) {
+    console.warn("submit rate limited", { key });
     throw new HttpError(429, "rate limited");
   }
+
+  // Daily cap: bound sustained submission flooding from one client.
+  const recent = await env.DB.prepare(
+    "SELECT COUNT(*) AS c FROM submissions WHERE source = ? AND created_at > datetime('now', '-1 day')"
+  ).bind(key).first<{ c: number }>();
+  if ((recent?.c ?? 0) >= 20) {
+    console.warn("submit daily cap reached", { key });
+    throw new HttpError(429, "daily submission limit reached");
+  }
+
+  // Dedup: if this word is already awaiting curation, don't queue it again.
+  const existing = await env.DB.prepare(
+    "SELECT 1 FROM submissions WHERE word = ? AND status = 'pending' LIMIT 1"
+  ).bind(word).first();
+  if (existing) return json({ status: "pending" }, 200);
 
   await env.DB.prepare(
     `INSERT INTO submissions (id, word, type, source, scope, status)
      VALUES (?, ?, ?, ?, ?, 'pending')`
-  ).bind(crypto.randomUUID(), word, type, subject, scopeOf(claims)).run();
+  ).bind(crypto.randomUUID(), word, type, key, scopeOf(claims)).run();
 
   return json({ status: "pending" }, 201);
 }
@@ -390,8 +433,8 @@ export default {
         return await handleSnapshot(env, request, ctx, scopeOf(claims));
       }
       if (request.method === "GET" && route === "search") {
-        await requireSession(env, request);
-        return await handleSearch(env, request);
+        const claims = await requireSession(env, request);
+        return await handleSearch(env, request, claims);
       }
       if (request.method === "POST" && route === "submissions") {
         const claims = await requireSession(env, request);
