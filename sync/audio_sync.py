@@ -8,8 +8,13 @@ exactly the same validated rows (same ids = sha256(level|word)[:16]).
 Design (mirrors the agreed concept):
   - One MP3 per word, named "<id>.mp3". Nouns spoken as "<article> <word>";
     other types as the bare word (see audio_engine.synthesis_for).
-  - Idempotent: a local cache (audio_cache/) keyed by audio_hash means only
-    new/changed words are re-synthesized. Text-only edits never re-synthesize.
+  - Idempotent & durable: a local cache (audio_cache/) keyed by audio_hash means
+    only new/changed words are re-synthesized, and every synthesized MP3 is also
+    mirrored to R2 (audio/files/<audio_hash>.mp3). On a cache miss the canonical
+    bytes are pulled from R2 rather than re-synthesized, so the audio for a given
+    recipe is byte-stable forever — even on a fresh machine or after the local
+    cache is cleared. (edge-tts is non-deterministic, so regeneration would
+    otherwise yield different bytes and needlessly churn every pack.)
   - Downloaded in PACKS, not per file: one ".pack" container per group so the
     app fetches a few dozen files instead of thousands.
       * "free"            -> every free=1 word (the 100-word preview)
@@ -54,6 +59,7 @@ logger = logging.getLogger("audio_sync")
 CACHE_DIR = Path(__file__).parent / "audio_cache"
 INDEX_PATH = CACHE_DIR / "index.json"          # {id: audio_hash}
 PACKS_PREFIX = "audio/packs"                    # R2 key prefix for packs
+FILES_PREFIX = "audio/files"                    # R2 key prefix for content-addressed MP3s
 MANIFEST_KEY = "audio/manifest.json"           # R2 key for the manifest
 
 MAX_WORKERS = 6
@@ -124,9 +130,59 @@ def _cache_path(word_id: str) -> Path:
     return CACHE_DIR / f"{word_id}.mp3"
 
 
-def synthesize_changed(words: list[dict[str, Any]], dry_run: bool) -> dict[str, str]:
-    """Synthesize any word whose cached audio_hash differs or whose MP3 is missing.
+def _file_key(audio_hash: str) -> str:
+    """R2 key for a content-addressed MP3. Keyed by the synthesis recipe hash, so
+    identical (text+voice+recipe) words share one durable object."""
+    return f"{FILES_PREFIX}/{audio_hash}.mp3"
 
+
+def _download_file(client, bucket: str, audio_hash: str, dest: Path) -> bool:
+    """Pull a previously-synthesized MP3 from R2 into the local cache. Returns
+    True on success. This is what makes re-synthesis idempotent: the canonical
+    bytes for a recipe live in R2 and are reused verbatim, never regenerated."""
+    if client is None:
+        return False
+    try:
+        obj = client.get_object(Bucket=bucket, Key=_file_key(audio_hash))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(obj["Body"].read())
+        return True
+    except Exception:  # noqa: BLE001 — missing object -> fall back to synthesis
+        return False
+
+
+def _upload_file(client, bucket: str, audio_hash: str, src: Path) -> None:
+    """Mirror a freshly-synthesized MP3 to R2 so it never needs regenerating."""
+    if client is None:
+        return
+    client.put_object(
+        Bucket=bucket, Key=_file_key(audio_hash),
+        Body=src.read_bytes(), ContentType="audio/mpeg",
+    )
+
+
+def _ensure_one(client, bucket: str | None, w: dict[str, Any]) -> str:
+    """Make the local cache MP3 for one word current. Order: reuse the local
+    cache, else pull the canonical bytes from R2, else synthesize via TTS and
+    upload them to R2. Returns "cached" | "r2" | "tts"."""
+    dest = _cache_path(w["id"])
+    # 1. Local cache already correct (index check happened by the caller).
+    if dest.exists():
+        return "cached"
+    # 2. Durable copy in R2 — reuse byte-for-byte (idempotent across machines/runs).
+    if _download_file(client, bucket or "", w["audio_hash"], dest):
+        return "r2"
+    # 3. Last resort: synthesize, then persist to R2 for next time.
+    audio_engine.synthesize(w["text"], w["voice"], dest)
+    _upload_file(client, bucket or "", w["audio_hash"], dest)
+    return "tts"
+
+
+def ensure_audio(words: list[dict[str, Any]], dry_run: bool, client, bucket: str | None) -> dict[str, str]:
+    """Ensure every word has its current MP3 in the local cache.
+
+    A word is (re)processed when its cached audio_hash differs or its MP3 is
+    missing. For each, prefer the local cache, then the durable R2 copy, then TTS.
     Returns the updated index {id: audio_hash}.
     """
     index = _load_index()
@@ -134,25 +190,23 @@ def synthesize_changed(words: list[dict[str, Any]], dry_run: bool) -> dict[str, 
         w for w in words
         if index.get(w["id"]) != w["audio_hash"] or not _cache_path(w["id"]).exists()
     ]
-    logger.info("Synthesis: %d of %d words need (re)generation.", len(todo), len(words))
+    logger.info("Audio: %d of %d words need (re)generation.", len(todo), len(words))
 
     if dry_run:
         logger.info("[DRY RUN] Skipping synthesis.")
         return index
 
     failed = 0
+    stats = {"cached": 0, "r2": 0, "tts": 0}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {
-            ex.submit(audio_engine.synthesize, w["text"], w["voice"], _cache_path(w["id"])): w
-            for w in todo
-        }
+        futures = {ex.submit(_ensure_one, client, bucket, w): w for w in todo}
         for i, fut in enumerate(as_completed(futures), start=1):
             w = futures[fut]
             try:
-                fut.result()
+                stats[fut.result()] += 1
                 index[w["id"]] = w["audio_hash"]
                 if i % 100 == 0:
-                    logger.info("  …%d/%d synthesized", i, len(todo))
+                    logger.info("  …%d/%d (r2=%d tts=%d)", i, len(todo), stats["r2"], stats["tts"])
             except Exception as exc:  # noqa: BLE001 — log and continue, don't abort the batch
                 failed += 1
                 logger.warning("  failed %s (\"%s\"): %s", w["id"], w["text"], exc)
@@ -165,8 +219,9 @@ def synthesize_changed(words: list[dict[str, Any]], dry_run: bool) -> dict[str, 
             _cache_path(stale_id).unlink(missing_ok=True)
 
     _save_index(index)
+    logger.info("Audio ready: %d reused from R2, %d synthesized.", stats["r2"], stats["tts"])
     if failed:
-        logger.warning("Synthesis finished with %d failure(s).", failed)
+        logger.warning("Audio finished with %d failure(s).", failed)
     return index
 
 
@@ -235,9 +290,37 @@ def _fetch_remote_manifest(client, bucket: str) -> dict[str, Any]:
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def build_and_upload(words: list[dict[str, Any]], dry_run: bool) -> None:
+def _hydrate_missing(words: list[dict[str, Any]], client, bucket: str | None) -> None:
+    """Ensure every member MP3 exists locally before packing, pulling any missing
+    ones from R2. Guarantees packs are built from the canonical bytes even if the
+    local cache was partially lost (e.g. on a fresh machine, esp. with --no-synth)."""
+    missing = [w for w in words if not _cache_path(w["id"]).exists()]
+    if not missing:
+        return
+    if client is None:
+        raise FileNotFoundError(
+            f"{len(missing)} cached MP3(s) missing and R2 not configured — "
+            f"run synthesis first or provide R2 credentials."
+        )
+    logger.info("Hydrating %d missing MP3(s) from R2…", len(missing))
+    pulled = 0
+    for w in missing:
+        if _download_file(client, bucket or "", w["audio_hash"], _cache_path(w["id"])):
+            pulled += 1
+        else:
+            logger.warning("  no R2 copy for %s (\"%s\") — synthesize first", w["id"], w.get("text"))
+    logger.info("Hydrated %d/%d from R2.", pulled, len(missing))
+
+
+def build_and_upload(
+    words: list[dict[str, Any]], dry_run: bool, client=None, bucket: str | None = None, force: bool = False
+) -> None:
     groups = _group_words(words)
     logger.info("Packs: %d groups (incl. free).", len(groups))
+
+    # Make sure every member's bytes are present locally (pull from R2 if needed).
+    if not dry_run:
+        _hydrate_missing(words, client, bucket)
 
     # Compute pack metadata for the new manifest.
     new_packs: dict[str, dict[str, Any]] = {}
@@ -275,15 +358,19 @@ def build_and_upload(words: list[dict[str, Any]], dry_run: bool) -> None:
         logger.info("[DRY RUN] manifest version would be %s", manifest["version"])
         return
 
-    bucket = os.environ["R2_BUCKET"]
-    client = _r2_client()
     remote = _fetch_remote_manifest(client, bucket)
     remote_packs = remote.get("packs", {})
 
     uploaded = 0
     for name, meta in new_packs.items():
-        if remote_packs.get(name, {}).get("hash") == meta["hash"]:
-            continue  # unchanged — skip upload
+        # Skip only when the exact blob is already in R2. Compare on `sha` (the
+        # actual .pack digest), not `hash` (content identity): the bytes can
+        # change while `hash` stays the same, and keying on `hash` would leave a
+        # stale blob in R2 whose sha no longer matches the manifest, failing the
+        # client's integrity check. `--force` re-uploads everything (use it to
+        # recover a manifest that already claims a sha the stored blob doesn't have).
+        if not force and remote_packs.get(name, {}).get("sha") == meta["sha"]:
+            continue  # exact blob already in R2 — skip upload
         client.put_object(
             Bucket=bucket,
             Key=f"{PACKS_PREFIX}/{name}.pack",
@@ -306,6 +393,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Synthesize and sync vocabulary audio to Cloudflare R2.")
     parser.add_argument("--dry-run", action="store_true", help="Synthesize + build locally, upload nothing.")
     parser.add_argument("--no-synth", action="store_true", help="Skip synthesis; pack from the existing cache.")
+    parser.add_argument("--force", action="store_true", help="Re-upload every pack even if unchanged (recovery).")
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true")
     verbosity.add_argument("-q", "--quiet", action="store_true")
@@ -321,6 +409,12 @@ def main() -> None:
             logger.error("Set them in sync/.env (or run with --dry-run).")
             sys.exit(1)
 
+    # One R2 client, shared by the durable MP3 mirror and the pack upload.
+    client = None
+    bucket = os.environ.get("R2_BUCKET")
+    if not args.dry_run:
+        client = _r2_client()
+
     logger.info("Reading vocabulary…")
     try:
         words = collect_words()
@@ -330,11 +424,11 @@ def main() -> None:
     logger.info("Total speakable words: %d", len(words))
 
     if not args.no_synth:
-        synthesize_changed(words, dry_run=args.dry_run)
+        ensure_audio(words, args.dry_run, client, bucket)
     else:
-        logger.info("Skipping synthesis (--no-synth).")
+        logger.info("Skipping synthesis (--no-synth); missing files will be pulled from R2.")
 
-    build_and_upload(words, dry_run=args.dry_run)
+    build_and_upload(words, dry_run=args.dry_run, client=client, bucket=bucket, force=args.force)
     logger.info("Audio sync complete.")
 
 

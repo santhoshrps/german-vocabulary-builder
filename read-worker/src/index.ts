@@ -264,15 +264,19 @@ async function handleAudioPack(
     throw new HttpError(403, "pack not available for this scope");
   }
 
-  const hash = manifest.packs[norm]?.hash ?? "0";
-  const etag = `"${hash}"`;
+  // Key the cache + ETag on `sha` (the actual .pack blob digest), NOT `hash`
+  // (content identity). The blob's bytes can change while `hash` stays the same;
+  // keying on `hash` would then serve stale bytes that fail the client's sha
+  // check. Fall back to `hash` only if an old manifest has no `sha`.
+  const sha = manifest.packs[norm]?.sha ?? manifest.packs[norm]?.hash ?? "0";
+  const etag = `"${sha}"`;
   if (request.headers.get("If-None-Match") === etag) {
     return new Response(null, { status: 304, headers: { ETag: etag } });
   }
 
   const url = new URL(request.url);
   const cache = caches.default;
-  const cacheKey = new Request(`https://media-cache.internal${url.pathname}?h=${hash}`, { method: "GET" });
+  const cacheKey = new Request(`https://media-cache.internal${url.pathname}?h=${sha}`, { method: "GET" });
   const hit = await cache.match(cacheKey);
   if (hit) {
     const headers = new Headers(hit.headers);
