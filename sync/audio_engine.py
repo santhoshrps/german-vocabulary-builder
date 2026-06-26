@@ -46,7 +46,7 @@ from xml.sax.saxutils import escape as _xml_escape
 # One voice is chosen per word from a gender-appropriate pool (see _pick_voice).
 MASCULINE_VOICES = [
     "de-DE-ConradNeural", "de-DE-FlorianMultilingualNeural", "de-DE-BerndNeural",
-    "de-DE-ChristophNeural", "de-DE-KasperNeural", "de-DE-KillianNeural",
+    "de-DE-KasperNeural", "de-DE-KillianNeural",
     "de-DE-KlausNeural", "de-DE-RalfNeural",
 ]
 FEMININE_VOICES = [
@@ -65,7 +65,7 @@ ALL_VOICES = [*MASCULINE_VOICES, *FEMININE_VOICES, NEUTER_VOICE]
 SPECIAL_WORD_VOICES = {
     "hallo": "de-DE-MajaNeural",
     "willkommen": "de-DE-GiselaNeural",
-    "danke": "de-DE-ChristophNeural",
+    "danke": "de-DE-RalfNeural",
 }
 
 # ── Prosody (slightly slower improves German phoneme clarity) ──────────────────
