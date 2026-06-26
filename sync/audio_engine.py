@@ -68,6 +68,14 @@ SPECIAL_WORD_VOICES = {
     "danke": "de-DE-RalfNeural",
 }
 
+# Voices removed from use. They are kept in the pools above ONLY so the modulo that
+# assigns voices stays stable — _pick_voice skips them and re-assigns just the words
+# that had landed on them, instead of reshuffling (and re-synthesizing) everything.
+DISABLED_VOICES = {
+    "de-DE-FlorianMultilingualNeural",
+    "de-DE-SeraphinaMultilingualNeural",
+}
+
 # ── Prosody (slightly slower improves German phoneme clarity) ──────────────────
 RATE = "-5%"
 VOLUME = "+0%"
@@ -87,9 +95,18 @@ def _pick_voice(pool: list[str], seed: str) -> str:
     Seeded by the word so the choice is stable across runs (idempotent cache) yet
     spread across the pool. NOT random — a random pick would re-synthesize the
     whole set every run.
+
+    If the natural pick is a DISABLED voice, re-assign deterministically among the
+    remaining voices of the same pool. Crucially, words whose natural pick is NOT
+    disabled keep that exact voice — so disabling a voice only re-synthesizes the
+    words that actually used it, not the whole set.
     """
     n = int.from_bytes(hashlib.sha256(seed.encode("utf-8")).digest()[:8], "big")
-    return pool[n % len(pool)]
+    primary = pool[n % len(pool)]
+    if primary not in DISABLED_VOICES:
+        return primary
+    allowed = [v for v in pool if v not in DISABLED_VOICES]
+    return allowed[n % len(allowed)]
 
 # ── German phoneme corrections applied before synthesis ────────────────────────
 PHONEME_MAP = {
