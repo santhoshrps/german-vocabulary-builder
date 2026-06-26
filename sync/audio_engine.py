@@ -2,37 +2,71 @@
 Reusable German TTS synthesis engine for the audio pipeline.
 
 Adapted from flashcard-german/scripts/audio_synthesizer.py (the reference). Uses
-edge-tts (Microsoft Edge Neural voices) — free, no API key. This module is the
-pure, reusable core: it knows how to turn one vocabulary row into (text, voice),
-hash the synthesis input deterministically, and render an MP3. Orchestration
-(diffing, packing, R2 upload) lives in audio_sync.py.
+the Azure Cognitive Services Speech SDK. The SDK natively handles a custom-domain
+/ Azure AI Foundry resource (endpoint + key) — discovering the region and managing
+auth tokens itself — which the plain REST API does not. This module is the pure,
+reusable core: it turns one vocabulary row into (text, voice), hashes the synthesis
+input deterministically, and renders an MP3. Orchestration (diffing, packing, R2
+upload) lives in audio_sync.py.
 
-Voices:
-  der (masculine) -> de-DE-KillianNeural   (adult male)
-  die (feminine)  -> de-DE-KatjaNeural     (adult female)
-  das (neuter)    -> de-DE-SeraphinaMultilingualNeural (child/girl)
-  verb/adverb/adjective -> de-DE-ConradNeural (neutral male narrator)
+Credentials (sync/.env):
+  AZURE_SPEECH_KEY       resource key
+  AZURE_SPEECH_ENDPOINT  Foundry / custom-domain URL (https://<name>.cognitiveservices.azure.com)
+  AZURE_SPEECH_REGION    alternative to endpoint for a classic regional resource
 
 Install:
-  pip install edge-tts
+  pip install azure-cognitiveservices-speech
+
+Voices (one is picked per word from a gender-appropriate pool):
+  der (masculine) -> a male voice pool
+  die (feminine)  -> a female voice pool
+  das (neuter)    -> Gisela + the male/female pools
+  verb/adverb/adjective -> any voice
+A few fixed words (hallo/willkommen/danke) get a specific voice.
+
+Selection is DETERMINISTIC per word (seeded by the word text), not random: the
+same word always maps to the same voice. This is required for the idempotent
+audio cache — a truly random pick would change every word's audio_hash on every
+run and re-synthesize the whole set.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
+import os
 import re
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape as _xml_escape
 
-# edge_tts is imported lazily inside synthesize() so that hashing / pack building
-# (and --dry-run / --no-synth) work without the TTS dependency installed.
+# The Azure Speech SDK is imported lazily inside the synthesis helpers so that
+# hashing / pack building (and --dry-run / --no-synth) work without it installed.
 
-# ── Voice mapping ──────────────────────────────────────────────────────────────
-VOICE_MASCULINE = "de-DE-KillianNeural"                  # der
-VOICE_FEMININE = "de-DE-KatjaNeural"                     # die
-VOICE_CHILD = "de-DE-SeraphinaMultilingualNeural"        # das
-VOICE_NEUTRAL = "de-DE-ConradNeural"                     # verb / adverb / adjective
+# ── Voice pools ────────────────────────────────────────────────────────────────
+# One voice is chosen per word from a gender-appropriate pool (see _pick_voice).
+MASCULINE_VOICES = [
+    "de-DE-ConradNeural", "de-DE-FlorianMultilingualNeural", "de-DE-BerndNeural",
+    "de-DE-ChristophNeural", "de-DE-KasperNeural", "de-DE-KillianNeural",
+    "de-DE-KlausNeural", "de-DE-RalfNeural",
+]
+FEMININE_VOICES = [
+    "de-DE-KatjaNeural", "de-DE-SeraphinaMultilingualNeural", "de-DE-AmalaNeural",
+    "de-DE-ElkeNeural", "de-DE-KlarissaNeural", "de-DE-LouisaNeural",
+    "de-DE-MajaNeural", "de-DE-TanjaNeural",
+]
+NEUTER_VOICE = "de-DE-GiselaNeural"
+
+# das (neuter) nouns: Gisela, or any male/female voice.
+NEUTER_VOICES = [NEUTER_VOICE, *MASCULINE_VOICES, *FEMININE_VOICES]
+# verbs / adjectives / adverbs: any voice.
+ALL_VOICES = [*MASCULINE_VOICES, *FEMININE_VOICES, NEUTER_VOICE]
+
+# Fixed overrides for a few specific words (matched case-insensitively on the word).
+SPECIAL_WORD_VOICES = {
+    "hallo": "de-DE-MajaNeural",
+    "willkommen": "de-DE-GiselaNeural",
+    "danke": "de-DE-ChristophNeural",
+}
 
 # ── Prosody (slightly slower improves German phoneme clarity) ──────────────────
 RATE = "-5%"
@@ -41,7 +75,21 @@ PITCH = "+0Hz"
 
 # Identifies the synthesis recipe. Bump this when voices/prosody/text rules change
 # so every word is re-synthesized (its audio_hash changes) on the next run.
-ENGINE_VERSION = "1"
+# v2: per-word voice variety (pools instead of one voice per gender).
+# v3: Azure Speech backend (different bytes than the old edge-tts engine).
+# v4: Azure Speech SDK (handles the custom-domain Foundry resource natively).
+ENGINE_VERSION = "4"
+
+
+def _pick_voice(pool: list[str], seed: str) -> str:
+    """Deterministically pick a voice from `pool` for a given word.
+
+    Seeded by the word so the choice is stable across runs (idempotent cache) yet
+    spread across the pool. NOT random — a random pick would re-synthesize the
+    whole set every run.
+    """
+    n = int.from_bytes(hashlib.sha256(seed.encode("utf-8")).digest()[:8], "big")
+    return pool[n % len(pool)]
 
 # ── German phoneme corrections applied before synthesis ────────────────────────
 PHONEME_MAP = {
@@ -86,12 +134,13 @@ def detect_gender_fallback(noun: str) -> str:
 
 
 def _voice_for_article(article: str | None, noun: str) -> tuple[str, str]:
-    """Return (voice, resolved_article) for a noun."""
+    """Return (voice, resolved_article) for a noun — a per-word pick from the
+    gender-appropriate pool."""
     art = (article or "").strip().lower()
     if art not in ("der", "die", "das"):
         art = detect_gender_fallback(noun)
-    voice = {"der": VOICE_MASCULINE, "die": VOICE_FEMININE, "das": VOICE_CHILD}[art]
-    return voice, art
+    pool = {"der": MASCULINE_VOICES, "die": FEMININE_VOICES, "das": NEUTER_VOICES}[art]
+    return _pick_voice(pool, noun.lower()), art
 
 
 def synthesis_for(table: str, row: dict[str, Any]) -> tuple[str, str] | None:
@@ -108,8 +157,10 @@ def synthesis_for(table: str, row: dict[str, Any]) -> tuple[str, str] | None:
         voice, article = _voice_for_article(row.get("article"), word)
         return f"{article} {word}", voice
 
-    # verbs, adverbs_adjectives (adjective + adverb) -> neutral narrator, word only
-    return word, VOICE_NEUTRAL
+    # verbs, adverbs_adjectives (adjective + adverb) -> bare word, any-voice pool.
+    # A few fixed words override the per-word pick.
+    voice = SPECIAL_WORD_VOICES.get(word.lower()) or _pick_voice(ALL_VOICES, word.lower())
+    return word, voice
 
 
 def audio_hash(text: str, voice: str) -> str:
@@ -125,15 +176,59 @@ def audio_hash(text: str, voice: str) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-async def _synthesize_async(text: str, voice: str, out_path: Path) -> None:
-    import edge_tts  # lazy: only needed when actually synthesizing
+def _ssml(text: str, voice: str) -> str:
+    """Build the SSML body for one utterance (text is XML-escaped)."""
+    return (
+        "<speak version='1.0' xml:lang='de-DE'>"
+        f"<voice xml:lang='de-DE' name='{voice}'>"
+        f"<prosody rate='{RATE}' volume='{VOLUME}' pitch='{PITCH}'>"
+        f"{_xml_escape(text)}"
+        "</prosody></voice></speak>"
+    )
 
-    corrected = apply_phoneme_corrections(text)
-    communicate = edge_tts.Communicate(corrected, voice, rate=RATE, volume=VOLUME, pitch=PITCH)
-    await communicate.save(str(out_path))
+
+def _speech_config():
+    """Build an Azure Speech SDK config from the environment.
+
+    The SDK natively handles a custom-domain / Foundry resource via `endpoint` +
+    key — it discovers the region and manages auth tokens itself, so we don't have
+    to. A classic regional resource can use AZURE_SPEECH_REGION instead.
+    """
+    import azure.cognitiveservices.speech as speechsdk
+
+    key = os.environ.get("AZURE_SPEECH_KEY")
+    if not key:
+        raise RuntimeError("AZURE_SPEECH_KEY must be set in sync/.env")
+    endpoint = os.environ.get("AZURE_SPEECH_ENDPOINT")
+    region = os.environ.get("AZURE_SPEECH_REGION")
+
+    if endpoint:
+        cfg = speechsdk.SpeechConfig(endpoint=endpoint.rstrip("/"), subscription=key)
+    elif region:
+        cfg = speechsdk.SpeechConfig(subscription=key, region=region)
+    else:
+        raise RuntimeError("Set AZURE_SPEECH_ENDPOINT (custom domain) or AZURE_SPEECH_REGION in sync/.env")
+
+    # 24 kHz mono MP3 — plenty for single-word pronunciation, small files.
+    cfg.set_speech_synthesis_output_format(
+        speechsdk.SpeechSynthesisOutputFormat.Audio24Khz48KBitRateMonoMp3
+    )
+    return cfg
 
 
 def synthesize(text: str, voice: str, out_path: Path) -> None:
-    """Render one MP3 to out_path (blocking; runs its own event loop)."""
+    """Render one MP3 to out_path via the Azure Speech SDK (blocking)."""
+    import azure.cognitiveservices.speech as speechsdk
+
+    corrected = apply_phoneme_corrections(text)
+    synth = speechsdk.SpeechSynthesizer(speech_config=_speech_config(), audio_config=None)
+    result = synth.speak_ssml_async(_ssml(corrected, voice)).get()
+
+    if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+        details = result.cancellation_details
+        raise RuntimeError(
+            f"Azure TTS failed for voice {voice!r}: {details.reason} {details.error_details}"
+        )
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    asyncio.run(_synthesize_async(text, voice, out_path))
+    out_path.write_bytes(result.audio_data)

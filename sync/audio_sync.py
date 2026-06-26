@@ -32,6 +32,7 @@ Usage:
   python audio_sync.py                # synth changed, build packs, upload changed
   python audio_sync.py --dry-run      # synth + build locally, upload nothing
   python audio_sync.py --no-synth     # rebuild/upload packs from existing cache
+  python audio_sync.py --prune-files  # also delete orphaned per-word MP3s from R2
 """
 
 from __future__ import annotations
@@ -161,45 +162,48 @@ def _upload_file(client, bucket: str, audio_hash: str, src: Path) -> None:
     )
 
 
-def _ensure_one(client, bucket: str | None, w: dict[str, Any]) -> str:
-    """Make the local cache MP3 for one word current. Order: reuse the local
-    cache, else pull the canonical bytes from R2, else synthesize via TTS and
-    upload them to R2. Returns "cached" | "r2" | "tts"."""
+def _ensure_one(client, bucket: str | None, w: dict[str, Any], resynth: bool = False) -> str:
+    """Produce the CURRENT MP3 for one word into the local cache. Returns "r2" | "tts".
+
+    The caller only passes words whose audio_hash changed or whose MP3 is missing,
+    so any existing local file (keyed by id, not audio_hash) is stale and must NOT
+    be reused. Order: durable R2 copy (content-addressed by audio_hash) → TTS.
+    With resynth=True, skip R2 and always synthesize fresh (then re-upload).
+    """
     dest = _cache_path(w["id"])
-    # 1. Local cache already correct (index check happened by the caller).
-    if dest.exists():
-        return "cached"
-    # 2. Durable copy in R2 — reuse byte-for-byte (idempotent across machines/runs).
-    if _download_file(client, bucket or "", w["audio_hash"], dest):
+    if not resynth and _download_file(client, bucket or "", w["audio_hash"], dest):
         return "r2"
-    # 3. Last resort: synthesize, then persist to R2 for next time.
     audio_engine.synthesize(w["text"], w["voice"], dest)
     _upload_file(client, bucket or "", w["audio_hash"], dest)
     return "tts"
 
 
-def ensure_audio(words: list[dict[str, Any]], dry_run: bool, client, bucket: str | None) -> dict[str, str]:
+def ensure_audio(
+    words: list[dict[str, Any]], dry_run: bool, client, bucket: str | None, resynth: bool = False
+) -> dict[str, str]:
     """Ensure every word has its current MP3 in the local cache.
 
     A word is (re)processed when its cached audio_hash differs or its MP3 is
-    missing. For each, prefer the local cache, then the durable R2 copy, then TTS.
+    missing. For each: pull the durable R2 copy, else synthesize via TTS. With
+    resynth=True, always synthesize fresh (ignore both the local cache and R2).
     Returns the updated index {id: audio_hash}.
     """
     index = _load_index()
-    todo = [
+    todo = words if resynth else [
         w for w in words
         if index.get(w["id"]) != w["audio_hash"] or not _cache_path(w["id"]).exists()
     ]
-    logger.info("Audio: %d of %d words need (re)generation.", len(todo), len(words))
+    verb = "re-synthesize (forced)" if resynth else "need (re)generation"
+    logger.info("Audio: %d of %d words %s.", len(todo), len(words), verb)
 
     if dry_run:
         logger.info("[DRY RUN] Skipping synthesis.")
         return index
 
     failed = 0
-    stats = {"cached": 0, "r2": 0, "tts": 0}
+    stats = {"r2": 0, "tts": 0}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(_ensure_one, client, bucket, w): w for w in todo}
+        futures = {ex.submit(_ensure_one, client, bucket, w, resynth): w for w in todo}
         for i, fut in enumerate(as_completed(futures), start=1):
             w = futures[fut]
             try:
@@ -284,6 +288,38 @@ def _fetch_remote_manifest(client, bucket: str) -> dict[str, Any]:
         return json.loads(obj["Body"].read())
     except Exception:  # noqa: BLE001 — missing/unreadable manifest -> treat as first run
         return {}
+
+
+def prune_orphan_files(client, bucket: str, live_hashes: set[str]) -> None:
+    """Delete audio/files/<hash>.mp3 objects no longer referenced by the current
+    vocabulary (e.g. after a voice/recipe change orphans the previous MP3s).
+
+    `live_hashes` is the set of audio_hash values for the current words — the only
+    per-word MP3s that should remain in R2.
+    """
+    prefix = f"{FILES_PREFIX}/"
+    paginator = client.get_paginator("list_objects_v2")
+    to_delete: list[dict[str, str]] = []
+    scanned = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            scanned += 1
+            key = obj["Key"]
+            h = key[len(prefix):]
+            if h.endswith(".mp3"):
+                h = h[: -len(".mp3")]
+            if h not in live_hashes:
+                to_delete.append({"Key": key})
+
+    logger.info("Prune: %d file(s) in R2, %d orphan(s) to delete.", scanned, len(to_delete))
+    deleted = 0
+    # S3 delete_objects accepts up to 1000 keys per call.
+    for i in range(0, len(to_delete), 1000):
+        batch = to_delete[i: i + 1000]
+        client.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
+        deleted += len(batch)
+    if deleted:
+        logger.info("Prune: deleted %d orphan MP3(s).", deleted)
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +429,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Synthesize and sync vocabulary audio to Cloudflare R2.")
     parser.add_argument("--dry-run", action="store_true", help="Synthesize + build locally, upload nothing.")
     parser.add_argument("--no-synth", action="store_true", help="Skip synthesis; pack from the existing cache.")
+    parser.add_argument("--resynth", action="store_true",
+                        help="Force fresh TTS for every word, ignoring the local cache AND R2 (then re-upload).")
     parser.add_argument("--force", action="store_true", help="Re-upload every pack even if unchanged (recovery).")
+    parser.add_argument("--prune-files", action="store_true",
+                        help="After uploading, delete audio/files/ MP3s in R2 no longer referenced (orphans).")
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true")
     verbosity.add_argument("-q", "--quiet", action="store_true")
@@ -402,8 +442,14 @@ def main() -> None:
     sync._setup_logging(args.verbose, args.quiet)
 
     if not args.dry_run:
-        missing = [k for k in ("R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET")
-                   if not os.environ.get(k)]
+        required = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"]
+        missing = [k for k in required if not os.environ.get(k)]
+        # Synthesis (any run that may call TTS) needs Azure Speech credentials too.
+        if not args.no_synth:
+            if not os.environ.get("AZURE_SPEECH_KEY"):
+                missing.append("AZURE_SPEECH_KEY")
+            if not os.environ.get("AZURE_SPEECH_ENDPOINT") and not os.environ.get("AZURE_SPEECH_REGION"):
+                missing.append("AZURE_SPEECH_ENDPOINT|AZURE_SPEECH_REGION")
         if missing:
             logger.error("Missing environment variables: %s", ", ".join(missing))
             logger.error("Set them in sync/.env (or run with --dry-run).")
@@ -424,11 +470,18 @@ def main() -> None:
     logger.info("Total speakable words: %d", len(words))
 
     if not args.no_synth:
-        ensure_audio(words, args.dry_run, client, bucket)
+        ensure_audio(words, args.dry_run, client, bucket, resynth=args.resynth)
     else:
         logger.info("Skipping synthesis (--no-synth); missing files will be pulled from R2.")
 
     build_and_upload(words, dry_run=args.dry_run, client=client, bucket=bucket, force=args.force)
+
+    if args.prune_files:
+        if args.dry_run or client is None:
+            logger.info("[DRY RUN] Skipping R2 prune.")
+        else:
+            prune_orphan_files(client, bucket, {w["audio_hash"] for w in words})
+
     logger.info("Audio sync complete.")
 
 

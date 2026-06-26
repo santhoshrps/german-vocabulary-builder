@@ -5,6 +5,6 @@
 httpx>=0.27
 openpyxl>=3.1
 python-dotenv>=1.0
-# Audio pipeline (audio_sync.py): TTS synthesis + R2 (S3-compatible) upload.
-edge-tts>=6.1
+# Audio pipeline (audio_sync.py): Azure Speech SDK for TTS; boto3 for R2 upload.
+azure-cognitiveservices-speech>=1.40
 boto3>=1.34

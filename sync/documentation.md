@@ -265,35 +265,82 @@ Excel reader, so word ids match exactly (`sha256(level|word)[:16]`).
 #   uv pip compile requirements.in -o requirements.txt   (or pip-compile)
 #   pip install -r requirements.txt
 
-python audio_sync.py            # synth changed words, build packs, upload changed
-python audio_sync.py --dry-run  # synth + build locally, upload nothing
-python audio_sync.py --no-synth # rebuild/upload packs from the existing cache
+python audio_sync.py              # synth changed words, build packs, upload changed
+python audio_sync.py --dry-run    # synth + build locally, upload nothing
+python audio_sync.py --no-synth   # rebuild/upload packs from the existing cache
+python audio_sync.py --prune-files # also delete orphaned per-word MP3s from R2
 ```
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Synthesize + build packs locally; upload nothing. Skips all R2 access. |
+| `--no-synth` | Skip synthesis; build packs from the existing cache (missing MP3s are pulled from R2). |
+| `--resynth` | Force fresh TTS for **every** word, ignoring both the local cache and R2 (then re-upload). Use after deleting R2 / changing the voice recipe. |
+| `--force` | Re-upload every pack even if unchanged. Recovery for when R2 holds a stale blob whose bytes don't match the manifest's `sha`. |
+| `--prune-files` | **After** uploading, delete `audio/files/<hash>.mp3` objects in R2 that the current vocabulary no longer references (orphans). Opt-in, since it deletes. Skipped under `--dry-run`. |
+| `-v` / `-q` | Verbose / quiet logging. |
 
 What it does:
 1. Reads every table; for each word derives `(text, voice)` — nouns spoken as
    `"<article> <word>"`, other types as the bare word — and an `audio_hash` of
-   that synthesis input.
+   that synthesis input. The voice is picked **deterministically per word** from a
+   gender-appropriate pool (see `audio_engine.py`), so the same word always maps to
+   the same voice.
 2. Synthesizes only words whose `audio_hash` changed or whose MP3 is missing
    (local cache in `sync/audio_cache/`). Text-only edits never re-synthesize.
+   Every synthesized MP3 is also mirrored to R2 at `audio/files/<audio_hash>.mp3`,
+   and a cache miss pulls those canonical bytes from R2 rather than re-synthesizing
+   — so audio is byte-stable across machines and cache clears.
 3. Groups words into packs: `free` (every `Free=1` word) and `<type>s/<level>`
    (e.g. `nouns/a1.1`). Each pack is a single `.pack` file:
    `[4-byte BE header length][JSON header][concatenated mp3 bytes]`.
-4. Uploads only packs whose hash changed, then writes `audio/manifest.json`
-   (pack hashes/bytes + which packs each scope may download). The read worker
-   serves the manifest scope-filtered and streams packs from R2.
+4. Uploads packs whose blob digest (`sha`) changed, then writes `audio/manifest.json`
+   (each pack's `hash`, `sha`, bytes + which packs each scope may download). The read
+   worker serves the manifest scope-filtered and streams packs from R2.
+
+### Pruning orphaned MP3s (`--prune-files`)
+
+The per-word MP3s in `audio/files/` are content-addressed by `audio_hash`. When the
+synthesis recipe changes — e.g. bumping `ENGINE_VERSION` or changing the voice pools
+— every word gets a **new** `audio_hash`, so the previous `audio/files/<old_hash>.mp3`
+objects become unreferenced. They're harmless but waste storage.
+
+`--prune-files` runs after a successful upload, lists everything under `audio/files/`,
+and deletes any object whose hash isn't in the current word set. The typical rebuild:
+
+```bash
+python audio_sync.py --dry-run        # preview
+python audio_sync.py --prune-files    # rebuild + upload, then clean up old MP3s
+```
+
+It only touches `audio/files/`; pack blobs (`audio/packs/`) are left alone.
 
 ### Audio configuration
 
 | Variable | File | Purpose |
 |----------|------|---------|
+| `AZURE_SPEECH_KEY` | `sync/.env` | Azure Speech / Foundry resource key (TTS synthesis) |
+| `AZURE_SPEECH_ENDPOINT` | `sync/.env` | Foundry / custom-domain resource URL, e.g. `https://<name>.cognitiveservices.azure.com` |
+| `AZURE_SPEECH_REGION` | `sync/.env` | *Alternative* to endpoint: a classic regional Speech resource, e.g. `westeurope` |
 | `R2_ACCOUNT_ID` | `sync/.env` | Cloudflare account id (R2 S3 endpoint) |
 | `R2_ACCESS_KEY_ID` | `sync/.env` | R2 API token access key |
 | `R2_SECRET_ACCESS_KEY` | `sync/.env` | R2 API token secret |
 | `R2_BUCKET` | `sync/.env` | Target R2 bucket (e.g. `german-vocabulary-media`) |
 
-Voices/prosody live in `audio_engine.py`. Bump `ENGINE_VERSION` there to force a
-full re-synthesis when the recipe changes.
+Synthesis uses the **Azure Cognitive Services Speech SDK**
+(`azure-cognitiveservices-speech`). The SDK natively handles an Azure AI Foundry /
+custom-domain resource from `AZURE_SPEECH_ENDPOINT` + `AZURE_SPEECH_KEY` — it
+discovers the region and manages auth tokens itself (the plain REST API does not, so
+a custom-domain resource returns 404/401 there). Voices are picked per word from
+gender pools in `audio_engine.py`; bump `ENGINE_VERSION` there to force a full
+re-synthesis when the recipe (voices/prosody/backend) changes. To force a one-off
+fresh synthesis ignoring both the local cache and R2, run with `--resynth`.
+
+> Note: the HD "Dragon" voices (`de-DE-…:DragonHDLatestNeural`) are **not** available
+> on this resource — they return "Unsupported voice". Use the standard `…Neural` /
+> `…MultilingualNeural` names.
 
 
 ### Manual setup before it runs
