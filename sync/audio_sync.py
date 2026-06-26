@@ -283,12 +283,21 @@ def _pack_hash(members: list[dict[str, Any]]) -> str:
 
 
 def _build_pack_bytes(members: list[dict[str, Any]]) -> bytes:
-    """Serialize members into the custom .pack container."""
+    """Serialize members into the custom .pack container.
+
+    Any member whose MP3 is missing (synthesis failed and no R2 copy) is skipped
+    with a warning rather than aborting the whole run — the word simply has no
+    audio in this pack until it synthesizes successfully on a later run.
+    """
     ordered = sorted(members, key=lambda m: m["id"])
     blobs: list[bytes] = []
     files: list[dict[str, Any]] = []
     for m in ordered:
-        data = _cache_path(m["id"]).read_bytes()
+        path = _cache_path(m["id"])
+        if not path.exists():
+            logger.warning("  pack: skipping %s — MP3 missing (synthesis failed?)", m["id"])
+            continue
+        data = path.read_bytes()
         files.append({"id": m["id"], "len": len(data)})
         blobs.append(data)
     header = json.dumps({"v": PACK_FORMAT_VERSION, "files": files}, separators=(",", ":")).encode("utf-8")
@@ -384,8 +393,19 @@ def build_and_upload(
     groups = _group_words(words)
     logger.info("Packs: %d groups (incl. free).", len(groups))
 
-    # Make sure every member's bytes are present locally (pull from R2 if needed).
-    if not dry_run:
+    if dry_run:
+        # Cache may be incomplete (synthesis was skipped) and there's no R2 client to
+        # hydrate from — so don't try to read pack bytes. Report structure instead.
+        missing = [w for w in words if not _cache_path(w["id"]).exists()]
+        if missing:
+            logger.info(
+                "[DRY RUN] %d packs across %d member files; %d not yet synthesized "
+                "(run without --dry-run to generate them). Skipping pack-size preview.",
+                len(groups), len(words), len(missing),
+            )
+            return
+    else:
+        # Make sure every member's bytes are present locally (pull from R2 if needed).
         _hydrate_missing(words, client, bucket)
 
     # Compute pack metadata for the new manifest.
