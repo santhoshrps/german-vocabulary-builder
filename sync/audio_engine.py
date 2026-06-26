@@ -163,19 +163,38 @@ def synthesis_for(table: str, row: dict[str, Any]) -> tuple[str, str] | None:
     return word, voice
 
 
+def _variant_text_voice(text: str | None, seed: str | None = None) -> tuple[str, str] | None:
+    """(text, voice) for an EXTRA spoken form (plural, sentence): an any-gender voice, picked
+    deterministically (seeded by `seed`, or the text) so the audio_hash is stable across runs.
+    Returns None when there is no text. Shared by plural_synthesis_for / sentence_synthesis_for so
+    every extra form is produced the same way.
+    """
+    t = (text or "").strip()
+    if not t:
+        return None
+    return t, _pick_voice(ALL_VOICES, (seed or t).lower())
+
+
 def plural_synthesis_for(row: dict[str, Any]) -> tuple[str, str] | None:
     """Map a noun row to (text, voice) for its PLURAL pronunciation.
 
-    Spoken as "die <plural>" — the German plural definite article is always "die",
-    regardless of the singular's gender. The voice is a per-word pick from the full
-    (any-gender) pool, since a plural has no single grammatical gender; like the
-    singular it is DETERMINISTIC (seeded by the plural form) so the audio_hash is
-    stable across runs. Returns None when the noun has no plural form.
+    Spoken as "die <plural>" — the German plural definite article is always "die", regardless of
+    the singular's gender. The voice is an any-gender deterministic pick seeded by the plural form
+    (so the audio_hash is stable). Returns None when the noun has no plural form.
     """
     plural = (row.get("plural") or "").strip()
     if not plural:
         return None
-    return f"die {plural}", _pick_voice(ALL_VOICES, plural.lower())
+    return _variant_text_voice(f"die {plural}", seed=plural)
+
+
+def sentence_synthesis_for(row: dict[str, Any]) -> tuple[str, str] | None:
+    """Map any row to (text, voice) for its German EXAMPLE-SENTENCE pronunciation.
+
+    Spoken verbatim (no added article), with an any-gender deterministic voice seeded by the
+    sentence. Applies to every word type. Returns None when the word has no German sentence.
+    """
+    return _variant_text_voice(row.get("german_sentence"))
 
 
 def audio_hash(text: str, voice: str) -> str:

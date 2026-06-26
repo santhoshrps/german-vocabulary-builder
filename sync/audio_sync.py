@@ -17,10 +17,11 @@ Design (mirrors the agreed concept):
     otherwise yield different bytes and needlessly churn every pack.)
   - Downloaded in PACKS, not per file: one ".pack" container per group so the
     app fetches a few dozen files instead of thousands.
-      * "free"             -> every free=1 word (the 100-word preview)
-      * "<type>s/<level>"  -> the full dataset, grouped (e.g. "nouns/a1.1")
-      * "plural/<level>"   -> noun plural pronunciations ("die <plural>"), full set
-      * "plural/free"      -> noun plurals for free words
+      * "free"              -> every free=1 word (the 100-word preview), singular
+      * "<type>s/<level>"   -> the full dataset, grouped (e.g. "nouns/a1.1"), singular
+      * "plural/<level>"    -> noun plural pronunciations ("die <plural>"), full set
+      * "sentence/<level>"  -> example-sentence pronunciations (all word types), full set
+      * "<variant>/free"    -> the free-word subset of each variant tier (plural/free, sentence/free)
   - Pack container format (no zip dependency on the client):
       [4-byte big-endian header length][UTF-8 JSON header][concatenated mp3 bytes]
       header = {"v":1,"files":[{"id": "...", "len": <int>}, ...]}  (sorted by id)
@@ -84,11 +85,27 @@ def _kind_of(table: str, row: dict[str, Any]) -> str:
     return "adverb" if t == "adverb" else "adjective"
 
 
-def collect_words() -> list[dict[str, Any]]:
-    """Read every table and return a flat list of word descriptors.
+def _descriptor(word_id: str, level: str, kind: str, free: int,
+                text: str, voice: str, variant: str) -> dict[str, Any]:
+    """Build one audio descriptor — used identically for the singular and every extra variant."""
+    return {
+        "id": word_id,
+        "level": level,
+        "kind": kind,
+        "free": free,
+        "text": text,
+        "voice": voice,
+        "audio_hash": audio_engine.audio_hash(text, voice),
+        "variant": variant,
+    }
 
-    Each: {id, level, kind, free, text, voice, audio_hash, variant}. Nouns with a
-    plural form also emit a "<id>_plural" descriptor (variant="plural").
+
+def collect_words() -> list[dict[str, Any]]:
+    """Read every table and return a flat list of audio descriptors.
+
+    Every word emits a "singular" descriptor. Nouns with a plural also emit "<id>_plural"
+    (variant="plural"); any word with a German example sentence also emits "<id>_sentence"
+    (variant="sentence"). Each: {id, level, kind, free, text, voice, audio_hash, variant}.
     """
     words: list[dict[str, Any]] = []
     for table in sync.TABLE_CONFIG:
@@ -99,37 +116,21 @@ def collect_words() -> list[dict[str, Any]]:
             if spec is None:
                 logger.warning("  skipping %s (no speakable word)", row.get("id"))
                 continue
-            text, voice = spec
+            wid = row["id"]
             level = (row.get("level") or "").strip().lower()
+            kind = _kind_of(table, row)
             free = int(row.get("free") or 0)
-            words.append({
-                "id": row["id"],
-                "level": level,
-                "kind": _kind_of(table, row),
-                "free": free,
-                "text": text,
-                "voice": voice,
-                "audio_hash": audio_engine.audio_hash(text, voice),
-                "variant": "singular",
-            })
+            words.append(_descriptor(wid, level, kind, free, *spec, "singular"))
 
-            # Nouns with a plural form get a second "die <plural>" pronunciation,
-            # tracked as a variant id "<id>_plural" so it synthesizes, caches, packs
-            # and re-syncs independently of the singular.
+            # Extra spoken forms — each a variant id "<id>_<variant>" so it synthesizes, caches,
+            # packs and re-syncs independently of the singular and of each other.
             if table == "nouns":
                 pspec = audio_engine.plural_synthesis_for(row)
                 if pspec is not None:
-                    ptext, pvoice = pspec
-                    words.append({
-                        "id": f"{row['id']}_plural",
-                        "level": level,
-                        "kind": "noun",
-                        "free": free,
-                        "text": ptext,
-                        "voice": pvoice,
-                        "audio_hash": audio_engine.audio_hash(ptext, pvoice),
-                        "variant": "plural",
-                    })
+                    words.append(_descriptor(f"{wid}_plural", level, kind, free, *pspec, "plural"))
+            sspec = audio_engine.sentence_synthesis_for(row)
+            if sspec is not None:
+                words.append(_descriptor(f"{wid}_sentence", level, kind, free, *sspec, "sentence"))
     return words
 
 
@@ -257,20 +258,28 @@ def ensure_audio(
 # Pack building
 # ---------------------------------------------------------------------------
 
-def _group_words(words: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Build the pack -> members map.
+def _is_free_pack(name: str) -> bool:
+    """A free-tier pack: the curated "free" pack, or any variant's "<variant>/free" pack."""
+    return name == "free" or name.endswith("/free")
 
-    Singular audio: "<type>s/<level>" for the full set, plus "free" for free words.
-    Plural audio (noun plurals) goes into a PARALLEL tier — "plural/<level>" for the
-    full set, plus "plural/free" — so it downloads alongside the singular yet adding
-    or changing it never re-uploads or re-downloads the singular packs.
+
+def _packs_for(w: dict[str, Any]) -> tuple[str, str]:
+    """(full_pack, free_pack) for a descriptor. The singular goes in the type/level tier; every
+    other variant (plural, sentence, …) goes in its OWN parallel tier "<variant>/<level>" plus
+    "<variant>/free" — so it downloads alongside the singular yet adding or changing one variant
+    never re-uploads or re-downloads the others. One rule covers every current and future variant.
     """
+    variant = w.get("variant", "singular")
+    if variant == "singular":
+        return f"{w['kind']}s/{w['level']}", "free"
+    return f"{variant}/{w['level']}", f"{variant}/free"
+
+
+def _group_words(words: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """Build the pack -> members map (see _packs_for for the tiering)."""
     groups: dict[str, list[dict[str, Any]]] = {}
     for w in words:
-        if w.get("variant") == "plural":
-            full_pack, free_pack = f"plural/{w['level']}", "plural/free"
-        else:
-            full_pack, free_pack = f"{w['kind']}s/{w['level']}", "free"
+        full_pack, free_pack = _packs_for(w)
         groups.setdefault(full_pack, []).append(w)
         if w["free"]:
             groups.setdefault(free_pack, []).append(w)
@@ -424,18 +433,19 @@ def build_and_upload(
             "count": len(members),
         }
 
-    # Scopes: free sessions get the free packs (singular "free" + "plural/free");
-    # full sessions get everything except those redundant free packs (the type/level
-    # and plural/level packs already contain every word, free ones included).
-    free_only = {"free", "plural/free"}
-    full_pack_names = sorted(n for n in new_packs if n not in free_only)
+    # Scopes: free sessions get the free packs (the curated "free" plus each variant's
+    # "<variant>/free", e.g. "plural/free", "sentence/free"); full sessions get everything else
+    # (the type/level and <variant>/level packs already contain every word, free ones included).
+    # Detecting free packs by name means a new variant tier needs no change here.
+    free_pack_names = sorted(n for n in new_packs if _is_free_pack(n))
+    full_pack_names = sorted(n for n in new_packs if not _is_free_pack(n))
     manifest = {
         "version": hashlib.sha256(
             "|".join(f"{n}:{new_packs[n]['hash']}" for n in sorted(new_packs)).encode()
         ).hexdigest()[:16],
         "packs": new_packs,
         "scopes": {
-            "free": [n for n in ("free", "plural/free") if n in new_packs],
+            "free": free_pack_names,
             "full": full_pack_names,
         },
     }
