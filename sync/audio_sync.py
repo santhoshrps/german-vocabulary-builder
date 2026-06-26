@@ -17,8 +17,10 @@ Design (mirrors the agreed concept):
     otherwise yield different bytes and needlessly churn every pack.)
   - Downloaded in PACKS, not per file: one ".pack" container per group so the
     app fetches a few dozen files instead of thousands.
-      * "free"            -> every free=1 word (the 100-word preview)
-      * "<type>s/<level>" -> the full dataset, grouped (e.g. "nouns/a1.1")
+      * "free"             -> every free=1 word (the 100-word preview)
+      * "<type>s/<level>"  -> the full dataset, grouped (e.g. "nouns/a1.1")
+      * "plural/<level>"   -> noun plural pronunciations ("die <plural>"), full set
+      * "plural/free"      -> noun plurals for free words
   - Pack container format (no zip dependency on the client):
       [4-byte big-endian header length][UTF-8 JSON header][concatenated mp3 bytes]
       header = {"v":1,"files":[{"id": "...", "len": <int>}, ...]}  (sorted by id)
@@ -85,7 +87,8 @@ def _kind_of(table: str, row: dict[str, Any]) -> str:
 def collect_words() -> list[dict[str, Any]]:
     """Read every table and return a flat list of word descriptors.
 
-    Each: {id, level, kind, free, text, voice, audio_hash}.
+    Each: {id, level, kind, free, text, voice, audio_hash, variant}. Nouns with a
+    plural form also emit a "<id>_plural" descriptor (variant="plural").
     """
     words: list[dict[str, Any]] = []
     for table in sync.TABLE_CONFIG:
@@ -97,15 +100,36 @@ def collect_words() -> list[dict[str, Any]]:
                 logger.warning("  skipping %s (no speakable word)", row.get("id"))
                 continue
             text, voice = spec
+            level = (row.get("level") or "").strip().lower()
+            free = int(row.get("free") or 0)
             words.append({
                 "id": row["id"],
-                "level": (row.get("level") or "").strip().lower(),
+                "level": level,
                 "kind": _kind_of(table, row),
-                "free": int(row.get("free") or 0),
+                "free": free,
                 "text": text,
                 "voice": voice,
                 "audio_hash": audio_engine.audio_hash(text, voice),
+                "variant": "singular",
             })
+
+            # Nouns with a plural form get a second "die <plural>" pronunciation,
+            # tracked as a variant id "<id>_plural" so it synthesizes, caches, packs
+            # and re-syncs independently of the singular.
+            if table == "nouns":
+                pspec = audio_engine.plural_synthesis_for(row)
+                if pspec is not None:
+                    ptext, pvoice = pspec
+                    words.append({
+                        "id": f"{row['id']}_plural",
+                        "level": level,
+                        "kind": "noun",
+                        "free": free,
+                        "text": ptext,
+                        "voice": pvoice,
+                        "audio_hash": audio_engine.audio_hash(ptext, pvoice),
+                        "variant": "plural",
+                    })
     return words
 
 
@@ -236,14 +260,20 @@ def ensure_audio(
 def _group_words(words: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     """Build the pack -> members map.
 
-    "free" gets every free word; "<type>s/<level>" gets the full grouping.
+    Singular audio: "<type>s/<level>" for the full set, plus "free" for free words.
+    Plural audio (noun plurals) goes into a PARALLEL tier — "plural/<level>" for the
+    full set, plus "plural/free" — so it downloads alongside the singular yet adding
+    or changing it never re-uploads or re-downloads the singular packs.
     """
     groups: dict[str, list[dict[str, Any]]] = {}
     for w in words:
-        full_pack = f"{w['kind']}s/{w['level']}"
+        if w.get("variant") == "plural":
+            full_pack, free_pack = f"plural/{w['level']}", "plural/free"
+        else:
+            full_pack, free_pack = f"{w['kind']}s/{w['level']}", "free"
         groups.setdefault(full_pack, []).append(w)
         if w["free"]:
-            groups.setdefault("free", []).append(w)
+            groups.setdefault(free_pack, []).append(w)
     return groups
 
 
@@ -374,16 +404,18 @@ def build_and_upload(
             "count": len(members),
         }
 
-    # Scopes: free sessions get only the "free" pack; full sessions get everything
-    # except the redundant free pack (the type/level packs already contain it).
-    full_pack_names = sorted(n for n in new_packs if n != "free")
+    # Scopes: free sessions get the free packs (singular "free" + "plural/free");
+    # full sessions get everything except those redundant free packs (the type/level
+    # and plural/level packs already contain every word, free ones included).
+    free_only = {"free", "plural/free"}
+    full_pack_names = sorted(n for n in new_packs if n not in free_only)
     manifest = {
         "version": hashlib.sha256(
             "|".join(f"{n}:{new_packs[n]['hash']}" for n in sorted(new_packs)).encode()
         ).hexdigest()[:16],
         "packs": new_packs,
         "scopes": {
-            "free": ["free"] if "free" in new_packs else [],
+            "free": [n for n in ("free", "plural/free") if n in new_packs],
             "full": full_pack_names,
         },
     }

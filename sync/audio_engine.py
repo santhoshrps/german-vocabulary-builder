@@ -163,6 +163,21 @@ def synthesis_for(table: str, row: dict[str, Any]) -> tuple[str, str] | None:
     return word, voice
 
 
+def plural_synthesis_for(row: dict[str, Any]) -> tuple[str, str] | None:
+    """Map a noun row to (text, voice) for its PLURAL pronunciation.
+
+    Spoken as "die <plural>" — the German plural definite article is always "die",
+    regardless of the singular's gender. The voice is a per-word pick from the full
+    (any-gender) pool, since a plural has no single grammatical gender; like the
+    singular it is DETERMINISTIC (seeded by the plural form) so the audio_hash is
+    stable across runs. Returns None when the noun has no plural form.
+    """
+    plural = (row.get("plural") or "").strip()
+    if not plural:
+        return None
+    return f"die {plural}", _pick_voice(ALL_VOICES, plural.lower())
+
+
 def audio_hash(text: str, voice: str) -> str:
     """Deterministic hash of the synthesis *input* (text + voice + recipe).
 

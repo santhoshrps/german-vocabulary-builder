@@ -442,10 +442,19 @@ export default {
       }
       if (request.method === "GET" && route === "audio" && sub === "manifest") {
         const claims = await requireSession(env, request);
+        if (!(await rateLimit(env, `audiomanifest:${rateSubjectKey(claims, ip)}`, 60, 600, nowSeconds()))) {
+          throw new HttpError(429, "rate limited");
+        }
         return await handleAudioManifest(env, request, ctx, scopeOf(claims));
       }
       if (request.method === "GET" && route === "audio" && sub === "pack") {
         const claims = await requireSession(env, request);
+        // Generous per-subject cap: a full first sync fetches only a few dozen packs
+        // (singular + plural across types/levels), so this never trips legitimate use
+        // but bounds scripted bulk scraping of the whole audio catalogue.
+        if (!(await rateLimit(env, `audiopack:${rateSubjectKey(claims, ip)}`, 300, 600, nowSeconds()))) {
+          throw new HttpError(429, "rate limited");
+        }
         // Pack name may contain a slash ("nouns/a1.1"): join the trailing parts.
         const name = parts.slice(3).join("/");
         if (!name) throw new HttpError(400, "missing pack name");
