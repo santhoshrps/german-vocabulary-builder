@@ -433,12 +433,15 @@ def build_and_upload(
             "count": len(members),
         }
 
-    # Scopes: free sessions get the free packs (the curated "free" plus each variant's
-    # "<variant>/free", e.g. "plural/free", "sentence/free"); full sessions get everything else
-    # (the type/level and <variant>/level packs already contain every word, free ones included).
-    # Detecting free packs by name means a new variant tier needs no change here.
+    # Scopes: free sessions get the starter (free-tier) packs (the curated "free" plus each
+    # variant's "<variant>/free", e.g. "plural/free", "sentence/free"). Full sessions are entitled
+    # to EVERYTHING, including the starter packs — every client always downloads the (tiny) starter
+    # packs so the curated/tutorial words have all forms (media_sync.md MS-FR-FREE-3 / MS-FR-CAT-3),
+    # and the client then chooses which full categories to actually fetch (word audio always;
+    # example-sentence/image audio opt-in — MS-FR-CAT-1/2). Detecting starter packs by name means a
+    # new variant tier needs no change here.
     free_pack_names = sorted(n for n in new_packs if _is_free_pack(n))
-    full_pack_names = sorted(n for n in new_packs if not _is_free_pack(n))
+    full_pack_names = sorted(new_packs.keys())
     manifest = {
         "version": hashlib.sha256(
             "|".join(f"{n}:{new_packs[n]['hash']}" for n in sorted(new_packs)).encode()

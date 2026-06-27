@@ -429,6 +429,29 @@ def compute_diff(
     return to_insert, to_update, to_delete
 
 
+# A sync touching more than this many rows (add + update + delete) prompts for
+# explicit confirmation before uploading — a guard against an accidental mass change
+# (e.g. a malformed Excel that would wipe and re-add everything).
+CONFIRM_THRESHOLD = 100
+
+
+def _confirm_large_change(table: str, total: int, counts: dict[str, int]) -> bool:
+    """Ask the operator to confirm a large change. Proceeds only if they type
+    'go ahead'; anything else (or a non-interactive stdin) aborts."""
+    # Use print/input (not logging) so the prompt shows even under --quiet.
+    print(
+        f"\n[CONFIRM] '{table}': {total} changes to apply "
+        f"({counts['inserted']} add, {counts['updated']} update, {counts['deleted']} delete) "
+        f"— exceeds the {CONFIRM_THRESHOLD}-change safety threshold."
+    )
+    try:
+        answer = input("Type 'go ahead' to proceed (anything else aborts): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    return answer == "go ahead"
+
+
 def sync_table(
     client: httpx.Client,
     table: str,
@@ -459,6 +482,12 @@ def sync_table(
 
     if dry_run:
         logger.info("  [DRY RUN] No changes written.")
+        return counts
+
+    total = counts["inserted"] + counts["updated"] + counts["deleted"]
+    if total > CONFIRM_THRESHOLD and not _confirm_large_change(table, total, counts):
+        logger.warning("  Aborted by user — '%s' NOT uploaded.", table)
+        counts["aborted"] = True
         return counts
 
     post_sync(client, table, to_insert + to_update, to_delete)
@@ -518,6 +547,7 @@ def main() -> None:
 
     totals: dict[str, int] = {"inserted": 0, "updated": 0, "deleted": 0}
     failures: list[str] = []
+    aborted: list[str] = []
 
     with httpx.Client(event_hooks={"request": [_sign_request]}) as client:
         for table in tables:
@@ -531,6 +561,9 @@ def main() -> None:
                 logger.error("%s: request failed: %s", table, exc)
                 failures.append(table)
                 continue
+            if result.get("aborted"):
+                aborted.append(table)
+                continue
             for key in totals:
                 totals[key] += result[key]
 
@@ -540,11 +573,13 @@ def main() -> None:
     print(f"  Added   : {totals['inserted']}")
     print(f"  Updated : {totals['updated']}")
     print(f"  Deleted : {totals['deleted']}")
+    if aborted:
+        print(f"  Aborted : {len(aborted)} table(s) — {', '.join(aborted)} (not uploaded)")
     if failures:
         print(f"  Failed  : {len(failures)} table(s) — {', '.join(failures)}")
     print(f"{'─' * 44}")
 
-    if failures:
+    if failures or aborted:
         sys.exit(1)
     if not args.dry_run:
         print("Sync complete.")
