@@ -15,6 +15,7 @@ Usage:
   python image_sync.py --dry-run       # build/report locally, upload nothing
   python image_sync.py --no-source     # skip sourcing; (re)build/publish from existing decisions+cache
   python image_sync.py --limit 50      # process at most 50 not-yet-settled nouns this run
+  python image_sync.py --workers 4     # generate 4 nouns in parallel (errors retry, never settle)
   python image_sync.py --free-first    # generate the free-tier nouns before the rest
   python image_sync.py --force         # re-upload every image pack (recovery)
   python image_sync.py --prune-files   # delete orphan image/files masters in R2
@@ -137,7 +138,8 @@ def _level_rank(level: str) -> tuple[int, int, int]:
     return ("abc".index(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
 
 
-def _source_pass(nouns, store, queue, opts, *, client, bucket, dry_run, limit, free_first=False) -> None:
+def _source_pass(nouns, store, queue, opts, *, client, bucket, dry_run, limit, free_first=False,
+                 workers=1) -> None:
     def _should_generate(n: dict[str, Any]) -> bool:
         # (Re)generate when the content changed or is new (approved/none/review all re-trigger on a
         # changed fingerprint). A noun already settled for its current content is NOT regenerated —
@@ -176,21 +178,28 @@ def _source_pass(nouns, store, queue, opts, *, client, bucket, dry_run, limit, f
         return
 
     today = date.today().isoformat()
-    stats = {"approved": 0, "review": 0, "none": 0}
-    for i, noun in enumerate(todo, 1):
-        nid = noun["id"]
-        outcome = image_engine.process_noun(
+    total = len(todo)
+    stats = {"approved": 0, "review": 0, "none": 0, "error": 0}
+
+    def _generate(noun: dict[str, Any]) -> "image_engine.Outcome":
+        """Pure, side-effect-free: the slow FLUX call(s) + crop/encode. Safe to run on a worker
+        thread — touches no shared state and never writes the store/queue/R2."""
+        return image_engine.process_noun(
             noun,
-            use_sentence=image_decisions.uses_sentence(opts, nid),
-            note=image_decisions.get_note(opts, nid),
+            use_sentence=image_decisions.uses_sentence(opts, noun["id"]),
+            note=image_decisions.get_note(opts, noun["id"]),
         )
-        # One line per word: position · CEFR level · free/paid · source (review+prompt vs new) · result.
+
+    def _apply(i: int, noun: dict[str, Any], outcome) -> None:
+        """Reduce step — runs ONLY on the main thread, so store/queue/stats need no locking.
+        An 'error' outcome writes NOTHING (the noun stays unsettled and is retried next run)."""
+        nid = noun["id"]
         lvl = (noun.get("level") or "?").upper()
         tier = "free" if noun.get("free") else "paid"
         src = "review+prompt" if image_decisions.get_note(opts, nid) else "new"
         res = f"review×{len(outcome.candidates)}" if outcome.status == "review" else outcome.status
         logger.info("  [%d/%d] %-5s %-4s %-13s %s (%s) → %s",
-                    i, len(todo), lvl, tier, src, noun.get("word", ""), noun.get("english", ""), res)
+                    i, total, lvl, tier, src, noun.get("word", ""), noun.get("english", ""), res)
         if outcome.status == "approved":
             pc = outcome.chosen
             _write_master(pc.master, pc.content_hash)
@@ -208,20 +217,46 @@ def _source_pass(nouns, store, queue, opts, *, client, bucket, dry_run, limit, f
                 _write_master(pc.master, pc.content_hash)  # local masters; review server transcodes to JPEG
             image_decisions.mark_review(store, noun, today)
             queue[nid] = _queue_entry(noun, outcome)
-        else:
+        elif outcome.status == "error":
+            # Generation FAILED — do NOT settle. Leave the decision untouched so the next run's
+            # _should_generate() picks it up again. (No queue/store mutation here on purpose.)
+            pass
+        else:  # "none" — a clean miss (e.g. content-safety blocked): settle so we don't loop forever.
             image_decisions.mark_none(store, noun, today)
             queue.pop(nid, None)
-        stats[outcome.status] += 1
+        stats[outcome.status] = stats.get(outcome.status, 0) + 1
 
         if i % SAVE_EVERY == 0:
             image_decisions.save(store)
             _save_review_queue(queue)
-            logger.info("  …%d/%d (approved=%d review=%d none=%d)", i, len(todo),
-                        stats["approved"], stats["review"], stats["none"])
+            logger.info("  …%d/%d (approved=%d review=%d none=%d error=%d)", i, total,
+                        stats["approved"], stats["review"], stats["none"], stats["error"])
+
+    if workers and workers > 1:
+        # Parallel generate (threads) → serial apply (main thread). process_noun is pure; only the
+        # cheap reduce mutates shared state, so no locks are needed and nouns never confuse each other.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        logger.info("Generating with %d parallel worker(s).", workers)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(_generate, n): n for n in todo}
+            for i, fut in enumerate(as_completed(futs), 1):
+                noun = futs[fut]
+                try:
+                    outcome = fut.result()
+                except Exception as exc:  # noqa: BLE001 — anything unexpected: count as error, never settle
+                    stats["error"] += 1
+                    logger.warning("  [%d/%d] generation FAILED for %s (%s) — left unsettled, will retry",
+                                   i, total, noun.get("word", ""), exc)
+                    continue
+                _apply(i, noun, outcome)
+    else:
+        for i, noun in enumerate(todo, 1):
+            _apply(i, noun, _generate(noun))
 
     image_decisions.save(store)
     _save_review_queue(queue)
-    logger.info("Sourcing done: approved=%d, review=%d, none=%d.", stats["approved"], stats["review"], stats["none"])
+    logger.info("Sourcing done: approved=%d, review=%d, none=%d, error=%d (errors retry next run).",
+                stats["approved"], stats["review"], stats["none"], stats["error"])
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +351,8 @@ def _reencode_pass(store, *, client, bucket, dry_run) -> None:
 
 
 def run(*, dry_run: bool, no_source: bool, limit: int, force: bool, prune_files: bool,
-        free_first: bool = False, reencode_masters: bool = False, client=None, bucket: str | None = None) -> None:
+        free_first: bool = False, reencode_masters: bool = False, workers: int = 1,
+        client=None, bucket: str | None = None) -> None:
     logger.info("Reading nouns…")
     nouns = collect_nouns()
     logger.info("Flagged for images: %d noun(s).", len(nouns))
@@ -329,7 +365,7 @@ def run(*, dry_run: bool, no_source: bool, limit: int, force: bool, prune_files:
         _reencode_pass(store, client=client, bucket=bucket, dry_run=dry_run)
     elif not no_source:
         _source_pass(nouns, store, queue, opts, client=client, bucket=bucket, dry_run=dry_run,
-                     limit=limit, free_first=free_first)
+                     limit=limit, free_first=free_first, workers=workers)
     else:
         logger.info("Skipping sourcing (--no-source); building from existing decisions + cache.")
 
@@ -412,6 +448,9 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="Process at most N not-yet-settled nouns this run.")
     parser.add_argument("--free-first", action="store_true",
                         help="Generate the free-tier (Free=1) nouns before the rest (composes with --limit).")
+    parser.add_argument("--workers", type=int, default=1, metavar="N",
+                        help="Generate N nouns in parallel (threads). Default 1. 3–4 is a good balance "
+                             "vs. Azure rate limits; failures are isolated and retried, never settled.")
     parser.add_argument("--force", action="store_true", help="Re-upload every image pack (recovery).")
     parser.add_argument("--reencode-masters", action="store_true",
                         help="Transcode all approved masters to Apple-conformant HEIC (sips) without "
@@ -429,6 +468,7 @@ def main() -> None:
     args = parser.parse_args()
 
     sync._setup_logging(args.verbose, args.quiet)
+    args.workers = max(1, min(args.workers, 8))   # clamp to a sane range
 
     if not args.dry_run:
         required = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"]
@@ -453,7 +493,7 @@ def main() -> None:
     try:
         run(dry_run=args.dry_run, no_source=args.no_source, limit=args.limit, force=args.force,
             prune_files=args.prune_files, free_first=args.free_first,
-            reencode_masters=args.reencode_masters, client=client, bucket=bucket)
+            reencode_masters=args.reencode_masters, workers=args.workers, client=client, bucket=bucket)
     except sync.ValidationError as exc:
         logger.error("Validation failed: %s", exc)
         sys.exit(1)

@@ -135,6 +135,10 @@ def main() -> None:
                     queue[nid] = image_sync._queue_entry(noun, outcome)
                     logger.info("  removed old picture → regenerated %d candidate(s); run image_review.py to pick",
                                 len(outcome.candidates))
+                elif outcome.status == "error":
+                    # Generation FAILED — leave it unsettled (we already popped the old decision) so a
+                    # re-run retries. Don't mark none.
+                    logger.warning("  removed old picture; generation FAILED — left unsettled, re-run to retry")
                 else:
                     image_decisions.mark_none(store, noun, today)
                     logger.info("  removed old picture; generation produced nothing — left without an image")
@@ -159,7 +163,11 @@ def main() -> None:
             styles = [args.style or "photo"] if args.prompt else ([args.style] if args.style else cfg.GENERATION_STYLES)
             done = False
             for style in styles:
-                raw = image_engine.generate(noun, style, prompt=args.prompt)
+                try:
+                    raw = image_engine.generate(noun, style, prompt=args.prompt)
+                except image_engine.GenerationError as exc:
+                    logger.warning("  generation (%s) failed: %s — trying next", style, exc)
+                    continue
                 if raw is None:
                     continue
                 master, jpeg = image_engine.process_for_approval(raw)

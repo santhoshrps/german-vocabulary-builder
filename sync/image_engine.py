@@ -37,6 +37,12 @@ from image_sources import Candidate
 
 logger = logging.getLogger("image_engine")
 
+
+class GenerationError(RuntimeError):
+    """A generation attempt FAILED (HTTP error, timeout, unusable response) — as opposed to a clean
+    'no image'. Callers must leave the noun UNSETTLED so it is retried, never mark it completed."""
+
+
 # How many CLIP-ranked candidates we actually process + verify per noun (bounds API cost).
 VERIFY_BUDGET = 3
 
@@ -63,7 +69,7 @@ class ProcessedCandidate:
 
 @dataclass
 class Outcome:
-    status: str                                              # "approved" | "review" | "none"
+    status: str                                              # "approved" | "review" | "none" | "error"
     chosen: ProcessedCandidate | None = None                # set when approved
     candidates: list[ProcessedCandidate] = field(default_factory=list)  # ranked, set when review
 
@@ -484,15 +490,17 @@ def generate(noun: dict[str, Any], style: str, *, prompt: str | None = None,
             return image_sources.fetch_image_bytes(img_url)
         logger.warning("  generation (%s): unrecognised response shape: %s",
                        style, str(payload)[:300])
-        return None
+        raise GenerationError("unrecognised response shape")
+    except GenerationError:
+        raise                                       # already classified — propagate as-is
     except httpx.HTTPStatusError as exc:
         # Surface the API's explanation — a 400 body says exactly which field is wrong.
         logger.warning("  generation (%s) %s: %s", style, exc.response.status_code,
                        exc.response.text[:500])
-        return None
-    except Exception as exc:  # noqa: BLE001
+        raise GenerationError(f"HTTP {exc.response.status_code}") from exc
+    except Exception as exc:  # noqa: BLE001 — network/timeout/decode → a (retryable) failure, not a clean miss
         logger.warning("  generation (%s) errored: %s", style, exc)
-        return None
+        raise GenerationError(str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -544,16 +552,23 @@ def process_noun(noun: dict[str, Any], *, allow_generation: bool | None = None,
 
     model = cfg.env("AZURE_FOUNDRY_IMAGE_MODEL", cfg.IMAGE_GEN_MODEL)
     review: list[ProcessedCandidate] = []
+    errored = False                                 # a style FAILED (vs. cleanly produced no image)
     for style in cfg.GENERATION_STYLES:
-        raw = generate(noun, style, use_sentence=use_sentence, note=note)
-        if raw is None:
+        try:
+            raw = generate(noun, style, use_sentence=use_sentence, note=note)
+        except GenerationError as exc:              # transient/API failure → must be retried
+            errored = True
+            logger.warning("  generation (%s) failed for %s: %s", style, label, exc)
             continue
+        if raw is None:
+            continue                                # not configured (no key) — nothing to do
         # Crop once → HEIC master (ship) + JPEG rendition (Content-Safety screen). No verify.
         try:
             cropped = _crop_to_slot(raw)
             master = encode_master(cropped)
             vision = _to_jpeg(cropped)
-        except Exception as exc:  # noqa: BLE001 — bad bytes from generation → skip this style
+        except Exception as exc:  # noqa: BLE001 — bad bytes from generation → treat as a retryable failure
+            errored = True
             logger.warning("  process failed for %s (%s): %s", label, style, exc)
             continue
         if not content_safe(vision):
@@ -570,5 +585,10 @@ def process_noun(noun: dict[str, Any], *, allow_generation: bool | None = None,
     if review:
         logger.debug("  → review %s (%d generated image(s))", label, len(review))
         return Outcome(status="review", candidates=review)
+    # No usable image. If a style FAILED, this is an error → leave the noun UNSETTLED so it retries.
+    # Only a clean run that simply produced nothing (e.g. content-safety blocked) settles as "none".
+    if errored:
+        logger.warning("  ⚠ generation errored for %s — left unsettled, will retry next run", label)
+        return Outcome(status="error")
     logger.debug("  ∅ no image generated for %s", label)
     return Outcome(status="none")
