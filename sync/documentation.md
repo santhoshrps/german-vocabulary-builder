@@ -349,3 +349,49 @@ Add R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET to sync/.en
 `python audio_sync.py` (synthesizes + uploads packs + manifest).
 Redeploy the read worker (wrangler deploy).
 Build the app in Xcode.
+
+## Image pipeline (`image_sync.py`)
+
+Sources a **premium picture for every noun flagged** in the Image column (`x` or `y`) and publishes it
+as the **image** media category into the SAME media manifest as audio (via `media_delivery.publish`,
+namespace-aware — it never touches the audio packs). Funnel: stock/CC search → CLIP pre-rank →
+smart-crop → **HEIC** master (≤500 KB) → Content-Safety → GPT-4o verify → auto-approve or queue for
+review → DALL·E fallback. Idempotent + resumable: an **approved image never changes** unless the
+word's gloss/word/sentence changes (decisions live in `image_decisions.json`, which is committed).
+Full design: `flashcard-german/Others/Docs/image_generation.md`; requirements:
+`.../Others/Requirements/images.md`.
+
+```bash
+# one-time: add the image deps (Pillow, pillow-heif, open-clip-torch, torch, openai, azure-*) and install
+#   uv pip compile requirements.in -o requirements.txt && uv pip install -r requirements.txt
+```
+
+### Tools & flags
+
+`python image_sync.py` — source/verify/pack/publish what's needed.
+- `--dry-run`     build/report locally, upload nothing
+- `--no-source`   skip sourcing; (re)build/publish from existing decisions + cache only
+- `--limit N`     process at most N not-yet-settled nouns this run (use `--limit 20` as a first smoke test)
+- `--force`       re-upload every image pack (recovery)
+- `--prune-files` after publishing, delete `image/files/` masters in R2 no longer referenced
+- `-v` / `-q`     verbosity
+
+`python image_review.py` — opens a local, keyboard-driven contact sheet for the LOW-CONFIDENCE nouns
+(1–9 pick · n none · s/→ skip). Writes picks straight into `image_decisions.json`. `--port` (default
+8765), `--no-open`.
+
+`python image_regen.py <word|id> …` — redo specific noun(s) on demand (overrides the pin; republishes
+only those). Default is **re-search** (no flag); `--generate [--style photo|illustration] [--prompt "…"]`
+to generate via Foundry; `--image <file|url>` to supply your own; `--dry-run` to preview.
+
+### Keys (sync/.env, never committed)
+`PIXABAY_API_KEY`, `PEXELS_API_KEY` (stock); `AZURE_FOUNDRY_ENDPOINT` / `AZURE_FOUNDRY_KEY` (+
+`AZURE_FOUNDRY_VERIFY_DEPLOYMENT`, `AZURE_FOUNDRY_IMAGE_DEPLOYMENT`, `AZURE_FOUNDRY_API_VERSION`) for
+the verifier + generation; optional `AZURE_VISION_*` (smart crop) and `AZURE_CONTENT_SAFETY_*`; plus
+the shared `R2_*`. Missing optional services degrade gracefully (no CLIP → source order; no verifier →
+everything goes to review; no Content Safety → a one-time warning).
+
+### Run order
+`python sync.py` (text) → `python image_sync.py` (images) → `python image_review.py` (the uncertain
+ones) → commit `image_decisions.json`. **No worker deploy needed** — images ride the existing
+`/v1/audio/*` endpoints. Build the app in Xcode.

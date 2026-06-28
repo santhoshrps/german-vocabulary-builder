@@ -41,11 +41,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import logging
 import os
-import struct
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -54,6 +52,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 import audio_engine
+import media_delivery  # shared .pack/manifest/R2 layer (also used by image_sync.py)
 import sync  # reuse read_excel / TABLE_CONFIG / logging setup from the text pipeline
 
 load_dotenv(Path(__file__).parent / ".env")
@@ -62,12 +61,10 @@ logger = logging.getLogger("audio_sync")
 
 CACHE_DIR = Path(__file__).parent / "audio_cache"
 INDEX_PATH = CACHE_DIR / "index.json"          # {id: audio_hash}
-PACKS_PREFIX = "audio/packs"                    # R2 key prefix for packs
-FILES_PREFIX = "audio/files"                    # R2 key prefix for content-addressed MP3s
-MANIFEST_KEY = "audio/manifest.json"           # R2 key for the manifest
+FILES_PREFIX = "audio/files"                    # R2 key prefix for this producer's content-addressed MP3 masters
+# The shared pack space + manifest + .pack format live in media_delivery.
 
 MAX_WORKERS = 6
-PACK_FORMAT_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -156,35 +153,20 @@ def _cache_path(word_id: str) -> Path:
     return CACHE_DIR / f"{word_id}.mp3"
 
 
-def _file_key(audio_hash: str) -> str:
-    """R2 key for a content-addressed MP3. Keyed by the synthesis recipe hash, so
-    identical (text+voice+recipe) words share one durable object."""
-    return f"{FILES_PREFIX}/{audio_hash}.mp3"
-
-
 def _download_file(client, bucket: str, audio_hash: str, dest: Path) -> bool:
-    """Pull a previously-synthesized MP3 from R2 into the local cache. Returns
-    True on success. This is what makes re-synthesis idempotent: the canonical
-    bytes for a recipe live in R2 and are reused verbatim, never regenerated."""
+    """Pull a previously-synthesized MP3 master from R2 into the local cache. Returns True on
+    success. This is what makes re-synthesis idempotent: the canonical bytes for a recipe live in R2
+    (content-addressed by audio_hash) and are reused verbatim, never regenerated."""
     if client is None:
         return False
-    try:
-        obj = client.get_object(Bucket=bucket, Key=_file_key(audio_hash))
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(obj["Body"].read())
-        return True
-    except Exception:  # noqa: BLE001 — missing object -> fall back to synthesis
-        return False
+    return media_delivery.download_file(client, bucket, FILES_PREFIX, audio_hash, "mp3", dest)
 
 
 def _upload_file(client, bucket: str, audio_hash: str, src: Path) -> None:
-    """Mirror a freshly-synthesized MP3 to R2 so it never needs regenerating."""
+    """Mirror a freshly-synthesized MP3 master to R2 so it never needs regenerating."""
     if client is None:
         return
-    client.put_object(
-        Bucket=bucket, Key=_file_key(audio_hash),
-        Body=src.read_bytes(), ContentType="audio/mpeg",
-    )
+    media_delivery.upload_file(client, bucket, FILES_PREFIX, audio_hash, "mp3", src)
 
 
 def _ensure_one(client, bucket: str | None, w: dict[str, Any], resynth: bool = False) -> str:
@@ -255,12 +237,14 @@ def ensure_audio(
 
 
 # ---------------------------------------------------------------------------
-# Pack building
+# Pack grouping (the .pack container, hashing and manifest live in media_delivery)
 # ---------------------------------------------------------------------------
 
-def _is_free_pack(name: str) -> bool:
-    """A free-tier pack: the curated "free" pack, or any variant's "<variant>/free" pack."""
-    return name == "free" or name.endswith("/free")
+def _owns_audio_pack(name: str) -> bool:
+    """This producer owns EVERY pack except the image category (image/<level>, image/free),
+    which image_sync.py owns. Used by media_delivery.publish so the two producers share the one
+    manifest without clobbering each other."""
+    return not name.startswith("image/")
 
 
 def _packs_for(w: dict[str, Any]) -> tuple[str, str]:
@@ -286,88 +270,14 @@ def _group_words(words: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]
     return groups
 
 
-def _pack_hash(members: list[dict[str, Any]]) -> str:
-    payload = "|".join(f"{m['id']}:{m['audio_hash']}" for m in sorted(members, key=lambda m: m["id"]))
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
-
-
-def _build_pack_bytes(members: list[dict[str, Any]]) -> bytes:
-    """Serialize members into the custom .pack container.
-
-    Any member whose MP3 is missing (synthesis failed and no R2 copy) is skipped
-    with a warning rather than aborting the whole run — the word simply has no
-    audio in this pack until it synthesizes successfully on a later run.
-    """
-    ordered = sorted(members, key=lambda m: m["id"])
-    blobs: list[bytes] = []
-    files: list[dict[str, Any]] = []
-    for m in ordered:
-        path = _cache_path(m["id"])
-        if not path.exists():
-            logger.warning("  pack: skipping %s — MP3 missing (synthesis failed?)", m["id"])
-            continue
-        data = path.read_bytes()
-        files.append({"id": m["id"], "len": len(data)})
-        blobs.append(data)
-    header = json.dumps({"v": PACK_FORMAT_VERSION, "files": files}, separators=(",", ":")).encode("utf-8")
-    return struct.pack(">I", len(header)) + header + b"".join(blobs)
-
-
 # ---------------------------------------------------------------------------
-# R2 (S3-compatible)
+# R2 master mirror (the shared client/pack/manifest live in media_delivery)
 # ---------------------------------------------------------------------------
-
-def _r2_client():
-    import boto3  # local import so --dry-run works without credentials/boto3
-
-    account = os.environ["R2_ACCOUNT_ID"]
-    return boto3.client(
-        "s3",
-        endpoint_url=f"https://{account}.r2.cloudflarestorage.com",
-        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-        region_name="auto",
-    )
-
-
-def _fetch_remote_manifest(client, bucket: str) -> dict[str, Any]:
-    try:
-        obj = client.get_object(Bucket=bucket, Key=MANIFEST_KEY)
-        return json.loads(obj["Body"].read())
-    except Exception:  # noqa: BLE001 — missing/unreadable manifest -> treat as first run
-        return {}
-
 
 def prune_orphan_files(client, bucket: str, live_hashes: set[str]) -> None:
-    """Delete audio/files/<hash>.mp3 objects no longer referenced by the current
-    vocabulary (e.g. after a voice/recipe change orphans the previous MP3s).
-
-    `live_hashes` is the set of audio_hash values for the current words — the only
-    per-word MP3s that should remain in R2.
-    """
-    prefix = f"{FILES_PREFIX}/"
-    paginator = client.get_paginator("list_objects_v2")
-    to_delete: list[dict[str, str]] = []
-    scanned = 0
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            scanned += 1
-            key = obj["Key"]
-            h = key[len(prefix):]
-            if h.endswith(".mp3"):
-                h = h[: -len(".mp3")]
-            if h not in live_hashes:
-                to_delete.append({"Key": key})
-
-    logger.info("Prune: %d file(s) in R2, %d orphan(s) to delete.", scanned, len(to_delete))
-    deleted = 0
-    # S3 delete_objects accepts up to 1000 keys per call.
-    for i in range(0, len(to_delete), 1000):
-        batch = to_delete[i: i + 1000]
-        client.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
-        deleted += len(batch)
-    if deleted:
-        logger.info("Prune: deleted %d orphan MP3(s).", deleted)
+    """Delete audio/files/<hash>.mp3 masters no longer referenced by the current vocabulary
+    (e.g. after a voice/recipe change orphans the previous MP3s)."""
+    media_delivery.prune_orphan_files(client, bucket, FILES_PREFIX, "mp3", live_hashes)
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +306,25 @@ def _hydrate_missing(words: list[dict[str, Any]], client, bucket: str | None) ->
     logger.info("Hydrated %d/%d from R2.", pulled, len(missing))
 
 
+def _build_owned_packs(groups: dict[str, list[dict[str, Any]]]) -> dict[str, list[media_delivery.Member]]:
+    """Turn the grouped descriptors into media_delivery members (id, audio_hash, mp3 bytes).
+
+    A member whose MP3 is missing (synthesis failed and no R2 copy) is skipped with a warning rather
+    than aborting the run — the word simply has no audio in this pack until a later run produces it.
+    """
+    owned: dict[str, list[media_delivery.Member]] = {}
+    for name, members in groups.items():
+        out: list[media_delivery.Member] = []
+        for m in sorted(members, key=lambda m: m["id"]):
+            path = _cache_path(m["id"])
+            if not path.exists():
+                logger.warning("  pack: skipping %s — MP3 missing (synthesis failed?)", m["id"])
+                continue
+            out.append((m["id"], m["audio_hash"], path.read_bytes()))
+        owned[name] = out
+    return owned
+
+
 def build_and_upload(
     words: list[dict[str, Any]], dry_run: bool, client=None, bucket: str | None = None, force: bool = False
 ) -> None:
@@ -403,91 +332,30 @@ def build_and_upload(
     logger.info("Packs: %d groups (incl. free).", len(groups))
 
     if dry_run:
-        # Cache may be incomplete (synthesis was skipped) and there's no R2 client to
-        # hydrate from — so don't try to read pack bytes. Report structure instead.
+        # Cache may be incomplete (synthesis was skipped) and there's no R2 client to hydrate from —
+        # report structure and let publish() preview without uploading.
         missing = [w for w in words if not _cache_path(w["id"]).exists()]
         if missing:
             logger.info(
                 "[DRY RUN] %d packs across %d member files; %d not yet synthesized "
-                "(run without --dry-run to generate them). Skipping pack-size preview.",
+                "(run without --dry-run to generate them).",
                 len(groups), len(words), len(missing),
             )
-            return
     else:
         # Make sure every member's bytes are present locally (pull from R2 if needed).
         _hydrate_missing(words, client, bucket)
 
-    # Compute pack metadata for the new manifest.
-    new_packs: dict[str, dict[str, Any]] = {}
-    pack_bytes: dict[str, bytes] = {}
-    for name, members in groups.items():
-        data = _build_pack_bytes(members)
-        pack_bytes[name] = data
-        new_packs[name] = {
-            "hash": _pack_hash(members),
-            # Digest of the ACTUAL .pack blob, so the client can verify integrity of the
-            # downloaded bytes (the `hash` above is a content-identity over id:audio_hash
-            # pairs, used for diffing — it does NOT detect a truncated/corrupt download).
-            "sha": hashlib.sha256(data).hexdigest(),
-            "bytes": len(data),
-            "count": len(members),
-        }
-
-    # Scopes: free sessions get the starter (free-tier) packs (the curated "free" plus each
-    # variant's "<variant>/free", e.g. "plural/free", "sentence/free"). Full sessions are entitled
-    # to EVERYTHING, including the starter packs — every client always downloads the (tiny) starter
-    # packs so the curated/tutorial words have all forms (media_sync.md MS-FR-FREE-3 / MS-FR-CAT-3),
-    # and the client then chooses which full categories to actually fetch (word audio always;
-    # example-sentence/image audio opt-in — MS-FR-CAT-1/2). Detecting starter packs by name means a
-    # new variant tier needs no change here.
-    free_pack_names = sorted(n for n in new_packs if _is_free_pack(n))
-    full_pack_names = sorted(new_packs.keys())
-    manifest = {
-        "version": hashlib.sha256(
-            "|".join(f"{n}:{new_packs[n]['hash']}" for n in sorted(new_packs)).encode()
-        ).hexdigest()[:16],
-        "packs": new_packs,
-        "scopes": {
-            "free": free_pack_names,
-            "full": full_pack_names,
-        },
-    }
-
-    if dry_run:
-        total = sum(p["bytes"] for p in new_packs.values())
-        logger.info("[DRY RUN] Built %d packs (%.1f MB). Nothing uploaded.", len(new_packs), total / 1e6)
-        logger.info("[DRY RUN] manifest version would be %s", manifest["version"])
-        return
-
-    remote = _fetch_remote_manifest(client, bucket)
-    remote_packs = remote.get("packs", {})
-
-    uploaded = 0
-    for name, meta in new_packs.items():
-        # Skip only when the exact blob is already in R2. Compare on `sha` (the
-        # actual .pack digest), not `hash` (content identity): the bytes can
-        # change while `hash` stays the same, and keying on `hash` would leave a
-        # stale blob in R2 whose sha no longer matches the manifest, failing the
-        # client's integrity check. `--force` re-uploads everything (use it to
-        # recover a manifest that already claims a sha the stored blob doesn't have).
-        if not force and remote_packs.get(name, {}).get("sha") == meta["sha"]:
-            continue  # exact blob already in R2 — skip upload
-        client.put_object(
-            Bucket=bucket,
-            Key=f"{PACKS_PREFIX}/{name}.pack",
-            Body=pack_bytes[name],
-            ContentType="application/octet-stream",
-        )
-        uploaded += 1
-        logger.info("  uploaded %s (%d files, %.1f KB)", name, meta["count"], meta["bytes"] / 1e3)
-
-    client.put_object(
-        Bucket=bucket,
-        Key=MANIFEST_KEY,
-        Body=json.dumps(manifest).encode("utf-8"),
-        ContentType="application/json",
+    # Publish this producer's packs into the ONE shared media manifest, preserving the image
+    # category (owned by image_sync.py). Scopes (free = starter packs, full = everything) and the
+    # .pack container/hash/integrity are handled by media_delivery — see Others/Docs/audio.md.
+    media_delivery.publish(
+        owned_packs=_build_owned_packs(groups),
+        owns=_owns_audio_pack,
+        client=client,
+        bucket=bucket,
+        force=force,
+        dry_run=dry_run,
     )
-    logger.info("Uploaded %d changed pack(s) + manifest (version %s).", uploaded, manifest["version"])
 
 
 def main() -> None:
@@ -524,7 +392,7 @@ def main() -> None:
     client = None
     bucket = os.environ.get("R2_BUCKET")
     if not args.dry_run:
-        client = _r2_client()
+        client = media_delivery.r2_client()
 
     logger.info("Reading vocabulary…")
     try:

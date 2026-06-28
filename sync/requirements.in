@@ -8,3 +8,15 @@ python-dotenv>=1.0
 # Audio pipeline (audio_sync.py): Azure Speech SDK for TTS; boto3 for R2 upload.
 azure-cognitiveservices-speech>=1.40
 boto3>=1.34
+# Image pipeline (image_sync.py): Pillow for crop/encode; CLIP for relevance pre-rank; OpenAI SDK
+# for the Microsoft Foundry GPT-4o verifier + DALL·E generation; Azure SDKs for Content Safety +
+# smart crop. Heavy deps (torch/open-clip) are imported lazily, so the other tools run without them.
+Pillow>=10.3
+# HEIC encode/decode uses macOS `sips` (Apple's ImageIO/HEVC encoder) — Apple-conformant output, no
+# extra Python dep. (The image build is macOS-only; sips ships with macOS.)
+open-clip-torch>=2.24
+torch>=2.2
+openai>=1.40
+azure-ai-contentsafety>=1.0
+azure-ai-vision-imageanalysis>=1.0
+azure-core>=1.30
