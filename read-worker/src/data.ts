@@ -121,8 +121,38 @@ const SEARCH_COLUMNS: Record<TableName, string[]> = {
   adverbs_adjectives: ["word", "english", "comparative", "superlative"],
 };
 
+// German umlauts the search folds away so matching is diacritic-insensitive (search.md SE-FR-ACCESS-8):
+// "Hauser" finds "Häuser", "groser" finds "größer". Each entry lists the upper- and lower-case form and
+// the ASCII base. We fold ONLY these combining diacritics — exactly what the iOS client's
+// `localizedStandardContains` does via Unicode diacritic-stripping — so local and backend search behave
+// identically. ß is deliberately left untouched: it has no Unicode decomposition, so the client doesn't
+// fold it either (folding it to "ss" here would make the backend more lenient than local).
+const UMLAUT_FOLDS: ReadonlyArray<{ upper: string; lower: string; base: string }> = [
+  { upper: "Ä", lower: "ä", base: "a" },
+  { upper: "Ö", lower: "ö", base: "o" },
+  { upper: "Ü", lower: "ü", base: "u" },
+];
+
+// Folds a value to its lowercased, umlaut-stripped form in JS (Unicode-aware `toLowerCase`).
+function foldTerm(s: string): string {
+  let out = s.toLowerCase();
+  for (const { lower, base } of UMLAUT_FOLDS) out = out.split(lower).join(base);
+  return out;
+}
+
+// The SQL expression that folds a column the same way as `foldTerm`. SQLite/D1 has no unaccent() and
+// its LOWER() only lowercases ASCII, so we REPLACE both umlaut cases explicitly, then LOWER() for the
+// remaining A–Z. `col` is a literal from SEARCH_COLUMNS (never user input), so it is safe to embed.
+function foldedColumnSql(col: string): string {
+  let expr = col;
+  for (const { upper, lower, base } of UMLAUT_FOLDS) {
+    expr = `REPLACE(REPLACE(${expr}, '${upper}', '${base}'), '${lower}', '${base}')`;
+  }
+  return `LOWER(${expr})`;
+}
+
 export async function searchWord(env: Env, query: string, type?: string): Promise<SearchHit[]> {
-  const like = `%${query.toLowerCase()}%`;
+  const like = `%${foldTerm(query)}%`;
 
   // Optional logical type narrows which table(s) we search.
   let tables: TableName[] = [...TABLES];
@@ -133,7 +163,7 @@ export async function searchWord(env: Env, query: string, type?: string): Promis
   const hits: SearchHit[] = [];
   for (const t of tables) {
     const cols = SEARCH_COLUMNS[t];
-    const where = cols.map((c) => `LOWER(${c}) LIKE ?`).join(" OR ");
+    const where = cols.map((c) => `${foldedColumnSql(c)} LIKE ?`).join(" OR ");
     const binds = cols.map(() => like);
     const res = await readOnlySelect(env,
       `SELECT * FROM ${t} WHERE ${where} LIMIT ${SEARCH_LIMIT_PER_TABLE}`
