@@ -110,6 +110,17 @@ export interface SearchHit {
 
 const SEARCH_LIMIT_PER_TABLE = 25;
 
+// Columns matched per table: the German word + English translation, PLUS each table's inflected /
+// derived forms (search.md SE-FR-ACCESS-8) — verb conjugations (present, simple past, past
+// participle), adjective/adverb comparative & superlative, and noun plural — so a learner who types
+// an inflected form finds the base word. Column names are literals from this file (never user input),
+// so they are safe to interpolate into the SQL; the query value itself is always bound.
+const SEARCH_COLUMNS: Record<TableName, string[]> = {
+  verbs: ["word", "english", "ich", "du", "er_sie_es", "wir", "ihr", "sie_sie", "simple_past", "past_participle"],
+  nouns: ["word", "english", "plural"],
+  adverbs_adjectives: ["word", "english", "comparative", "superlative"],
+};
+
 export async function searchWord(env: Env, query: string, type?: string): Promise<SearchHit[]> {
   const like = `%${query.toLowerCase()}%`;
 
@@ -121,9 +132,12 @@ export async function searchWord(env: Env, query: string, type?: string): Promis
 
   const hits: SearchHit[] = [];
   for (const t of tables) {
+    const cols = SEARCH_COLUMNS[t];
+    const where = cols.map((c) => `LOWER(${c}) LIKE ?`).join(" OR ");
+    const binds = cols.map(() => like);
     const res = await readOnlySelect(env,
-      `SELECT * FROM ${t} WHERE LOWER(word) LIKE ? OR LOWER(english) LIKE ? LIMIT ${SEARCH_LIMIT_PER_TABLE}`
-    ).bind(like, like).all<Record<string, unknown>>();
+      `SELECT * FROM ${t} WHERE ${where} LIMIT ${SEARCH_LIMIT_PER_TABLE}`
+    ).bind(...binds).all<Record<string, unknown>>();
     for (const row of res.results) {
       // adverbs_adjectives holds both; an adjective/adverb filter narrows by its `type` column.
       if ((type === "adjective" || type === "adverb") && row.type !== type) continue;
