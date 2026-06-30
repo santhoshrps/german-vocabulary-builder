@@ -91,7 +91,9 @@ GENERATION_STYLES = ["photo", "illustration"]        # one generated image per s
 
 # Default cultural/regional context added to every generation prompt, so subjects look German/European
 # rather than American — e.g. "highway" → a German Autobahn, not a US freeway. Empty string disables it.
-IMAGE_REGION_HINT = "Show it as it typically looks in Germany / Europe, not the USA."
+IMAGE_REGION_HINT = (
+    "Show it as it typically looks in Germany / Europe nowadays"
+)
 
 # ── Image generation backend: Azure AI Foundry — Black Forest Labs FLUX ──
 # REST: POST {AZURE_FOUNDRY_IMAGE_ENDPOINT}/{IMAGE_GEN_PROVIDER_PATH}?api-version={IMAGE_GEN_API_VERSION}
