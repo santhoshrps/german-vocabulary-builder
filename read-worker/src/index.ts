@@ -4,7 +4,7 @@ import { signSession, verifySession, SessionClaims } from "./jwt";
 import { issueChallenge, consumeChallenge, rateLimit } from "./kv";
 import { serveCachedByVersion } from "./cache";
 import { verifyAttestation, verifyAssertion } from "./appattest";
-import { verifyPromoCode, verifyStoreKitTransaction, Entitlement, Scope } from "./entitlement";
+import { verifyPromoCode, verifyStoreKitTransaction, storeKitXcodeMode, Entitlement, Scope } from "./entitlement";
 import {
   getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP, searchWord,
 } from "./data";
@@ -94,7 +94,7 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
     entitlement = await verifyPromoCode(env, body.promoCode);
     if (!entitlement) throw new HttpError(403, "invalid promo code");
     subject = `promo:${entitlement.label}`;
-  } else if (env.STOREKIT_ENV === "xcode" && body.signedTransaction && !body.assertion) {
+  } else if (storeKitXcodeMode(env) && body.signedTransaction && !body.assertion) {
     // ---- Local Xcode testing: StoreKit transaction only, no App Attest ----
     // Enabled solely by STOREKIT_ENV="xcode". The transaction is locally signed
     // (StoreKit Configuration File), so verifyStoreKitTransaction decodes its
@@ -174,7 +174,7 @@ async function requireFreshAssertion(
   if (claims.ent === "promo") return;
   // Local Xcode StoreKit sessions have no attested device key, so they can't
   // present an assertion — exempt them (dev only; guarded by STOREKIT_ENV).
-  if (claims.ent === "storekit" && env.STOREKIT_ENV === "xcode") return;
+  if (claims.ent === "storekit" && storeKitXcodeMode(env)) return;
 
   const challenge = request.headers.get("X-Challenge") || "";
   const assertionB64 = request.headers.get("X-Assertion") || "";

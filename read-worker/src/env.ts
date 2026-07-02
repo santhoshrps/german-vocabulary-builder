@@ -14,7 +14,9 @@ export interface Env {
   APP_ATTEST_ENV: string;
   // StoreKit environment: "production" (verify against Apple Root CA) or "xcode"
   // (local StoreKit Configuration File testing — trusts locally-signed
-  // transactions WITHOUT Apple verification or App Attest). NEVER ship "xcode".
+  // transactions WITHOUT Apple verification or App Attest). "xcode" is honored
+  // ONLY when APP_ATTEST_ENV !== "production" (see storeKitXcodeMode in
+  // entitlement.ts), so it can never take effect on a production deployment.
   STOREKIT_ENV?: string;
 
   // secrets

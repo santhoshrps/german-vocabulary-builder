@@ -26,10 +26,13 @@ ENTITLEMENT_PRODUCT_IDS = "com.german-vocabulary.fullaccess.lifetime"
 SESSION_TTL_SECONDS = "3600"
 # App Attest environment: "production" or "development".
 APP_ATTEST_ENV = "production"
-# StoreKit environment. "xcode" trusts locally-signed StoreKit Configuration File
-# transactions WITHOUT Apple verification or App Attest — for local testing only.
-# Set back to "production" before any real release.
-STOREKIT_ENV = "xcode"
+# StoreKit environment. "production" verifies transactions against Apple's Root CA.
+# "xcode" (dev only) trusts locally-signed StoreKit Configuration File transactions
+# WITHOUT Apple verification or App Attest — it lives ONLY in the [env.dev] block
+# below and is additionally refused at runtime whenever APP_ATTEST_ENV="production"
+# (see storeKitXcodeMode in src/entitlement.ts). Keep this "production" here so a
+# bare `wrangler deploy` always ships the locked-down config.
+STOREKIT_ENV = "production"
 
 # Secrets (set with `wrangler secret put <NAME>`), never committed:
 #   SESSION_JWT_SECRET          random 32+ byte secret for signing session JWTs (openssl rand -hex 32)
@@ -46,3 +49,48 @@ bucket_name = "german-vocabulary-media"
 # [[r2_buckets]]
 # binding = "SNAPSHOTS"
 # bucket_name = "german-vocabulary-snapshots"
+
+# ---------------------------------------------------------------------------
+# Development / staging environment — the ONLY place StoreKit "xcode" mode lives.
+#
+#   Local run:   npm run dev         (wrangler dev --env dev)
+#   Deploy:      npm run deploy:dev   (wrangler deploy --env dev)
+#                → https://german-vocabulary-read-worker-dev.<subdomain>.workers.dev
+#
+# DEBUG builds of the iOS app point at the -dev origin (VocabularySyncConfig.swift);
+# release builds hit the production worker above. A bare `wrangler deploy`
+# (npm run deploy) ships the SECURE production config — xcode mode is never on it,
+# and even if it were, storeKitXcodeMode() refuses it while APP_ATTEST_ENV is
+# "production". This dev origin knowingly trusts local StoreKit transactions, so
+# keep its URL out of release builds (the #if DEBUG split guarantees that).
+#
+# Named environments do NOT inherit vars or bindings, so they are re-declared here.
+# Set this env's secrets separately, e.g.:
+#   wrangler secret put SESSION_JWT_SECRET --env dev
+# ---------------------------------------------------------------------------
+[[env.dev.d1_databases]]
+binding = "DB"
+database_name = "german-vocabulary"
+database_id = "b84997d9-5e78-493e-a43e-9d8aafd1ca95"
+
+[[env.dev.kv_namespaces]]
+binding = "KV"
+id = "2c0cb0115b0f4e0bacbc0475f2f72737"
+
+[[env.dev.r2_buckets]]
+binding = "MEDIA"
+bucket_name = "german-vocabulary-media"
+
+[env.dev.observability]
+enabled = true
+
+[env.dev.vars]
+APP_TEAM_ID = "REPLACE_TEAM_ID"
+APP_BUNDLE_ID = "com.german-vocabulary.German-Vocabulary"
+ENTITLEMENT_PRODUCT_IDS = "com.german-vocabulary.fullaccess.lifetime"
+SESSION_TTL_SECONDS = "3600"
+# App Attest development mode — REQUIRED to pair with StoreKit "xcode" mode
+# (storeKitXcodeMode refuses xcode when this is "production").
+APP_ATTEST_ENV = "development"
+# Local Xcode StoreKit testing: trust locally-signed transactions (dev origin only).
+STOREKIT_ENV = "xcode"

@@ -52,6 +52,34 @@ interface TransactionPayload {
   revocationDate?: number;  // ms epoch
 }
 
+/// Whether StoreKit "xcode" test mode is active for this deployment.
+///
+/// "xcode" mode trusts locally-signed StoreKit Configuration File transactions
+/// WITHOUT Apple signature/chain verification, and lets the /v1/session and
+/// /v1/snapshot paths skip App Attest entirely. It exists ONLY for local Xcode
+/// testing and must never be honored on a production deployment.
+///
+/// To make that structurally impossible (not just a config convention), xcode
+/// mode is hard-coupled to the App Attest environment: it is honored only when
+/// App Attest is also in "development". A deployment with APP_ATTEST_ENV set to
+/// "production" therefore refuses to trust unsigned transactions even if
+/// STOREKIT_ENV is misconfigured to "xcode" — it fails closed onto the real
+/// Apple-verified path. This is the single choke point for the whole dev path
+/// (used by verifyStoreKitTransaction, the /v1/session mint, and the snapshot
+/// assertion gate).
+export function storeKitXcodeMode(env: Env): boolean {
+  if (env.STOREKIT_ENV !== "xcode") return false;
+  if (env.APP_ATTEST_ENV === "production") {
+    console.error(
+      'SECURITY: ignoring STOREKIT_ENV="xcode" because APP_ATTEST_ENV="production". ' +
+        "Refusing to trust unsigned StoreKit transactions on a production deployment. " +
+        "Use `wrangler deploy --env dev` (App Attest development) for Xcode testing."
+    );
+    return false;
+  }
+  return true;
+}
+
 export async function verifyStoreKitTransaction(
   env: Env,
   signedTransaction: string
@@ -66,7 +94,7 @@ export async function verifyStoreKitTransaction(
   // root. In "xcode" mode we DECODE the payload and validate its claims only —
   // no signature/chain check. This is insecure by design and MUST be off
   // ("production") for any real build.
-  if (env.STOREKIT_ENV === "xcode") {
+  if (storeKitXcodeMode(env)) {
     const payload = JSON.parse(new TextDecoder().decode(b64UrlToBytes(payloadB64))) as TransactionPayload;
     return validateTransactionClaims(env, payload);
   }
