@@ -152,7 +152,10 @@ function foldedColumnSql(col: string): string {
 }
 
 export async function searchWord(env: Env, query: string, type?: string): Promise<SearchHit[]> {
-  const like = `%${foldTerm(query)}%`;
+  const folded = foldTerm(query);
+  const like = `%${folded}%`;      // German: match anywhere in the word/forms
+  const prefix = `${folded}%`;     // starts-with
+  const suffix = `%${folded}`;     // ends-with
 
   // Optional logical type narrows which table(s) we search.
   let tables: TableName[] = [...TABLES];
@@ -160,14 +163,59 @@ export async function searchWord(env: Env, query: string, type?: string): Promis
   else if (type === "noun") tables = ["nouns"];
   else if (type === "adjective" || type === "adverb") tables = ["adverbs_adjectives"];
 
+  const wordSql = foldedColumnSql("word");
+  const englishSql = foldedColumnSql("english");
+  // Word-boundary matching for the translation AND inflected forms: pad with spaces and look for
+  // " query" (a word starts with it), "query " (a word ends with it), or " query " (a whole word). So
+  // "hund" won't match "t·hund·er" and "test" won't match the "-test" ending of "kostest", while "dog"
+  // still finds "hot dog" and "am größten" is found by "größten" (search.md SE-FR-ACCESS-3/8).
+  const engPadded = `(' ' || ${englishSql} || ' ')`;
+  const engStarts = `% ${folded}%`;   // a translation word starts with the query
+  const engEnds = `%${folded} %`;     // a translation word ends with the query
+  const wholeWord = `% ${folded} %`;  // the query is a complete space-delimited word (translation or a form)
+
   const hits: SearchHit[] = [];
   for (const t of tables) {
     const cols = SEARCH_COLUMNS[t];
-    const where = cols.map((c) => `${foldedColumnSql(c)} LIKE ?`).join(" OR ");
-    const binds = cols.map(() => like);
+    // Inflected/derived form columns (everything except the base word + English translation), padded
+    // so they match only WHOLE words — never a shared inflection ending.
+    const inflPadded = cols
+      .filter((c) => c !== "word" && c !== "english")
+      .map((c) => `(' ' || ${foldedColumnSql(c)} || ' ')`);
+
+    // MATCHING: the base WORD matches anywhere (compounds like See·hund); inflected forms and the
+    // English translation match only at a WORD boundary (SE-FR-ACCESS-3/8).
+    const whereParts = [
+      `${wordSql} LIKE ?`,                        // base word contains the query
+      ...inflPadded.map((p) => `${p} LIKE ?`),    // an inflected form HAS it as a whole word
+      `${engPadded} LIKE ?`,                      // a translation word starts with the query
+      `${engPadded} LIKE ?`,                      // a translation word ends with the query
+    ];
+    const whereBinds = [like, ...inflPadded.map(() => wholeWord), engStarts, engEnds];
+
+    // Rank so the per-table LIMIT keeps the BEST candidates (rank-then-limit, SE-FR-ACCESS-9),
+    // mirroring the client tiers: word exact → whole inflected form → word starts/ends → word mid-word
+    // → English whole word → (else = English word start/end). Ties: shorter word first.
+    const wholeForm = inflPadded.length ? inflPadded.map((p) => `${p} LIKE ?`).join(" OR ") : null;
+    const orderBy =
+      "ORDER BY CASE" +
+      ` WHEN ${wordSql} = ? THEN 0` +
+      (wholeForm ? ` WHEN ${wholeForm} THEN 1` : "") +
+      ` WHEN ${wordSql} LIKE ? OR ${wordSql} LIKE ? THEN 2` +
+      ` WHEN ${wordSql} LIKE ? THEN 3` +
+      ` WHEN ${engPadded} LIKE ? THEN 4` +
+      " ELSE 5 END, LENGTH(word)";
+    const orderBinds = [
+      folded,                                  // word exact
+      ...inflPadded.map(() => wholeWord),      // whole inflected form (tier 1)
+      prefix, suffix,                          // word starts/ends
+      like,                                    // word mid-word
+      wholeWord,                               // English whole word
+    ];
+
     const res = await readOnlySelect(env,
-      `SELECT * FROM ${t} WHERE ${where} LIMIT ${SEARCH_LIMIT_PER_TABLE}`
-    ).bind(...binds).all<Record<string, unknown>>();
+      `SELECT * FROM ${t} WHERE ${whereParts.join(" OR ")} ${orderBy} LIMIT ${SEARCH_LIMIT_PER_TABLE}`
+    ).bind(...whereBinds, ...orderBinds).all<Record<string, unknown>>();
     for (const row of res.results) {
       // adverbs_adjectives holds both; an adjective/adverb filter narrows by its `type` column.
       if ((type === "adjective" || type === "adverb") && row.type !== type) continue;
