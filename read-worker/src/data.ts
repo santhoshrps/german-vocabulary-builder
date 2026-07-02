@@ -225,6 +225,41 @@ export async function searchWord(env: Env, query: string, type?: string): Promis
   return hits;
 }
 
+// ---- Free-tier search request cap ------------------------------------------
+// A free user may run a bounded number of search REQUESTS per device before being
+// asked to upgrade; within the cap, searches return full results (including paid-word
+// previews). The count is kept server-side in `search_usage`, keyed to the attested
+// device, so it can't be reset by reinstalling the app. The client enforces the same
+// cap and short-circuits; this is the authoritative backstop against direct API abuse.
+
+// Search requests a free device may make before further searches are refused.
+// Mirrors the app's freeSearchLimit. Enforced only in production.
+export const FREE_SEARCH_REQUEST_CAP = 100;
+
+// Whether the request cap is enforced for this deployment. Off on the dev worker
+// (APP_ATTEST_ENV="development"), which DEBUG builds target, so testing is uncapped.
+export function searchCapEnforced(env: Env): boolean {
+  return env.APP_ATTEST_ENV === "production";
+}
+
+// Search requests this device has already made.
+export async function searchRequestsUsed(env: Env, deviceId: string): Promise<number> {
+  const row = await env.DB.prepare(
+    "SELECT request_count FROM search_usage WHERE device_id = ?"
+  ).bind(deviceId).first<{ request_count: number }>();
+  return row?.request_count ?? 0;
+}
+
+// Count one more search request for this device (upsert increment).
+export async function recordSearchRequest(env: Env, deviceId: string): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO search_usage (device_id, request_count) VALUES (?, 1)
+     ON CONFLICT(device_id) DO UPDATE SET
+       request_count = request_count + 1,
+       updated_at = datetime('now')`
+  ).bind(deviceId).run();
+}
+
 // ---- Snapshot ---------------------------------------------------------------
 // Full dataset as NDJSON (one row per line). Cloudflare compresses the response;
 // the phone streams + inserts line-by-line without buffering it all in memory.

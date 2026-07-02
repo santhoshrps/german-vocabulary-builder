@@ -3,10 +3,11 @@ import { json, HttpError, bearerToken, clientIp } from "./http";
 import { signSession, verifySession, SessionClaims } from "./jwt";
 import { issueChallenge, consumeChallenge, rateLimit } from "./kv";
 import { serveCachedByVersion } from "./cache";
-import { verifyAttestation, verifyAssertion } from "./appattest";
+import { verifyAttestation, verifyAssertion, attestationRequired } from "./appattest";
 import { verifyPromoCode, verifyStoreKitTransaction, storeKitXcodeMode, Entitlement, Scope } from "./entitlement";
 import {
   getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP, searchWord,
+  searchCapEnforced, searchRequestsUsed, recordSearchRequest, FREE_SEARCH_REQUEST_CAP,
 } from "./data";
 import {
   loadManifest, scopedManifest, allowedPacks, normalizePackName, getPackObject,
@@ -25,7 +26,11 @@ function scopeOf(claims: SessionClaims): Scope {
 // promo (free) sessions share ONE subject across ALL free users, so they fall back to the
 // client IP (per network) — otherwise the limit would be collective for everyone on free.
 function rateSubjectKey(claims: SessionClaims, ip: string): string {
-  return claims.ent === "promo" ? `ip:${ip}` : `dev:${claims.sub || "anon"}`;
+  // Prefer the device subject when present (attested sessions, INCLUDING the production
+  // free tier, whose sub is the device id). Dev/self-test promo sessions share a
+  // "promo:*" subject across all free users, so they fall back to the client IP.
+  const sub = claims.sub || "";
+  return sub && !sub.startsWith("promo:") ? `dev:${sub}` : `ip:${ip}`;
 }
 
 // Keep only letters (incl. German ä/ö/ü/ß) and spaces; strips junk AND SQL LIKE wildcards
@@ -73,13 +78,49 @@ async function handleRegister(env: Env, request: Request): Promise<Response> {
 }
 
 interface SessionBody {
-  // Promo path (self-test): no App Attest required.
+  // Free/promo tier. In production this ALSO requires deviceId + assertion + challenge
+  // (an attested device); on the dev worker the code alone is enough (self-test).
   promoCode?: string;
-  // StoreKit path: requires a registered device + assertion + signed transaction.
+  // App Attest device proof. Required for every production session (free and full);
+  // omitted only on the dev worker and the local-Xcode StoreKit path.
   deviceId?: string;
   assertion?: string;
   challenge?: string;
+  // StoreKit path (full access): a signed transaction to verify the purchase.
   signedTransaction?: string;
+}
+
+// Verify an App Attest assertion for a registered device and return its device id.
+// Consumes the one-time challenge and advances the stored monotonic sign counter
+// (clone/replay defense). Shared by the production free (promo) and full (StoreKit)
+// session paths, which both bind their session to a genuine device.
+async function verifyDeviceAssertion(env: Env, body: SessionBody): Promise<string> {
+  if (!body.deviceId || !body.assertion || !body.challenge) {
+    throw new HttpError(400, "missing deviceId/assertion/challenge");
+  }
+  if (!(await consumeChallenge(env, body.challenge))) throw new HttpError(401, "bad challenge");
+
+  const device = await env.DB.prepare(
+    "SELECT public_key, sign_count FROM devices WHERE device_id = ?"
+  ).bind(body.deviceId).first<{ public_key: string; sign_count: number }>();
+  if (!device) throw new HttpError(401, "unknown device");
+
+  const assertion = await verifyAssertion(env, {
+    deviceId: body.deviceId,
+    publicKeySpki: device.public_key,
+    storedSignCount: device.sign_count,
+    assertionB64: body.assertion,
+    challenge: body.challenge,
+  }).catch((e) => {
+    console.error("assertion failed", { err: String(e) });
+    throw new HttpError(401, "assertion failed");
+  });
+
+  await env.DB.prepare(
+    "UPDATE devices SET sign_count = ?, last_seen = datetime('now') WHERE device_id = ?"
+  ).bind(assertion.newSignCount, body.deviceId).run();
+
+  return body.deviceId;
 }
 
 async function handleSession(env: Env, request: Request): Promise<Response> {
@@ -90,10 +131,16 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
   let subject = "";
 
   if (body.promoCode) {
-    // ---- Self-test path: promo code only ----
+    // ---- Free / promo tier ----
     entitlement = await verifyPromoCode(env, body.promoCode);
     if (!entitlement) throw new HttpError(403, "invalid promo code");
-    subject = `promo:${entitlement.label}`;
+    // In production the free tier must ALSO prove a genuine, attested device, so the
+    // search reveal cap can be pinned to hardware (not resettable local state) and the
+    // built-in free code alone can't mint sessions. The dev worker
+    // (APP_ATTEST_ENV="development"), which DEBUG builds target, stays promo-only.
+    subject = attestationRequired(env)
+      ? await verifyDeviceAssertion(env, body)
+      : `promo:${entitlement.label}`;
   } else if (storeKitXcodeMode(env) && body.signedTransaction && !body.assertion) {
     // ---- Local Xcode testing: StoreKit transaction only, no App Attest ----
     // Enabled solely by STOREKIT_ENV="xcode". The transaction is locally signed
@@ -107,38 +154,14 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
     subject = `storekit:${entitlement.label}`;
   } else {
     // ---- Production path: App Attest assertion + StoreKit entitlement ----
-    if (!body.deviceId || !body.assertion || !body.challenge || !body.signedTransaction) {
-      throw new HttpError(400, "missing deviceId/assertion/challenge/signedTransaction");
-    }
-    if (!(await consumeChallenge(env, body.challenge))) throw new HttpError(401, "bad challenge");
-
-    const device = await env.DB.prepare(
-      "SELECT public_key, sign_count FROM devices WHERE device_id = ?"
-    ).bind(body.deviceId).first<{ public_key: string; sign_count: number }>();
-    if (!device) throw new HttpError(401, "unknown device");
-
-    const assertion = await verifyAssertion(env, {
-      deviceId: body.deviceId,
-      publicKeySpki: device.public_key,
-      storedSignCount: device.sign_count,
-      assertionB64: body.assertion,
-      challenge: body.challenge,
-    }).catch((e) => {
-      console.error("assertion failed", { err: String(e) });
-      throw new HttpError(401, "assertion failed");
-    });
-
+    if (!body.signedTransaction) throw new HttpError(400, "missing signedTransaction");
+    const deviceId = await verifyDeviceAssertion(env, body);
     entitlement = await verifyStoreKitTransaction(env, body.signedTransaction).catch((e) => {
       console.error("storekit failed", { err: String(e) });
       throw new HttpError(403, "entitlement verification failed");
     });
     if (!entitlement) throw new HttpError(403, "no active entitlement");
-
-    await env.DB.prepare(
-      "UPDATE devices SET sign_count = ?, last_seen = datetime('now') WHERE device_id = ?"
-    ).bind(assertion.newSignCount, body.deviceId).run();
-
-    subject = body.deviceId;
+    subject = deviceId;
   }
 
   const ttl = parseInt(env.SESSION_TTL_SECONDS || "3600", 10);
@@ -271,6 +294,16 @@ async function handleSearch(
   if (!(await rateLimit(env, `search:${key}`, 50, 600, nowSeconds()))) {
     console.warn("search rate limited", { key });
     throw new HttpError(429, "rate limited");
+  }
+
+  // Free tier: cap total search REQUESTS per device (production only). Full sessions and
+  // the dev worker are unrestricted. The client enforces the same cap and short-circuits,
+  // so this is the authoritative backstop against direct API abuse (403, not retried).
+  if (searchCapEnforced(env) && scopeOf(claims) === "free" && claims.sub) {
+    if ((await searchRequestsUsed(env, claims.sub)) >= FREE_SEARCH_REQUEST_CAP) {
+      throw new HttpError(403, "search_limit_reached");
+    }
+    await recordSearchRequest(env, claims.sub);
   }
 
   const type = url.searchParams.get("type") || undefined;

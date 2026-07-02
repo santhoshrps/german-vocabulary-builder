@@ -48,6 +48,17 @@ CREATE TABLE IF NOT EXISTS submissions (
 
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions (status, created_at);
 
+-- Per-device count of search REQUESTS a free user has made. A free (attested) device
+-- may run up to a fixed cap of searches before being asked to upgrade; within the cap,
+-- searches return full results (including paid-word previews). Keyed to device_id (App
+-- Attest keyId), so the cap survives an app reinstall — it is NOT resettable local state.
+-- Enforced only when APP_ATTEST_ENV="production" (the dev worker is exempt for testing).
+CREATE TABLE IF NOT EXISTS search_usage (
+  device_id     TEXT PRIMARY KEY,                     -- devices.device_id
+  request_count INTEGER NOT NULL DEFAULT 0,           -- lifetime search requests from this device
+  updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Example: the app's built-in free-tier code (200-word preview):
 --   printf 'flashcard-free-2026' | shasum -a 256
 --   INSERT INTO promo_codes (code_hash, label, tier) VALUES ('<hash>', 'builtin-free', 'free');

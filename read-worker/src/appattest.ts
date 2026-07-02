@@ -21,6 +21,14 @@ import {
 const AAGUID_PROD = utf8("appattest\0\0\0\0\0\0\0"); // 16 bytes
 const AAGUID_DEV = utf8("appattestdevelop");        // 16 bytes
 
+/// Whether this deployment requires App Attest (a genuine, registered device) for
+/// EVERY session — including the free tier — and enforces the search reveal cap.
+/// True in production; false on the dev worker (APP_ATTEST_ENV="development"), which
+/// DEBUG iOS builds target, so local testing needs no attestation and has no cap.
+export function attestationRequired(env: Env): boolean {
+  return env.APP_ATTEST_ENV === "production";
+}
+
 async function importP256Spki(spki: Uint8Array): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     "spki",
