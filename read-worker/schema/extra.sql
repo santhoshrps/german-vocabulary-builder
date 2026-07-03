@@ -40,11 +40,15 @@ CREATE TABLE IF NOT EXISTS submissions (
   id         TEXT PRIMARY KEY,                       -- random uuid
   word       TEXT NOT NULL,                          -- the German word the user typed
   type       TEXT,                                   -- optional: 'noun' | 'verb' | 'adjective' | 'adverb'
+  details    TEXT,                                   -- optional JSON: full fields of a shared custom word
+                                                     -- (translation/sentences/forms), each validated server-side
   source     TEXT,                                   -- session subject (e.g. 'promo:label' or device id)
   scope      TEXT,                                   -- caller scope at submit time ('free' | 'full')
   status     TEXT NOT NULL DEFAULT 'pending',        -- 'pending' | 'approved' | 'rejected'
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Existing deployments (table already created without `details`): run once —
+--   ALTER TABLE submissions ADD COLUMN details TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions (status, created_at);
 
@@ -59,8 +63,10 @@ CREATE TABLE IF NOT EXISTS search_usage (
   updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Example: the app's built-in free-tier code (200-word preview):
---   printf 'flashcard-free-2026' | shasum -a 256
+-- The app's built-in free-tier code (the preview set). The VALUE must match
+-- `VocabularySyncConfig.freePromoCode` in the iOS app EXACTLY — registering a
+-- different string here mints a hash the app can never present:
+--   printf 'flashcard-dev-2026' | shasum -a 256
 --   INSERT INTO promo_codes (code_hash, label, tier) VALUES ('<hash>', 'builtin-free', 'free');
 -- A full-access code (alternative to a StoreKit purchase):
 --   printf 'SOME-FULL-CODE' | shasum -a 256

@@ -373,6 +373,25 @@ async function handleSearch(
 interface SubmissionBody {
   word?: string;
   type?: string;
+  // Full-field sharing of a user's custom word (customwords.md CW-FR-ADD-3 / search.md §3):
+  // every field optional, every field validated server-side below.
+  translation?: string;
+  example_de?: string;
+  example_en?: string;
+  article?: string;
+  plural?: string;
+  ich?: string; du?: string; er_sie_es?: string;
+  wir?: string; ihr?: string; sie_sie?: string;
+  simple_past?: string; past_participle?: string;
+  comparative?: string; superlative?: string;
+}
+
+// Word/form fields: letters + spaces only (the existing sanitizeTerm rule), capped.
+const WORD_FIELD_MAX = 80;
+// Sentence fields: letters, digits, spaces, and basic sentence punctuation — capped.
+// Anything else (markup, emoji, control chars) is stripped; never trust the client.
+function sanitizeSentence(s: string): string {
+  return s.replace(/[^\p{L}\p{N} .,!?;:'"()\-–—]/gu, "").trim().slice(0, 240);
 }
 
 // Submit a missing word for curation. A write path (like /devices/register), so it does
@@ -384,11 +403,33 @@ async function handleSubmission(
   const body = (await request.json().catch(() => null)) as SubmissionBody | null;
   const ip = clientIp(request);
   // Sanitize server-side (letters + spaces only, capped) — never trust the client.
-  const word = sanitizeTerm(body?.word || "").slice(0, 80);
+  const word = sanitizeTerm(body?.word || "").slice(0, WORD_FIELD_MAX);
   if (word.length < 2) throw new HttpError(400, "missing or invalid word");
   const allowedTypes = ["noun", "verb", "adjective", "adverb"];
   const type = body?.type && allowedTypes.includes(body.type) ? body.type : null;
   const key = rateSubjectKey(claims, ip);
+
+  // Optional full fields of a shared custom word — per-field validation: word/form fields
+  // keep the letters/spaces rule; sentence fields allow sentence punctuation; article is a
+  // strict enum. Empty after sanitizing → omitted. Stored as one JSON `details` blob for
+  // the curator; never written to the published vocabulary tables.
+  const details: Record<string, string> = {};
+  const wordField = (v?: string) => sanitizeTerm(v || "").slice(0, WORD_FIELD_MAX);
+  const put = (k: string, v: string) => { if (v.length > 0) details[k] = v; };
+  put("translation", sanitizeSentence(body?.translation || "").slice(0, WORD_FIELD_MAX));
+  put("example_de", sanitizeSentence(body?.example_de || ""));
+  put("example_en", sanitizeSentence(body?.example_en || ""));
+  const article = (body?.article || "").toLowerCase();
+  if (["der", "die", "das"].includes(article)) details.article = article;
+  put("plural", wordField(body?.plural));
+  put("ich", wordField(body?.ich)); put("du", wordField(body?.du));
+  put("er_sie_es", wordField(body?.er_sie_es)); put("wir", wordField(body?.wir));
+  put("ihr", wordField(body?.ihr)); put("sie_sie", wordField(body?.sie_sie));
+  put("simple_past", wordField(body?.simple_past));
+  put("past_participle", wordField(body?.past_participle));
+  put("comparative", wordField(body?.comparative));
+  put("superlative", wordField(body?.superlative));
+  const detailsJSON = Object.keys(details).length > 0 ? JSON.stringify(details) : null;
 
   // Burst limit: a handful of submissions per 10 minutes, per device (StoreKit) or IP (free).
   if (!(await rateLimit(env, `submit:${key}`, 10, 600, nowSeconds()))) {
@@ -412,9 +453,9 @@ async function handleSubmission(
   if (existing) return json({ status: "pending" }, 200);
 
   await env.DB.prepare(
-    `INSERT INTO submissions (id, word, type, source, scope, status)
-     VALUES (?, ?, ?, ?, ?, 'pending')`
-  ).bind(crypto.randomUUID(), word, type, key, scopeOf(claims)).run();
+    `INSERT INTO submissions (id, word, type, details, source, scope, status)
+     VALUES (?, ?, ?, ?, ?, ?, 'pending')`
+  ).bind(crypto.randomUUID(), word, type, detailsJSON, key, scopeOf(claims)).run();
 
   return json({ status: "pending" }, 201);
 }

@@ -56,10 +56,13 @@ export function scopedManifest(manifest: AudioManifest, scope: Scope): AudioMani
 
 // Validate and normalize a requested pack name from the URL path. Names are
 // "free" or "<type>s/<level>" (e.g. "nouns/a1.1") — restrict the charset so the
-// value can never escape the audio/packs/ prefix.
+// value can never escape the audio/packs/ prefix. Dots in the second segment are
+// allowed only BETWEEN alphanumeric runs (defense-in-depth: "nouns/.." matched the
+// old character-class form; not exploitable — manifest allowlist + flat R2 keys —
+// but there is no reason to admit it).
 export function normalizePackName(raw: string): string {
   const name = decodeURIComponent(raw).trim();
-  if (!/^[a-z0-9]+(\/[a-z0-9.]+)?$/.test(name)) {
+  if (!/^[a-z0-9]+(\/[a-z0-9]+(\.[a-z0-9]+)*)?$/.test(name)) {
     throw new HttpError(400, "invalid pack name");
   }
   return name;
