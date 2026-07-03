@@ -97,7 +97,7 @@ def main() -> None:
             sys.exit(1)
         client = media_delivery.r2_client()
 
-    nouns = image_sync.collect_nouns()
+    nouns = image_sync.collect_nouns(include_unflagged=True)   # allow regen of any noun, marked or not
     targets = _resolve(args.targets, nouns)
     if not targets:
         sys.exit(1)

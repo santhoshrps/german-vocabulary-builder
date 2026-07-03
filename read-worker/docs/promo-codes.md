@@ -208,11 +208,12 @@ issued remain valid until the JWT expires (default 1 hour, `SESSION_TTL_SECONDS`
 
 Code redemption is guessing-resistant on several layers:
 
-- **Server rate limit (authoritative).** The worker caps the auth endpoints —
-  `/v1/session`, `/v1/challenge`, `/v1/devices` — at **5 requests per 60 seconds
-  per IP** ([`src/index.ts`](../src/index.ts) → `rateLimit`); excess requests get
-  `429`. This is the real protection, since it applies even to scripted clients
-  that bypass the app. Tune the `5` there if needed.
+- **Server rate limit (authoritative).** The worker caps `/v1/session` at
+  **10 requests per 60 seconds per IP** (`challenge` 30/min, `devices/register`
+  10/10min — `authBudget` in [`src/index.ts`](../src/index.ts)); excess requests
+  get `429`. Counters are atomic D1 upserts, so concurrent requests can't slip
+  past the bound. This is the real protection, since it applies even to scripted
+  clients that bypass the app.
 - **One session mint per attempt.** A failed redeem performs a single
   `/v1/session` call — no wasteful "revert" re-sync — so legitimate retries stay
   well under the limit (`EntitlementStore.redeemFullAccessCode`).

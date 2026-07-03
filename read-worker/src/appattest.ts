@@ -14,9 +14,8 @@ import {
   utf8, sha256, concat, b64ToBytes, bytesToB64, bytesToB64Url, timingSafeEqualBytes,
 } from "./bytes";
 import { decodeCbor } from "./crypto/cbor";
-import {
-  extractSPKI, extractAppAttestNonce, tbsBytes, signatureDer, ecdsaDerToRaw,
-} from "./crypto/der";
+import { extractSPKI, extractAppAttestNonce, ecdsaDerToRaw } from "./crypto/der";
+import { verifyChainToAppleRoot } from "./crypto/x509";
 
 const AAGUID_PROD = utf8("appattest\0\0\0\0\0\0\0"); // 16 bytes
 const AAGUID_DEV = utf8("appattestdevelop");        // 16 bytes
@@ -89,8 +88,9 @@ export async function verifyAttestation(
   const certNonce = extractAppAttestNonce(credCert);
   if (!timingSafeEqualBytes(expectedNonce, certNonce)) throw new Error("attest: nonce mismatch");
 
-  // 2. Verify the cert chain up to the pinned Apple App Attest Root CA.
-  await verifyChainToAppleRoot(env, x5c, env.APPLE_APPATTEST_ROOT_CA);
+  // 2. Verify the cert chain up to the pinned Apple App Attest Root CA (shared x509.ts:
+  //    per-cert curve/hash detection, validity windows, CA basicConstraints).
+  await verifyChainToAppleRoot(x5c, env.APPLE_APPATTEST_ROOT_CA, "attest");
 
   // 3. Public key from the leaf cert.
   const spki = extractSPKI(credCert);
@@ -115,36 +115,6 @@ export async function verifyAttestation(
   }
 
   return { deviceId: keyIdFromHash, publicKeySpki: bytesToB64(spki), signCount };
-}
-
-// Verify each leaf is signed by the next cert, and the chain terminates at the
-// pinned Apple root. Pass the root as base64 DER via env.
-async function verifyChainToAppleRoot(
-  env: Env,
-  x5c: Uint8Array[],
-  rootB64: string | undefined
-): Promise<void> {
-  if (!rootB64) throw new Error("attest: APPLE_APPATTEST_ROOT_CA not configured");
-  const root = b64ToBytes(rootB64);
-
-  // Build the full chain: leaf, intermediate(s), then the pinned root.
-  const chain = [...x5c, root];
-  for (let i = 0; i < chain.length - 1; i++) {
-    const child = chain[i];
-    const parent = chain[i + 1];
-    const parentKey = await importP256Spki(extractSPKI(parent));
-    const ok = await crypto.subtle.verify(
-      { name: "ECDSA", hash: "SHA-256" },
-      parentKey,
-      ecdsaDerToRaw(signatureDer(child)),
-      tbsBytes(child)
-    );
-    if (!ok) throw new Error(`attest: chain link ${i} failed`);
-  }
-
-  // The intermediate Apple sent must actually be the pinned root (or signed by it).
-  // Pin by comparing the last x5c cert's issuer chain to our root bytes: the loop
-  // above already verified x5c[last] is signed by `root`, so trust is anchored.
 }
 
 export interface AssertionInput {

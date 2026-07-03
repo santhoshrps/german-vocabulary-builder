@@ -320,6 +320,16 @@ def _publish_on_exit() -> None:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Publish failed (%s) — run `python image_sync.py --no-source` to retry.", exc)
 
+    # Flag every approved word (incl. previously-unflagged ones just picked) as 'y' in nouns.xlsx, so
+    # the app's image flag matches the shipped picture. Run `python sync.py` to push the flags to D1.
+    try:
+        newly = image_sync.flag_approved_in_sheet(_Handler.store)
+        if newly:
+            logger.info("Flagged %d newly-approved word(s) as 'y' (red) in nouns.xlsx — run `python sync.py` "
+                        "to propagate the image flag to D1.", newly)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not update nouns.xlsx image flags (%s).", exc)
+
 
 if __name__ == "__main__":
     main()

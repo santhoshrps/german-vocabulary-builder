@@ -15,8 +15,10 @@ with the listed HTTP status. Implemented in [`src/index.ts`](../src/index.ts).
 | `GET /v1/rows/:table` | session JWT |
 | `GET /v1/snapshot` | session JWT **+ fresh assertion** (device sessions) |
 
-Rate limiting: `challenge`, `session`, and `devices` are capped at **30 requests/min per
-client IP**; exceeding returns `429 {"error":"rate limited"}`.
+Rate limiting (per client IP, atomic D1 counters): `challenge` **30/min**, `session`
+**10/min**, `devices/register` **10 per 10 min**; exceeding returns
+`429 {"error":"rate limited"}`. These values mirror `authBudget` in `src/index.ts` — keep
+the two in step.
 
 ---
 

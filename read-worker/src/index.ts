@@ -1,13 +1,13 @@
 import { Env } from "./env";
 import { json, HttpError, bearerToken, clientIp } from "./http";
 import { signSession, verifySession, SessionClaims } from "./jwt";
-import { issueChallenge, consumeChallenge, rateLimit } from "./kv";
+import { issueChallenge, consumeChallenge, rateLimit } from "./limits";
 import { serveCachedByVersion } from "./cache";
 import { verifyAttestation, verifyAssertion, attestationRequired } from "./appattest";
 import { verifyPromoCode, verifyStoreKitTransaction, storeKitXcodeMode, Entitlement, Scope } from "./entitlement";
 import {
   getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP, searchWord,
-  searchCapEnforced, searchRequestsUsed, recordSearchRequest, FREE_SEARCH_REQUEST_CAP,
+  searchCapEnforced, takeSearchRequest, refundSearchRequest, FREE_SEARCH_REQUEST_CAP,
 } from "./data";
 import {
   loadManifest, scopedManifest, allowedPacks, normalizePackName, getPackObject,
@@ -116,11 +116,51 @@ async function verifyDeviceAssertion(env: Env, body: SessionBody): Promise<strin
     throw new HttpError(401, "assertion failed");
   });
 
-  await env.DB.prepare(
-    "UPDATE devices SET sign_count = ?, last_seen = datetime('now') WHERE device_id = ?"
-  ).bind(assertion.newSignCount, body.deviceId).run();
+  await advanceSignCount(env, body.deviceId, assertion.newSignCount);
 
   return body.deviceId;
+}
+
+// Advances a device's monotonic assertion counter with an atomic compare-and-set.
+// verifyAssertion's in-memory `signCount > stored` check is only a fast path: two CONCURRENT
+// requests replaying the same assertion both read the same stored count and both pass it
+// (TOCTOU). The conditional UPDATE is the authoritative gate — only one writer can satisfy
+// `sign_count < ?`, so the clone/replay defense holds under concurrency.
+async function advanceSignCount(env: Env, deviceId: string, newCount: number): Promise<void> {
+  const res = await env.DB.prepare(
+    "UPDATE devices SET sign_count = ?, last_seen = datetime('now') WHERE device_id = ? AND sign_count < ?"
+  ).bind(newCount, deviceId, newCount).run();
+  if ((res.meta.changes ?? 0) === 0) throw new HttpError(401, "assertion counter reused");
+}
+
+// How many DISTINCT attested devices one StoreKit purchase may mint sessions for. Bounds
+// Apple-ID sharing / a leaked JWS without troubling a legitimate multi-device user (iPhone +
+// iPad + replacements). Devices already bound keep working; only NEW devices past the cap are
+// refused. Lifetime purchases have no freshness signal (the JWS is the original transaction),
+// so this device binding is the only meaningful replay bound.
+const TRANSACTION_DEVICE_CAP = 5;
+
+async function enforceTransactionDeviceCap(
+  env: Env, originalTransactionId: string | undefined, deviceId: string
+): Promise<void> {
+  if (!originalTransactionId) return; // payload carried no identity — nothing to bind on
+  const known = await env.DB.prepare(
+    "SELECT 1 FROM transaction_devices WHERE original_transaction_id = ? AND device_id = ?"
+  ).bind(originalTransactionId, deviceId).first();
+  if (known) return; // an already-bound device always keeps working
+
+  const row = await env.DB.prepare(
+    "SELECT COUNT(*) AS c FROM transaction_devices WHERE original_transaction_id = ?"
+  ).bind(originalTransactionId).first<{ c: number }>();
+  if ((row?.c ?? 0) >= TRANSACTION_DEVICE_CAP) {
+    console.warn("transaction device cap reached", { originalTransactionId });
+    throw new HttpError(403, "device limit reached for this purchase");
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO transaction_devices (original_transaction_id, device_id)
+     VALUES (?, ?) ON CONFLICT(original_transaction_id, device_id) DO NOTHING`
+  ).bind(originalTransactionId, deviceId).run();
 }
 
 async function handleSession(env: Env, request: Request): Promise<Response> {
@@ -161,6 +201,7 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
       throw new HttpError(403, "entitlement verification failed");
     });
     if (!entitlement) throw new HttpError(403, "no active entitlement");
+    await enforceTransactionDeviceCap(env, entitlement.originalTransactionId, deviceId);
     subject = deviceId;
   }
 
@@ -223,9 +264,7 @@ async function requireFreshAssertion(
     throw new HttpError(401, "assertion failed");
   });
 
-  await env.DB.prepare(
-    "UPDATE devices SET sign_count = ?, last_seen = datetime('now') WHERE device_id = ?"
-  ).bind(result.newSignCount, deviceId).run();
+  await advanceSignCount(env, deviceId, result.newSignCount);
 }
 
 async function handleVersion(env: Env, scope: Scope): Promise<Response> {
@@ -280,7 +319,7 @@ async function handleSnapshot(
 // WHOLE vocabulary (free + full) so a free user can find — and preview — full-set words;
 // each hit's `free` flag lets the client mark/lock those. Read-only.
 async function handleSearch(
-  env: Env, request: Request, claims: SessionClaims
+  env: Env, request: Request, ctx: ExecutionContext, claims: SessionClaims
 ): Promise<Response> {
   const url = new URL(request.url);
   const ip = clientIp(request);
@@ -296,19 +335,39 @@ async function handleSearch(
     throw new HttpError(429, "rate limited");
   }
 
+  const type = url.searchParams.get("type") || undefined;
+  // Version-keyed EDGE cache, like every other read: search deliberately spans the WHOLE
+  // dataset (not scope-filtered — hits carry their own `free` flag), so the response is
+  // identical for every caller and safe to share; key on the full-scope version so any data
+  // change invalidates. Without this, each search was an uncached leading-wildcard LIKE scan
+  // of all tables per request. Rate limit + free-cap accounting run BEFORE the cache, so a
+  // cache hit still consumes a free search.
+  const respond = async (): Promise<Response> => {
+    const version = await getVersion(env, "full");
+    const tag = `search:${encodeURIComponent(q)}:${type ?? ""}`;
+    return serveCachedByVersion(request, ctx, version, tag, 300, async () => ({
+      body: JSON.stringify({ query: q, results: await searchWord(env, q, type) }),
+      contentType: "application/json",
+    }));
+  };
+
   // Free tier: cap total search REQUESTS per device (production only). Full sessions and
   // the dev worker are unrestricted. The client enforces the same cap and short-circuits,
   // so this is the authoritative backstop against direct API abuse (403, not retried).
+  // The take is ATOMIC (upsert-RETURNING) so concurrency can't slip past the cap, and a
+  // failed search refunds the count so a server error never burns one of the capped requests.
   if (searchCapEnforced(env) && scopeOf(claims) === "free" && claims.sub) {
-    if ((await searchRequestsUsed(env, claims.sub)) >= FREE_SEARCH_REQUEST_CAP) {
-      throw new HttpError(403, "search_limit_reached");
+    const used = await takeSearchRequest(env, claims.sub);
+    if (used > FREE_SEARCH_REQUEST_CAP) throw new HttpError(403, "search_limit_reached");
+    try {
+      return await respond();
+    } catch (err) {
+      await refundSearchRequest(env, claims.sub);
+      throw err;
     }
-    await recordSearchRequest(env, claims.sub);
   }
 
-  const type = url.searchParams.get("type") || undefined;
-  const results = await searchWord(env, q, type);
-  return json({ query: q, results }, 200, { "Cache-Control": "private, max-age=60" });
+  return respond();
 }
 
 interface SubmissionBody {
@@ -427,12 +486,27 @@ export default {
     const [version, route, sub] = parts;
 
     try {
+      // Unauthenticated liveness probe (project rule: every service exposes /health).
+      // Deliberately static — it touches no D1/R2, so it can't amplify load, and it lets
+      // monitors distinguish "worker down" from "route missing".
+      if (request.method === "GET" && url.pathname === "/health") {
+        return json({ status: "ok" });
+      }
+
       if (version !== "v1") return json({ error: "not found" }, 404);
 
-      // Rate-limit the expensive auth endpoints per client IP.
+      // Rate-limit the expensive auth endpoints per client IP. Per-route budgets (documented
+      // in api-reference.md / promo-codes.md — keep the three in step): `session` is the promo
+      // brute-force surface so it gets the tightest budget; a legitimate install needs ~2
+      // challenges + 1 register + 1 mint per hour.
       const ip = clientIp(request);
-      const limited = route === "challenge" || route === "session" || route === "devices";
-      if (limited && !(await rateLimit(env, `${route}:${ip}`, 60, 600, nowSeconds()))) {
+      const authBudget: Record<string, { limit: number; window: number }> = {
+        challenge: { limit: 30, window: 60 },
+        session: { limit: 10, window: 60 },
+        devices: { limit: 10, window: 600 },
+      };
+      const budget = route ? authBudget[route] : undefined;
+      if (budget && !(await rateLimit(env, `${route}:${ip}`, budget.limit, budget.window, nowSeconds()))) {
         return json({ error: "rate limited" }, 429);
       }
 
@@ -467,7 +541,7 @@ export default {
       }
       if (request.method === "GET" && route === "search") {
         const claims = await requireSession(env, request);
-        return await handleSearch(env, request, claims);
+        return await handleSearch(env, request, ctx, claims);
       }
       if (request.method === "POST" && route === "submissions") {
         const claims = await requireSession(env, request);

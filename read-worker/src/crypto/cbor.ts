@@ -21,7 +21,23 @@ function readUint(view: DataView, ai: number, pos: number): { val: number; next:
   throw new Error("cbor: unsupported length encoding");
 }
 
-function decodeItem(bytes: Uint8Array, view: DataView, pos: number): DecodeResult {
+// Nesting bound: App Attest objects are ~3 levels deep; anything deeper is hostile input
+// aiming at stack exhaustion.
+const MAX_DEPTH = 16;
+
+// Every declared length is validated against the REMAINING input before any allocation or
+// loop: a crafted attestation claiming a 2^40-element array (or a string longer than the
+// buffer) must fail immediately, not burn CPU until an out-of-bounds read finally throws.
+function checkLength(len: number, remaining: number, what: string): void {
+  // Each array/map element and each string byte occupies ≥ 1 input byte, so a length can
+  // never legitimately exceed what's left of the buffer.
+  if (!Number.isSafeInteger(len) || len < 0 || len > remaining) {
+    throw new Error(`cbor: ${what} length ${len} exceeds input`);
+  }
+}
+
+function decodeItem(bytes: Uint8Array, view: DataView, pos: number, depth: number): DecodeResult {
+  if (depth > MAX_DEPTH) throw new Error("cbor: nesting too deep");
   const initial = view.getUint8(pos);
   const major = initial >> 5;
   const ai = initial & 0x1f;
@@ -41,21 +57,24 @@ function decodeItem(bytes: Uint8Array, view: DataView, pos: number): DecodeResul
     case 2: {
       // byte string
       const { val: len, next } = readUint(view, ai, pos);
+      checkLength(len, bytes.length - next, "byte string");
       return { value: bytes.slice(next, next + len), next: next + len };
     }
     case 3: {
       // text string
       const { val: len, next } = readUint(view, ai, pos);
+      checkLength(len, bytes.length - next, "text string");
       const str = new TextDecoder().decode(bytes.slice(next, next + len));
       return { value: str, next: next + len };
     }
     case 4: {
       // array
       const { val: len, next } = readUint(view, ai, pos);
+      checkLength(len, bytes.length - next, "array");
       let p = next;
       const arr: unknown[] = [];
       for (let i = 0; i < len; i++) {
-        const r = decodeItem(bytes, view, p);
+        const r = decodeItem(bytes, view, p, depth + 1);
         arr.push(r.value);
         p = r.next;
       }
@@ -64,11 +83,13 @@ function decodeItem(bytes: Uint8Array, view: DataView, pos: number): DecodeResul
     case 5: {
       // map
       const { val: len, next } = readUint(view, ai, pos);
+      // A map entry is ≥ 2 bytes (key + value); halve the remaining bound accordingly.
+      checkLength(len, (bytes.length - next) >> 1, "map");
       let p = next;
       const map = new Map<unknown, unknown>();
       for (let i = 0; i < len; i++) {
-        const k = decodeItem(bytes, view, p);
-        const v = decodeItem(bytes, view, k.next);
+        const k = decodeItem(bytes, view, p, depth + 1);
+        const v = decodeItem(bytes, view, k.next, depth + 1);
         map.set(k.value, v.value);
         p = v.next;
       }
@@ -81,5 +102,5 @@ function decodeItem(bytes: Uint8Array, view: DataView, pos: number): DecodeResul
 
 export function decodeCbor(bytes: Uint8Array): unknown {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  return decodeItem(bytes, view, 0).value;
+  return decodeItem(bytes, view, 0, 0).value;
 }

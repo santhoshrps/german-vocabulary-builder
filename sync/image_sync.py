@@ -16,6 +16,7 @@ Usage:
   python image_sync.py --no-source     # skip sourcing; (re)build/publish from existing decisions+cache
   python image_sync.py --limit 50      # process at most 50 not-yet-settled nouns this run
   python image_sync.py --workers 4     # generate 4 nouns in parallel (errors retry, never settle)
+  python image_sync.py --include-unflagged --limit 100  # also do nouns NOT marked x/y (big set — cap it)
   python image_sync.py --free-first    # generate the free-tier nouns before the rest
   python image_sync.py --force         # re-upload every image pack (recovery)
   python image_sync.py --prune-files   # delete orphan image/files masters in R2
@@ -57,9 +58,14 @@ SAVE_EVERY = 20  # checkpoint decisions+queue this often so a crash never loses 
 # Inputs + local master cache
 # ---------------------------------------------------------------------------
 
-def collect_nouns() -> list[dict[str, Any]]:
-    """The nouns flagged for an image (Image column = x or y → row['image'] == 1)."""
+def collect_nouns(include_unflagged: bool = False) -> list[dict[str, Any]]:
+    """The nouns eligible for an image. By default only those flagged in the sheet (Image column =
+    x or y → row['image'] == 1). With include_unflagged=True, every noun is returned — used both by
+    `--include-unflagged` sourcing and, always, for packing/pruning so an approved unflagged noun is
+    shipped and never pruned on a marked-only run."""
     rows = sync.read_excel("nouns")
+    if include_unflagged:
+        return rows
     return [r for r in rows if r.get("image") == 1]
 
 
@@ -257,6 +263,7 @@ def _source_pass(nouns, store, queue, opts, *, client, bucket, dry_run, limit, f
     _save_review_queue(queue)
     logger.info("Sourcing done: approved=%d, review=%d, none=%d, error=%d (errors retry next run).",
                 stats["approved"], stats["review"], stats["none"], stats["error"])
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -303,11 +310,70 @@ def publish_images(store, *, client, bucket, force: bool = False) -> tuple[int, 
     manifest to R2. Returns (packs published, distinct images in those packs). Shared by run() and
     image_review.py's publish-on-exit, so approving images and (re)building the manifest use the exact
     same path."""
-    nouns = collect_nouns()
+    nouns = collect_nouns(include_unflagged=True)   # pack any approved noun, flagged or not
     owned = _build_owned_packs(nouns, store, client=client, bucket=bucket, dry_run=False)
     media_delivery.publish(owned_packs=owned, owns=cfg.owns_pack, client=client, bucket=bucket,
                            force=force, dry_run=False)
     return len(owned), _distinct_image_count(owned)
+
+
+def _flag_ids_in_sheet(ids: set[str]) -> int:
+    """Set nouns.xlsx Image → 'y' for the given noun ids (identity = compute_id(level, word)), when a
+    row is not already flagged. Rewrites the sheet once; returns the count newly flagged. Safe no-op
+    when nothing needs flagging or the file is missing/locked."""
+    if not ids:
+        return 0
+    import openpyxl
+    from openpyxl.styles import PatternFill
+    filename, _ = sync.TABLE_CONFIG["nouns"]
+    path = sync.DATA_DIR / filename
+    if not path.exists():
+        logger.warning("Cannot flag words in the sheet — %s not found.", path)
+        return 0
+    try:
+        wb = openpyxl.load_workbook(path)
+    except Exception as exc:  # noqa: BLE001 — e.g. the file is open in Excel/Numbers
+        logger.warning("Cannot open %s to flag words (%s) — leave it closed and re-run.", filename, exc)
+        return 0
+    try:
+        ws = wb.active
+        red = PatternFill(start_color="FFFF0000", end_color="FFFF0000", fill_type="solid")  # highlight changed cells
+        header = [(str(c.value).replace("\xa0", " ").strip() if c.value is not None else "") for c in ws[1]]
+        cols = {n: (header.index(n) + 1 if n in header else -1) for n in ("Level", "Word", "Image")}
+        if min(cols.values()) < 0:
+            logger.warning("Cannot flag words — missing Level/Word/Image column in %s.", filename)
+            return 0
+        remaining = set(ids)
+        flagged = 0
+        for r in range(2, ws.max_row + 1):
+            if not remaining:
+                break
+            lvl = sync._clean(ws.cell(r, cols["Level"]).value)
+            word = sync._clean(ws.cell(r, cols["Word"]).value)
+            if lvl is None or word is None:
+                continue
+            if sync.compute_id(str(lvl), str(word)) not in remaining:
+                continue
+            remaining.discard(sync.compute_id(str(lvl), str(word)))
+            cell = ws.cell(r, cols["Image"])
+            cur_norm = str(cell.value).replace("\xa0", " ").strip().lower() if cell.value is not None else ""
+            if cur_norm in sync._TRUTHY:
+                continue                                    # already flagged — leave as-is
+            cell.value = "y"
+            cell.fill = red                                 # mark the changed cell red
+            flagged += 1
+        if flagged:
+            wb.save(path)
+        return flagged
+    finally:
+        wb.close()
+
+
+def flag_approved_in_sheet(store) -> int:
+    """Reconcile the sheet with reality: every noun that has an APPROVED image gets Image='y' in
+    nouns.xlsx (the source of truth for the app's image flag). Idempotent — only unflagged rows are
+    written. Run `python sync.py` afterwards to propagate the new flags to D1. Returns count flagged."""
+    return _flag_ids_in_sheet(set(image_decisions.approved(store)))
 
 
 # ---------------------------------------------------------------------------
@@ -352,32 +418,37 @@ def _reencode_pass(store, *, client, bucket, dry_run) -> None:
 
 def run(*, dry_run: bool, no_source: bool, limit: int, force: bool, prune_files: bool,
         free_first: bool = False, reencode_masters: bool = False, workers: int = 1,
-        client=None, bucket: str | None = None) -> None:
+        include_unflagged: bool = False, client=None, bucket: str | None = None) -> None:
     logger.info("Reading nouns…")
-    nouns = collect_nouns()
-    logger.info("Flagged for images: %d noun(s).", len(nouns))
+    all_nouns = collect_nouns(include_unflagged=True)   # every noun in the sheet — for packing + prune liveness
+    flagged = [n for n in all_nouns if n.get("image") == 1]
+    source_nouns = all_nouns if include_unflagged else flagged
+    logger.info("Flagged for images: %d noun(s)%s.", len(flagged),
+                f"; sourcing all {len(source_nouns)} (incl. unflagged)" if include_unflagged else "")
 
     store = image_decisions.load()
     queue = _load_review_queue()
     opts = image_decisions.load_prompt_opts()
 
+    srcstats = None
     if reencode_masters:
         _reencode_pass(store, client=client, bucket=bucket, dry_run=dry_run)
     elif not no_source:
-        _source_pass(nouns, store, queue, opts, client=client, bucket=bucket, dry_run=dry_run,
-                     limit=limit, free_first=free_first, workers=workers)
+        srcstats = _source_pass(source_nouns, store, queue, opts, client=client, bucket=bucket,
+                                dry_run=dry_run, limit=limit, free_first=free_first, workers=workers)
     else:
         logger.info("Skipping sourcing (--no-source); building from existing decisions + cache.")
 
-    # Drop decisions/queue for nouns no longer flagged, then build + publish.
-    live_ids = {n["id"] for n in nouns}
+    # Prune decisions/queue ONLY for nouns removed from the sheet entirely — an approved noun (flagged
+    # or not) stays, so packing below ships it. (Uses all_nouns, so de-flagging never drops an image.)
+    live_ids = {n["id"] for n in all_nouns}
     removed = image_decisions.prune(store, live_ids)
     if removed:
-        logger.info("Pruned %d decision(s) for de-flagged/removed noun(s).", removed)
+        logger.info("Pruned %d decision(s) for noun(s) removed from the sheet.", removed)
     for nid in [q for q in queue if q not in live_ids]:
         queue.pop(nid, None)
 
-    owned = _build_owned_packs(nouns, store, client=client, bucket=bucket, dry_run=dry_run)
+    owned = _build_owned_packs(all_nouns, store, client=client, bucket=bucket, dry_run=dry_run)
     logger.info("Image packs: %d (incl. free), %d distinct image(s).", len(owned), _distinct_image_count(owned))
     media_delivery.publish(owned_packs=owned, owns=cfg.owns_pack, client=client, bucket=bucket,
                            force=force, dry_run=dry_run)
@@ -389,9 +460,31 @@ def run(*, dry_run: bool, no_source: bool, limit: int, force: bool, prune_files:
 
     image_decisions.save(store)
     _save_review_queue(queue)
+
+    # Reconcile the source sheet: any approved (incl. previously-unflagged) noun gets Image='y' so the
+    # app will show it. sync.py then propagates the flag to D1.
+    if not dry_run:
+        newly = flag_approved_in_sheet(store)
+        if newly:
+            logger.info("Flagged %d newly-approved word(s) as 'y' (red) in nouns.xlsx — run `python sync.py` "
+                        "to propagate the image flag to D1.", newly)
+
     n_review = sum(1 for r in store.values() if r.get("status") == "review")
     if n_review:
         logger.info("%d noun(s) await review — run: python image_review.py", n_review)
+
+    # End-of-run "go live" summary for --include-unflagged: what still needs review + a sync to reach D1.
+    if include_unflagged and srcstats is not None:
+        generated = srcstats["review"] + srcstats["approved"]
+        logger.info("─ Unflagged-words run summary ─")
+        logger.info("  generated this run : %d (%d queued for review, %d errored → retry next run)",
+                    generated, srcstats["review"], srcstats["error"])
+        logger.info("  to make them live  :")
+        if n_review:
+            logger.info("    1) python image_review.py   # pick images (auto-flags them 'y', red, in nouns.xlsx)")
+            logger.info("    2) python sync.py           # push the new image flags to D1 so the app shows them")
+        else:
+            logger.info("    python sync.py              # push the new image flags to D1 so the app shows them")
     logger.info("Image sync complete.")
 
 
@@ -448,6 +541,9 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0, help="Process at most N not-yet-settled nouns this run.")
     parser.add_argument("--free-first", action="store_true",
                         help="Generate the free-tier (Free=1) nouns before the rest (composes with --limit).")
+    parser.add_argument("--include-unflagged", action="store_true",
+                        help="Also source images for nouns NOT marked x/y in the sheet (default: marked only). "
+                             "Big set — pair with --limit/--workers to control cost. Approved ones are packed + shipped.")
     parser.add_argument("--workers", type=int, default=1, metavar="N",
                         help="Generate N nouns in parallel (threads). Default 1. 3–4 is a good balance "
                              "vs. Azure rate limits; failures are isolated and retried, never settled.")
@@ -493,7 +589,8 @@ def main() -> None:
     try:
         run(dry_run=args.dry_run, no_source=args.no_source, limit=args.limit, force=args.force,
             prune_files=args.prune_files, free_first=args.free_first,
-            reencode_masters=args.reencode_masters, workers=args.workers, client=client, bucket=bucket)
+            reencode_masters=args.reencode_masters, workers=args.workers,
+            include_unflagged=args.include_unflagged, client=client, bucket=bucket)
     except sync.ValidationError as exc:
         logger.error("Validation failed: %s", exc)
         sys.exit(1)

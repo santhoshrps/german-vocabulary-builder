@@ -33,23 +33,43 @@ function readOnlySelect(env: Env, sql: string): D1PreparedStatement {
 // Prefer an explicit value in meta.dataset_version (bumped by the write worker).
 // Otherwise derive one from per-table COUNT(*) + MAX(updated_at): COUNT reflects
 // deletions, MAX(updated_at) reflects inserts/updates — so any change moves it.
+
+// Per-isolate cache of the computed version, per scope. getVersion() runs at the top of EVERY
+// data request (it keys the edge cache) and /v1/version is each client's foreground poll —
+// without this, D1 QPS scales with USER count instead of with how often the data changes
+// (docs/caching.md's core promise), and the no-meta fallback is three table scans per hit.
+// The TTL matches /v1/version's public max-age (30s), so clients observe no extra staleness.
+const VERSION_CACHE_TTL_MS = 30_000;
+const versionCache = new Map<Scope, { version: string; expiresAt: number }>();
+
 export async function getVersion(env: Env, scope: Scope): Promise<string> {
+  const cached = versionCache.get(scope);
+  const nowMs = Date.now();
+  if (cached && cached.expiresAt > nowMs) return cached.version;
+
   // The version is scope-specific so a free->full upgrade always looks "changed"
   // to the client (and free users don't needlessly re-sync on full-only edits).
   const explicit = await readOnlySelect(env,
     "SELECT value FROM meta WHERE key = 'dataset_version'"
   ).first<{ value: string }>().catch(() => null);
-  if (explicit?.value) return `${explicit.value}:${scope}`;
 
-  const parts: string[] = [scope];
-  for (const t of TABLES) {
-    const row = await readOnlySelect(env,
-      `SELECT COUNT(*) AS c, COALESCE(MAX(updated_at), '') AS m FROM ${t} WHERE ${scopeWhere(scope)}`
-    ).first<{ c: number; m: string }>();
-    parts.push(`${t}:${row?.c ?? 0}:${row?.m ?? ""}`);
+  let version: string;
+  if (explicit?.value) {
+    version = `${explicit.value}:${scope}`;
+  } else {
+    const parts: string[] = [scope];
+    for (const t of TABLES) {
+      const row = await readOnlySelect(env,
+        `SELECT COUNT(*) AS c, COALESCE(MAX(updated_at), '') AS m FROM ${t} WHERE ${scopeWhere(scope)}`
+      ).first<{ c: number; m: string }>();
+      parts.push(`${t}:${row?.c ?? 0}:${row?.m ?? ""}`);
+    }
+    const hash = bytesToHex(await sha256(utf8(parts.join("|"))));
+    version = hash.slice(0, 16);
   }
-  const hash = bytesToHex(await sha256(utf8(parts.join("|"))));
-  return hash.slice(0, 16);
+
+  versionCache.set(scope, { version, expiresAt: nowMs + VERSION_CACHE_TTL_MS });
+  return version;
 }
 
 // ---- Manifest ---------------------------------------------------------------
@@ -242,21 +262,25 @@ export function searchCapEnforced(env: Env): boolean {
   return env.APP_ATTEST_ENV === "production";
 }
 
-// Search requests this device has already made.
-export async function searchRequestsUsed(env: Env, deviceId: string): Promise<number> {
+// Atomically counts one search request and returns the POST-increment total — one
+// upsert-RETURNING statement, so concurrent requests can't both slip under the cap (the old
+// read-then-record pair was a TOCTOU). Fail closed: if D1 didn't answer, report over-cap.
+export async function takeSearchRequest(env: Env, deviceId: string): Promise<number> {
   const row = await env.DB.prepare(
-    "SELECT request_count FROM search_usage WHERE device_id = ?"
-  ).bind(deviceId).first<{ request_count: number }>();
-  return row?.request_count ?? 0;
-}
-
-// Count one more search request for this device (upsert increment).
-export async function recordSearchRequest(env: Env, deviceId: string): Promise<void> {
-  await env.DB.prepare(
     `INSERT INTO search_usage (device_id, request_count) VALUES (?, 1)
      ON CONFLICT(device_id) DO UPDATE SET
        request_count = request_count + 1,
-       updated_at = datetime('now')`
+       updated_at = datetime('now')
+     RETURNING request_count`
+  ).bind(deviceId).first<{ request_count: number }>();
+  return row?.request_count ?? Number.MAX_SAFE_INTEGER;
+}
+
+// Refunds one search request — called when the search itself FAILS after the count was taken,
+// so a server-side error never consumes one of the device's capped requests.
+export async function refundSearchRequest(env: Env, deviceId: string): Promise<void> {
+  await env.DB.prepare(
+    "UPDATE search_usage SET request_count = MAX(request_count - 1, 0) WHERE device_id = ?"
   ).bind(deviceId).run();
 }
 

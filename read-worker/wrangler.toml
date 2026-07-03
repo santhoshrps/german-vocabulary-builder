@@ -8,10 +8,9 @@ binding = "DB"
 database_name = "german-vocabulary"
 database_id = "b84997d9-5e78-493e-a43e-9d8aafd1ca95"
 
-# KV for short-lived challenges (nonces) and rate-limit counters.
-[[kv_namespaces]]
-binding = "KV"
-id = "2c0cb0115b0f4e0bacbc0475f2f72737"
+# Short-lived challenges (nonces) and rate-limit counters live in D1 (src/limits.ts:
+# `challenges` / `rate_limits` in schema/extra.sql) — single-writer SQLite makes the
+# consume/increment checks atomic, which eventually-consistent KV could not.
 
 [observability]
 enabled = true
@@ -72,10 +71,6 @@ bucket_name = "german-vocabulary-media"
 binding = "DB"
 database_name = "german-vocabulary"
 database_id = "b84997d9-5e78-493e-a43e-9d8aafd1ca95"
-
-[[env.dev.kv_namespaces]]
-binding = "KV"
-id = "2c0cb0115b0f4e0bacbc0475f2f72737"
 
 [[env.dev.r2_buckets]]
 binding = "MEDIA"

@@ -10,7 +10,8 @@
 
 import { Env } from "./env";
 import { utf8, sha256, bytesToHex, b64UrlToBytes, b64ToBytes } from "./bytes";
-import { extractSPKI, tbsBytes, signatureDer, ecdsaDerToRaw } from "./crypto/der";
+import { extractSPKI } from "./crypto/der";
+import { verifyChainToAppleRoot } from "./crypto/x509";
 
 /// Access scope an entitlement grants. "free" = the curated 100-word preview
 /// (rows with free = 1); "full" = the entire dataset.
@@ -20,6 +21,9 @@ export interface Entitlement {
   type: "storekit" | "promo";
   scope: Scope; // how much of the dataset this entitlement unlocks
   label: string; // productId or promo label, for the JWT subject/audit
+  /// StoreKit only: the purchase's stable identity, used to cap how many distinct
+  /// devices one signed transaction can mint sessions for (Apple-ID sharing bound).
+  originalTransactionId?: string;
 }
 
 // ---- Promo code -------------------------------------------------------------
@@ -48,6 +52,7 @@ interface JwsHeader {
 interface TransactionPayload {
   bundleId: string;
   productId: string;
+  originalTransactionId?: string; // stable purchase identity (device-cap binding)
   expiresDate?: number;     // ms epoch (subscriptions)
   revocationDate?: number;  // ms epoch
 }
@@ -105,8 +110,9 @@ export async function verifyStoreKitTransaction(
   // x5c certs are standard base64 DER.
   const chain = header.x5c.map((c) => b64ToBytes(c));
 
-  // 1. Verify the chain terminates at the pinned Apple Root CA - G3.
-  await verifyChainToAppleRoot(env, chain, env.APPLE_STOREKIT_ROOT_CA);
+  // 1. Verify the chain terminates at the pinned Apple Root CA - G3 (shared x509.ts:
+  //    per-cert curve/hash detection, validity windows, CA basicConstraints).
+  await verifyChainToAppleRoot(chain, env.APPLE_STOREKIT_ROOT_CA, "storekit");
 
   // 2. Verify the JWS signature with the leaf cert's public key (ES256 = raw r||s).
   const leafKey = await crypto.subtle.importKey(
@@ -141,34 +147,11 @@ function validateTransactionClaims(env: Env, payload: TransactionPayload): Entit
   if (payload.revocationDate && payload.revocationDate <= now) return null;
   if (payload.expiresDate && payload.expiresDate <= now) return null;
 
-  return { type: "storekit", scope: "full", label: payload.productId };
+  return {
+    type: "storekit",
+    scope: "full",
+    label: payload.productId,
+    originalTransactionId: payload.originalTransactionId,
+  };
 }
 
-async function verifyChainToAppleRoot(
-  env: Env,
-  chain: Uint8Array[],
-  rootB64: string | undefined
-): Promise<void> {
-  if (!rootB64) throw new Error("storekit: APPLE_STOREKIT_ROOT_CA not configured");
-  const full = [...chain];
-  // If Apple's root is already the last element, the link check covers it;
-  // otherwise append the pinned root as the trust anchor.
-  full.push(b64ToBytes(rootB64));
-
-  for (let i = 0; i < full.length - 1; i++) {
-    const parentKey = await crypto.subtle.importKey(
-      "spki",
-      extractSPKI(full[i + 1]),
-      { name: "ECDSA", namedCurve: "P-256" },
-      false,
-      ["verify"]
-    );
-    const ok = await crypto.subtle.verify(
-      { name: "ECDSA", hash: "SHA-256" },
-      parentKey,
-      ecdsaDerToRaw(signatureDer(full[i])),
-      tbsBytes(full[i])
-    );
-    if (!ok) throw new Error(`storekit: chain link ${i} failed`);
-  }
-}

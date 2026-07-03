@@ -65,3 +65,35 @@ CREATE TABLE IF NOT EXISTS search_usage (
 -- A full-access code (alternative to a StoreKit purchase):
 --   printf 'SOME-FULL-CODE' | shasum -a 256
 --   INSERT INTO promo_codes (code_hash, label, tier) VALUES ('<hash>', 'full-grant', 'full');
+
+-- One-time App Attest challenges (nonces). Consumed by a single conditional DELETE
+-- (src/limits.ts) — atomic in SQLite, so a challenge can never be consumed twice, which the
+-- earlier KV get→delete allowed under concurrency (TOCTOU). Expired rows are GC'd
+-- opportunistically on issue.
+CREATE TABLE IF NOT EXISTS challenges (
+  challenge  TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL                        -- unix seconds
+);
+
+CREATE INDEX IF NOT EXISTS idx_challenges_expiry ON challenges (expires_at);
+
+-- Fixed-window rate-limit counters, incremented by an atomic upsert (src/limits.ts) that
+-- returns the post-increment count — a hard bound under concurrency, unlike the earlier
+-- non-atomic KV read-modify-write. Dead windows are GC'd on the first hit of a new window.
+CREATE TABLE IF NOT EXISTS rate_limits (
+  bucket     TEXT PRIMARY KEY,                       -- "<name>:<subject>:<window-number>"
+  count      INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER NOT NULL                        -- unix seconds (window end + grace)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rate_limits_expiry ON rate_limits (expires_at);
+
+-- Devices bound to a StoreKit purchase (by originalTransactionId). One signed transaction may
+-- mint sessions for at most TRANSACTION_DEVICE_CAP distinct attested devices (src/index.ts) —
+-- bounding Apple-ID sharing / a leaked JWS. Already-bound devices always keep working.
+CREATE TABLE IF NOT EXISTS transaction_devices (
+  original_transaction_id TEXT NOT NULL,
+  device_id               TEXT NOT NULL,               -- devices.device_id
+  first_seen              TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (original_transaction_id, device_id)
+);
