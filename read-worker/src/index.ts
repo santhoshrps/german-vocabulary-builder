@@ -387,11 +387,12 @@ interface SubmissionBody {
 }
 
 // Word/form fields: letters + spaces only (the existing sanitizeTerm rule), capped.
-const WORD_FIELD_MAX = 80;
+// Mirrors the app editor's caps (CustomWordService.wordFieldLimit / sentenceFieldLimit).
+const WORD_FIELD_MAX = 100;
 // Sentence fields: letters, digits, spaces, and basic sentence punctuation — capped.
 // Anything else (markup, emoji, control chars) is stripped; never trust the client.
 function sanitizeSentence(s: string): string {
-  return s.replace(/[^\p{L}\p{N} .,!?;:'"()\-–—]/gu, "").trim().slice(0, 240);
+  return s.replace(/[^\p{L}\p{N} .,!?;:'"()\-–—]/gu, "").trim().slice(0, 200);
 }
 
 // Submit a missing word for curation. A write path (like /devices/register), so it does
