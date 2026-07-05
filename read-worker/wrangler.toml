@@ -17,10 +17,10 @@ enabled = true
 
 [vars]
 # Your Apple Developer Team ID and the app's bundle id (used for App Attest appId hash).
-APP_TEAM_ID = "REPLACE_TEAM_ID"
-APP_BUNDLE_ID = "com.german-vocabulary.German-Vocabulary"
+APP_TEAM_ID = "3VF33Y593F"
+APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
 # Comma-separated StoreKit product ids that grant full access.
-ENTITLEMENT_PRODUCT_IDS = "com.german-vocabulary.fullaccess.lifetime"
+ENTITLEMENT_PRODUCT_IDS = "com.ramapurampalanivel.germanwords.fullaccess.lifetime"
 # Session JWT lifetime in seconds.
 SESSION_TTL_SECONDS = "3600"
 # App Attest environment: "production" or "development".
@@ -80,9 +80,9 @@ bucket_name = "german-vocabulary-media"
 enabled = true
 
 [env.dev.vars]
-APP_TEAM_ID = "REPLACE_TEAM_ID"
-APP_BUNDLE_ID = "com.german-vocabulary.German-Vocabulary"
-ENTITLEMENT_PRODUCT_IDS = "com.german-vocabulary.fullaccess.lifetime"
+APP_TEAM_ID = "3VF33Y593F"
+APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
+ENTITLEMENT_PRODUCT_IDS = "com.ramapurampalanivel.germanwords.fullaccess.lifetime"
 SESSION_TTL_SECONDS = "3600"
 # App Attest development mode — REQUIRED to pair with StoreKit "xcode" mode
 # (storeKitXcodeMode refuses xcode when this is "production").
