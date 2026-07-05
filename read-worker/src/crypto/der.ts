@@ -98,6 +98,28 @@ export function extractSPKI(certDer: Uint8Array): Uint8Array {
   throw new Error("der: SubjectPublicKeyInfo not found");
 }
 
+// The raw EC public-key point in X9.62 UNCOMPRESSED form (`0x04 || X || Y`, 65 bytes for P-256),
+// pulled from the SubjectPublicKeyInfo's BIT STRING. This — NOT the full SPKI — is what Apple hashes
+// to form the App Attest keyId (`keyId = SHA256(uncompressed point) == authData.credentialId`).
+// Hashing the whole SPKI is the classic mistake that passes synthetic tests yet fails a real device.
+export function extractECPublicKeyPoint(certDer: Uint8Array): Uint8Array {
+  const { tbs } = certParts(certDer);
+  for (const child of children(certDer, tbs)) {
+    if (child.tag !== 0x30) continue; // SEQUENCE
+    const inner = children(certDer, child);
+    if (inner.length >= 2 && inner[0].tag === 0x30 && inner[1].tag === 0x03) {
+      const algId = children(certDer, inner[0]);
+      if (algId.length && algId[0].tag === 0x06 && oidHex(certDer, algId[0]) === OID_EC_PUBLIC_KEY) {
+        // inner[1] is the BIT STRING: first content byte is the "unused bits" count (0x00 for a
+        // key); the remainder is the uncompressed point. Drop that leading byte.
+        const bitString = inner[1];
+        return certDer.slice(bitString.contentStart + 1, bitString.contentEnd);
+      }
+    }
+  }
+  throw new Error("der: EC public key point not found");
+}
+
 // An extension's extnValue OCTET STRING by OID, or null when the cert doesn't carry it
 // (or has no extensions at all). Shared by the App Attest nonce and basicConstraints reads.
 function findExtension(certDer: Uint8Array, wantOidHex: string): TLV | null {

@@ -14,7 +14,7 @@ import {
   utf8, sha256, concat, b64ToBytes, bytesToB64, bytesToB64Url, timingSafeEqualBytes,
 } from "./bytes";
 import { decodeCbor } from "./crypto/cbor";
-import { extractSPKI, extractAppAttestNonce, ecdsaDerToRaw } from "./crypto/der";
+import { extractSPKI, extractECPublicKeyPoint, extractAppAttestNonce, ecdsaDerToRaw } from "./crypto/der";
 import { verifyChainToAppleRoot } from "./crypto/x509";
 
 const AAGUID_PROD = utf8("appattest\0\0\0\0\0\0\0"); // 16 bytes
@@ -92,8 +92,10 @@ export async function verifyAttestation(
   //    per-cert curve/hash detection, validity windows, CA basicConstraints).
   await verifyChainToAppleRoot(x5c, env.APPLE_APPATTEST_ROOT_CA, "attest");
 
-  // 3. Public key from the leaf cert.
+  // 3. Public key from the leaf cert: the full SPKI (stored + used later to verify assertions) and
+  //    the raw uncompressed EC point (what Apple hashes to form the keyId — see step 6).
   const spki = extractSPKI(credCert);
+  const publicKeyPoint = extractECPublicKeyPoint(credCert);
 
   // 4. rpIdHash must equal SHA256(teamId.bundleId).
   const { rpIdHash, aaguid, credentialId, signCount } = parseAuthData(authData);
@@ -109,8 +111,9 @@ export async function verifyAttestation(
   //     not a clean first registration — reject it so the stored baseline can't start mid-stream.
   if (signCount !== 0) throw new Error("attest: nonzero sign count");
 
-  // 6. keyId = SHA256(public key); must equal credentialId in authData and the client-supplied keyId.
-  const pubKeyHash = await sha256(spki);
+  // 6. keyId = SHA256(uncompressed EC public-key point) — Apple hashes the X9.62 point, NOT the full
+  //    SPKI. Must equal credentialId in authData AND the client-supplied keyId.
+  const pubKeyHash = await sha256(publicKeyPoint);
   const keyIdFromHash = bytesToB64Url(pubKeyHash);
   if (!credentialId || !timingSafeEqualBytes(pubKeyHash, credentialId)) {
     throw new Error("attest: credentialId mismatch");
