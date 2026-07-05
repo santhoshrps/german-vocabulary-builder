@@ -70,9 +70,13 @@ async function handleRegister(env: Env, request: Request): Promise<Response> {
      VALUES (?, ?, ?, datetime('now'))
      ON CONFLICT(device_id) DO UPDATE SET
        public_key = excluded.public_key,
-       sign_count = excluded.sign_count,
+       sign_count = MAX(sign_count, excluded.sign_count),
        last_seen = datetime('now')`
   ).bind(result.deviceId, result.publicKeySpki, result.signCount).run();
+  // sign_count uses MAX(existing, new) so a re-registration can NEVER lower the stored anti-replay
+  // baseline (the counter that catches cloned/replayed assertions). device_id = SHA256(pubkey), so
+  // a conflict is always the same key; combined with the counter==0 attestation check, a used key
+  // can't re-register at all, and this guarantees the baseline is monotonic even if one ever did.
 
   return json({ deviceId: result.deviceId });
 }

@@ -21,8 +21,10 @@ APP_TEAM_ID = "3VF33Y593F"
 APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
 # Comma-separated StoreKit product ids that grant full access.
 ENTITLEMENT_PRODUCT_IDS = "com.ramapurampalanivel.germanwords.fullaccess.lifetime"
-# Session JWT lifetime in seconds.
-SESSION_TTL_SECONDS = "3600"
+# Session JWT lifetime in seconds. Kept short (10 min) so a leaked/shared session token is only
+# usable for a small window; the client renews on demand in the foreground (it reads `expiresIn`,
+# so this is transparent — no app change) and never renews in the background.
+SESSION_TTL_SECONDS = "600"
 # App Attest environment: "production" or "development".
 APP_ATTEST_ENV = "production"
 # StoreKit environment. "production" verifies transactions against Apple's Root CA.
@@ -83,7 +85,7 @@ enabled = true
 APP_TEAM_ID = "3VF33Y593F"
 APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
 ENTITLEMENT_PRODUCT_IDS = "com.ramapurampalanivel.germanwords.fullaccess.lifetime"
-SESSION_TTL_SECONDS = "3600"
+SESSION_TTL_SECONDS = "600"
 # App Attest development mode — REQUIRED to pair with StoreKit "xcode" mode
 # (storeKitXcodeMode refuses xcode when this is "production").
 APP_ATTEST_ENV = "development"

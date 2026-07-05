@@ -104,6 +104,11 @@ export async function verifyAttestation(
   const wantAaguid = env.APP_ATTEST_ENV === "development" ? AAGUID_DEV : AAGUID_PROD;
   if (!aaguid || !timingSafeEqualBytes(aaguid, wantAaguid)) throw new Error("attest: aaguid mismatch");
 
+  // 5b. Apple's algorithm requires the counter to be 0 at attestation. A freshly generated key
+  //     is always 0; a non-zero value means the key was already used (or crafted authData), i.e.
+  //     not a clean first registration — reject it so the stored baseline can't start mid-stream.
+  if (signCount !== 0) throw new Error("attest: nonzero sign count");
+
   // 6. keyId = SHA256(public key); must equal credentialId in authData and the client-supplied keyId.
   const pubKeyHash = await sha256(spki);
   const keyIdFromHash = bytesToB64Url(pubKeyHash);
