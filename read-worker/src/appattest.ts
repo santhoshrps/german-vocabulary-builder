@@ -138,7 +138,8 @@ export interface AssertionResult {
 }
 
 // Assertion (CBOR): { signature: bytes (DER ECDSA), authenticatorData: bytes }
-// Signed message = SHA256(authenticatorData || SHA256(challenge)).
+// The device ECDSA-SHA256-signs the nonce = SHA256(authenticatorData || SHA256(challenge)) — i.e. the
+// verified digest is SHA256(nonce) — so verify OVER the nonce (WebCrypto applies the outer SHA-256).
 export async function verifyAssertion(env: Env, input: AssertionInput): Promise<AssertionResult> {
   const obj = decodeCbor(b64ToBytes(input.assertionB64)) as Map<string, unknown>;
   const signature = obj.get("signature") as Uint8Array;
@@ -146,14 +147,18 @@ export async function verifyAssertion(env: Env, input: AssertionInput): Promise<
   if (!signature || !authData) throw new Error("assert: malformed");
 
   const clientDataHash = await sha256(utf8(input.challenge));
-  const message = concat(authData, clientDataHash);
+  // nonce = SHA256(authenticatorData || SHA256(challenge)). The device signs the NONCE with
+  // ECDSA-SHA256 — Apple's `isValidSignature(_, for: nonce)` hashes the nonce again — so verify OVER
+  // the nonce and let WebCrypto apply the outer SHA-256. Verifying over the raw concat is one hash
+  // short and fails a real device's signature ("bad signature").
+  const nonce = await sha256(concat(authData, clientDataHash));
 
   const key = await importP256Spki(b64ToBytes(input.publicKeySpki));
   const ok = await crypto.subtle.verify(
     { name: "ECDSA", hash: "SHA-256" },
     key,
     ecdsaDerToRaw(signature),
-    message
+    nonce
   );
   if (!ok) throw new Error("assert: bad signature");
 

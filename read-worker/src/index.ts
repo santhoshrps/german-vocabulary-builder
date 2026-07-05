@@ -174,22 +174,22 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
   let entitlement: Entitlement | null = null;
   let subject = "";
 
+  // Best-effort App Attest: verify the device proof IF the client supplied one and it checks out.
+  // Attestation is a fraud-reduction SIGNAL here, never a hard gate — a genuine user on a network or
+  // device where App Attest can't complete (restrictive Wi-Fi, DeviceCheck hiccup, older/managed
+  // device) MUST still get in, like any normal app. When present it upgrades the session to a stable
+  // device id (device-scoped search cap + purchase device-cap); when absent we fall back to the
+  // credential's own proof — the promo code, or the Apple-VERIFIED purchase.
+  const attestedDeviceId = await tryVerifyDeviceAssertion(env, body);
+
   if (body.promoCode) {
     // ---- Free / promo tier ----
     entitlement = await verifyPromoCode(env, body.promoCode);
     if (!entitlement) throw new HttpError(403, "invalid promo code");
-    // In production the free tier must ALSO prove a genuine, attested device, so the
-    // search reveal cap can be pinned to hardware (not resettable local state) and the
-    // built-in free code alone can't mint sessions. The dev worker
-    // (APP_ATTEST_ENV="development"), which DEBUG builds target, stays promo-only.
-    subject = attestationRequired(env)
-      ? await verifyDeviceAssertion(env, body)
-      : `promo:${entitlement.label}`;
+    // Device-scoped when attested (pins the free search cap to hardware); label-scoped otherwise.
+    subject = attestedDeviceId ?? `promo:${entitlement.label}`;
   } else if (storeKitXcodeMode(env) && body.signedTransaction && !body.assertion) {
-    // ---- Local Xcode testing: StoreKit transaction only, no App Attest ----
-    // Enabled solely by STOREKIT_ENV="xcode". The transaction is locally signed
-    // (StoreKit Configuration File), so verifyStoreKitTransaction decodes its
-    // claims without Apple verification. NEVER enable this in production.
+    // ---- Local Xcode testing: StoreKit transaction only, no App Attest (dev only) ----
     entitlement = await verifyStoreKitTransaction(env, body.signedTransaction).catch((e) => {
       console.error("storekit (xcode) failed", { err: String(e) });
       throw new HttpError(403, "entitlement verification failed");
@@ -197,16 +197,22 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
     if (!entitlement) throw new HttpError(403, "no active entitlement");
     subject = `storekit:${entitlement.label}`;
   } else {
-    // ---- Production path: App Attest assertion + StoreKit entitlement ----
+    // ---- Production paid tier ----
+    // The Apple-VERIFIED StoreKit purchase is the real gate (works on any network). App Attest is
+    // best-effort binding on top: enforce the anti-sharing device cap only when we actually have an
+    // attested device id; otherwise grant on the verified purchase alone.
     if (!body.signedTransaction) throw new HttpError(400, "missing signedTransaction");
-    const deviceId = await verifyDeviceAssertion(env, body);
     entitlement = await verifyStoreKitTransaction(env, body.signedTransaction).catch((e) => {
       console.error("storekit failed", { err: String(e) });
       throw new HttpError(403, "entitlement verification failed");
     });
     if (!entitlement) throw new HttpError(403, "no active entitlement");
-    await enforceTransactionDeviceCap(env, entitlement.originalTransactionId, deviceId);
-    subject = deviceId;
+    if (attestedDeviceId) {
+      await enforceTransactionDeviceCap(env, entitlement.originalTransactionId, attestedDeviceId);
+      subject = attestedDeviceId;
+    } else {
+      subject = `storekit:${entitlement.label}`;
+    }
   }
 
   const ttl = parseInt(env.SESSION_TTL_SECONDS || "3600", 10);
