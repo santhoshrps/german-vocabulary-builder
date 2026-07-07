@@ -131,6 +131,11 @@ export interface AssertionInput {
   storedSignCount: number;
   assertionB64: string;
   challenge: string;
+  // Request binding (AA-M1): SHA-256 of the request's credential (promo code / signed
+  // transaction). When present, the signed client data is `utf8(challenge) || bindingDigest`,
+  // so a captured challenge+assertion pair can't be attached to a DIFFERENT payload.
+  // Must byte-match the client (AppAttestService.assertion(challenge:bindingDigest:)).
+  bindingDigest?: Uint8Array;
 }
 
 export interface AssertionResult {
@@ -146,8 +151,12 @@ export async function verifyAssertion(env: Env, input: AssertionInput): Promise<
   const authData = obj.get("authenticatorData") as Uint8Array;
   if (!signature || !authData) throw new Error("assert: malformed");
 
-  const clientDataHash = await sha256(utf8(input.challenge));
-  // nonce = SHA256(authenticatorData || SHA256(challenge)). The device signs the NONCE with
+  // Bound form (AA-M1): clientData = utf8(challenge) || bindingDigest; legacy form is the
+  // challenge alone (pre-binding clients — the session route falls back during the rollout).
+  const clientDataHash = input.bindingDigest
+    ? await sha256(concat(utf8(input.challenge), input.bindingDigest))
+    : await sha256(utf8(input.challenge));
+  // nonce = SHA256(authenticatorData || SHA256(clientData)). The device signs the NONCE with
   // ECDSA-SHA256 — Apple's `isValidSignature(_, for: nonce)` hashes the nonce again — so verify OVER
   // the nonce and let WebCrypto apply the outer SHA-256. Verifying over the raw concat is one hash
   // short and fails a real device's signature ("bad signature").

@@ -12,6 +12,7 @@ import {
 import {
   loadManifest, scopedManifest, allowedPacks, normalizePackName, getPackObject,
 } from "./audio";
+import { sha256, utf8 } from "./bytes";
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -109,16 +110,35 @@ async function verifyDeviceAssertion(env: Env, body: SessionBody): Promise<strin
   ).bind(body.deviceId).first<{ public_key: string; sign_count: number }>();
   if (!device) throw new HttpError(401, "unknown device");
 
-  const assertion = await verifyAssertion(env, {
+  const input = {
     deviceId: body.deviceId,
     publicKeySpki: device.public_key,
     storedSignCount: device.sign_count,
     assertionB64: body.assertion,
     challenge: body.challenge,
-  }).catch((e) => {
-    console.error("assertion failed", { err: String(e) });
-    throw new HttpError(401, "assertion failed");
-  });
+  };
+  // Request binding (AA-M1): the assertion also signs the session credential, so a captured
+  // challenge+assertion pair can't be attached to a DIFFERENT promo code / transaction.
+  const credential = body.promoCode ?? body.signedTransaction;
+  const bindingDigest = credential ? await sha256(utf8(credential)) : undefined;
+
+  let assertion;
+  try {
+    assertion = await verifyAssertion(env, { ...input, bindingDigest });
+  } catch (boundErr) {
+    // Rollout window: app builds released before the binding sign the challenge alone.
+    // Accept that legacy form (logged, so its disappearance is observable) until every
+    // device updates, then DELETE this fallback — tracked in the app repo's
+    // docs/deferred.md App Attest entry. Both verifies are pure local crypto; the one-time
+    // challenge was consumed once above, so the retry costs nothing security-wise.
+    try {
+      assertion = await verifyAssertion(env, input);
+      console.warn("legacy unbound assertion accepted", { deviceId: body.deviceId });
+    } catch {
+      console.error("assertion failed", { err: String(boundErr) });
+      throw new HttpError(401, "assertion failed");
+    }
+  }
 
   await advanceSignCount(env, body.deviceId, assertion.newSignCount);
 
