@@ -125,6 +125,23 @@ async function verifyDeviceAssertion(env: Env, body: SessionBody): Promise<strin
   return body.deviceId;
 }
 
+// Best-effort variant of verifyDeviceAssertion (the missing half of commit e4dd551, which
+// switched handleSession to this API): App Attest here is a fraud-reduction SIGNAL, never a
+// hard gate — see the call site. Returns the attested device id when a complete proof
+// (deviceId + assertion + challenge) is supplied AND verifies; null when the proof is absent
+// or fails (logged). A failed proof is treated exactly like an omitted one — the caller's
+// real gates (promo code / Apple-verified purchase) still apply either way, so soft-failing
+// grants nothing an attacker couldn't get by simply omitting the proof.
+async function tryVerifyDeviceAssertion(env: Env, body: SessionBody): Promise<string | null> {
+  if (!body.deviceId || !body.assertion || !body.challenge) return null;
+  try {
+    return await verifyDeviceAssertion(env, body);
+  } catch (err) {
+    console.warn("best-effort device assertion failed", { err: String(err) });
+    return null;
+  }
+}
+
 // Advances a device's monotonic assertion counter with an atomic compare-and-set.
 // verifyAssertion's in-memory `signCount > stored` check is only a fast path: two CONCURRENT
 // requests replaying the same assertion both read the same stored count and both pass it
@@ -471,6 +488,65 @@ async function handleSubmission(
   return json({ status: "pending" }, 201);
 }
 
+interface FeedbackBody {
+  text?: string;
+  app_version?: string;
+  cefr_level?: string;
+  locale?: string;
+}
+
+// Feedback text: same charset as sentence fields plus newlines, capped at 500 (the app's
+// reviews.md RV-FR-FDBK-2 cap, re-enforced here — never trust the client).
+const FEEDBACK_TEXT_MAX = 500;
+function sanitizeFeedback(s: string): string {
+  return s.replace(/[^\p{L}\p{N} .,!?;:'"()\-–—\n]/gu, "").trim().slice(0, FEEDBACK_TEXT_MAX);
+}
+
+// "Not enjoying" review feedback from the app (reviews.md RV-FR-FDBK). A write path like
+// /submissions: session-authenticated, per-field validated, rate-limited per subject, stored
+// as 'new' for manual operator review. D1 only — deliberately no e-mail/notification leg.
+async function handleFeedback(
+  env: Env, request: Request, claims: SessionClaims
+): Promise<Response> {
+  const body = (await request.json().catch(() => null)) as FeedbackBody | null;
+  const ip = clientIp(request);
+
+  const text = sanitizeFeedback(body?.text || "");
+  if (text.length < 2) throw new HttpError(400, "missing or invalid text");
+  // Metadata fields: strict shape checks, never free-form (invalid → generic placeholder,
+  // not a rejection — the feedback text is the payload that matters).
+  const appVersion = /^[0-9]+(\.[0-9]+){0,3}$/.test(body?.app_version || "")
+    ? (body!.app_version as string) : "unknown";
+  const cefrLevel = /^[A-Ca-c][12](\.[0-9]{1,2})?$/.test(body?.cefr_level || "")
+    ? (body!.cefr_level as string).toUpperCase() : "unknown";
+  const locale = /^[A-Za-z0-9_-]{2,20}$/.test(body?.locale || "")
+    ? (body!.locale as string) : "unknown";
+
+  const key = rateSubjectKey(claims, ip);
+
+  // Burst limit: a couple of feedback messages per 10 minutes per subject.
+  if (!(await rateLimit(env, `feedback:${key}`, 3, 600, nowSeconds()))) {
+    console.warn("feedback rate limited", { key });
+    throw new HttpError(429, "rate limited");
+  }
+
+  // Daily cap: bound sustained flooding from one client (RV-FR-FDBK-6).
+  const recent = await env.DB.prepare(
+    "SELECT COUNT(*) AS c FROM feedback WHERE subject = ? AND created_at > datetime('now', '-1 day')"
+  ).bind(key).first<{ c: number }>();
+  if ((recent?.c ?? 0) >= 3) {
+    console.warn("feedback daily cap reached", { key });
+    throw new HttpError(429, "daily feedback limit reached");
+  }
+
+  await env.DB.prepare(
+    `INSERT INTO feedback (id, subject, text, app_version, cefr_level, locale, status)
+     VALUES (?, ?, ?, ?, ?, ?, 'new')`
+  ).bind(crypto.randomUUID(), key, text, appVersion, cefrLevel, locale).run();
+
+  return json({ status: "received" }, 201);
+}
+
 // ---- Audio media endpoints --------------------------------------------------
 
 // Pack manifest, filtered to the caller's scope (free sees only the "free" pack).
@@ -598,6 +674,10 @@ export default {
       if (request.method === "POST" && route === "submissions") {
         const claims = await requireSession(env, request);
         return await handleSubmission(env, request, claims);
+      }
+      if (request.method === "POST" && route === "feedback") {
+        const claims = await requireSession(env, request);
+        return await handleFeedback(env, request, claims);
       }
       if (request.method === "GET" && route === "audio" && sub === "manifest") {
         const claims = await requireSession(env, request);

@@ -52,6 +52,23 @@ CREATE TABLE IF NOT EXISTS submissions (
 
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions (status, created_at);
 
+-- "Not enjoying" review feedback from the iOS app (reviews.md RV-FR-FDBK). Inserted by
+-- POST /v1/feedback — sanitized and rate-limited server-side, reviewed manually by the
+-- operator (D1 only; deliberately never e-mailed). `subject` is the session subject
+-- (device id or promo label), kept for rate-limiting / abuse review, not personal data.
+CREATE TABLE IF NOT EXISTS feedback (
+  id          TEXT PRIMARY KEY,                       -- random uuid
+  subject     TEXT NOT NULL,                          -- session subject (rate-limit key)
+  text        TEXT NOT NULL,                          -- sanitized free text, <= 500 chars
+  app_version TEXT NOT NULL,                          -- e.g. '1.2'
+  cefr_level  TEXT NOT NULL,                          -- e.g. 'A1.1'
+  locale      TEXT NOT NULL,                          -- e.g. 'en_DE'
+  status      TEXT NOT NULL DEFAULT 'new',            -- 'new' | 'read'
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')) -- UTC
+);
+
+CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback (status, created_at);
+
 -- Per-device count of search REQUESTS a free user has made. A free (attested) device
 -- may run up to a fixed cap of searches before being asked to upgrade; within the cap,
 -- searches return full results (including paid-word previews). Keyed to device_id (App
