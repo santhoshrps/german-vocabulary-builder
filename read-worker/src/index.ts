@@ -287,6 +287,17 @@ async function requireFreshAssertion(
   // Local Xcode StoreKit sessions have no attested device key, so they can't
   // present an assertion — exempt them (dev only; guarded by STOREKIT_ENV).
   if (claims.ent === "storekit" && storeKitXcodeMode(env)) return;
+  // PURCHASE-ONLY sessions (2026-07-12): a paid device that could not complete App
+  // Attest at mint gets in on the Apple-verified purchase alone, with a
+  // `storekit:<label>` subject instead of a device id (see handleSession). That device
+  // has no hardware key to assert with, so DEMANDING a fresh assertion here contradicts
+  // the best-effort mint and hard-bricks exactly the device class the mint promised to
+  // admit (owner report: a paid device throttled by Apple after many same-day reinstalls
+  // could not download words). The requirement is meaningful ONLY for a DEVICE-BOUND
+  // session (subject = the attested device id) — those still enforce fresh proof, so a
+  // stolen device-bound token still can't pull the bulk dataset. The verified purchase
+  // is the gate for the purchase-only path.
+  if (claims.sub.startsWith("storekit:")) return;
 
   const challenge = request.headers.get("X-Challenge") || "";
   const assertionB64 = request.headers.get("X-Assertion") || "";
