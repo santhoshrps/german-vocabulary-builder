@@ -11,6 +11,7 @@ import {
 } from "./data";
 import {
   loadManifest, scopedManifest, allowedPacks, normalizePackName, getPackObject,
+  presignPackURL, PACK_URL_TTL_SECONDS,
 } from "./audio";
 import { sha256, utf8 } from "./bytes";
 
@@ -604,24 +605,43 @@ async function handleAudioPack(
   }
 
   const url = new URL(request.url);
+  // MEDIATRACE: the Cache API silently no-ops on workers.dev hosts — the client's per-pack
+  // trace shows this header so a cache-incapable deployment names itself instead of
+  // masquerading as an eternal MISS.
+  const cacheCapable = url.hostname.endsWith(".workers.dev") ? "no-workers.dev" : "yes";
   const cache = caches.default;
   const cacheKey = new Request(`https://media-cache.internal${url.pathname}?h=${sha}`, { method: "GET" });
   const hit = await cache.match(cacheKey);
   if (hit) {
     const headers = new Headers(hit.headers);
     headers.set("X-Cache", "HIT");
+    headers.set("X-Cache-Capable", cacheCapable);
+    headers.set("Server-Timing", "edge;desc=hit");
+    console.log(JSON.stringify({ evt: "MEDIATRACE pack", name: norm, cache: "HIT" }));
     return new Response(hit.body, { status: hit.status, headers });
   }
 
+  const r2Start = Date.now();
   const obj = await getPackObject(env, manifest, scope, norm);
+  const r2ms = Date.now() - r2Start;   // time-to-first-byte from R2; streaming continues after
   const headers = new Headers({
     "Content-Type": "application/octet-stream",
     "Cache-Control": "public, max-age=86400",
     ETag: etag,
     "X-Cache": "MISS",
+    "X-Cache-Capable": cacheCapable,
+    "Server-Timing": `r2;dur=${r2ms}`,
   });
   const response = new Response(obj.body, { status: 200, headers });
-  ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  console.log(JSON.stringify({
+    evt: "MEDIATRACE pack", name: norm, cache: "MISS", cacheCapable, r2ms,
+    bytes: manifest.packs[norm]?.bytes ?? 0,
+  }));
+  // A failed store must be VISIBLE — a pack that never caches re-streams from R2 for every
+  // user forever, which reads as "downloads are slow" with no error anywhere.
+  ctx.waitUntil(cache.put(cacheKey, response.clone()).catch((err) => {
+    console.warn(JSON.stringify({ evt: "MEDIATRACE cache-put-failed", name: norm, err: String(err) }));
+  }));
   return response;
 }
 
@@ -718,6 +738,27 @@ export default {
         const name = parts.slice(3).join("/");
         if (!name) throw new HttpError(400, "missing pack name");
         return await handleAudioPack(env, request, ctx, scopeOf(claims), name);
+      }
+      // Direct-from-storage delivery (MS-NFR-PERF-3): authorize, then hand the client a
+      // short-lived presigned R2 URL instead of streaming the bytes through the worker.
+      // Same auth, same scope enforcement, same rate budget as the streamed route.
+      if (request.method === "GET" && route === "audio" && sub === "packurl") {
+        const claims = await requireSession(env, request);
+        if (!(await rateLimit(env, `audiopack:${rateSubjectKey(claims, ip)}`, 300, 600, nowSeconds()))) {
+          throw new HttpError(429, "rate limited");
+        }
+        const name = parts.slice(3).join("/");
+        if (!name) throw new HttpError(400, "missing pack name");
+        const manifest = await loadManifest(env);
+        const norm = normalizePackName(name);
+        // Paywall: identical check to the streamed route — a grant is authorization.
+        if (!allowedPacks(manifest, scopeOf(claims)).has(norm)) {
+          throw new HttpError(403, "pack not available for this scope");
+        }
+        const url = await presignPackURL(env, norm);
+        if (!url) throw new HttpError(503, "direct delivery not configured");
+        console.log(JSON.stringify({ evt: "MEDIATRACE packurl", name: norm }));
+        return json({ url, expiresSeconds: PACK_URL_TTL_SECONDS });
       }
 
       return json({ error: "not found" }, 404);

@@ -34,6 +34,12 @@ APP_ATTEST_ENV = "production"
 # (see storeKitXcodeMode in src/entitlement.ts). Keep this "production" here so a
 # bare `wrangler deploy` always ships the locked-down config.
 STOREKIT_ENV = "production"
+# Direct-from-storage pack delivery (MS-NFR-PERF-3): account id + bucket for minting
+# presigned R2 URLs. The access key pair are SECRETS (wrangler secret put
+# R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY) from an R2 API token scoped to READ this
+# bucket only. Leave unset to disable: clients then use the streamed route.
+R2_ACCOUNT_ID = "50163e5bf5ee8a574fb5e2dd442e38ed"
+R2_MEDIA_BUCKET = "german-vocabulary-media"
 
 # Secrets (set with `wrangler secret put <NAME>`), never committed:
 #   SESSION_JWT_SECRET          random 32+ byte secret for signing session JWTs (openssl rand -hex 32)
@@ -91,3 +97,6 @@ SESSION_TTL_SECONDS = "600"
 APP_ATTEST_ENV = "development"
 # Local Xcode StoreKit testing: trust locally-signed transactions (dev origin only).
 STOREKIT_ENV = "xcode"
+# Same direct-delivery vars for the dev worker (secrets set with --env dev).
+R2_ACCOUNT_ID = "50163e5bf5ee8a574fb5e2dd442e38ed"
+R2_MEDIA_BUCKET = "german-vocabulary-media"
