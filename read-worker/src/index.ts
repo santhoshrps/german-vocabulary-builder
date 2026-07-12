@@ -357,7 +357,12 @@ async function handleSnapshot(
   const version = await getVersion(env, scope);
   return serveCachedByVersion(request, ctx, version, `snapshot:${scope}`, 86400, async () => ({
     body: await buildSnapshotNdjson(env, scope),
-    contentType: "application/x-ndjson",
+    // text/plain, not application/x-ndjson (2026-07-12): the client parses BYTES and never
+    // reads this header, and only types on Cloudflare's compressible list get wire
+    // compression — x-ndjson isn't listed, which shipped the ~20 MB snapshot raw. This is
+    // the ONLY sanctioned compression mechanism here; never hand-gzip a response (the
+    // double-gzip incident, see cache.ts).
+    contentType: "text/plain; charset=utf-8",
   }));
 }
 
