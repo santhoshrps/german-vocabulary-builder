@@ -201,36 +201,39 @@ def read_excel(table: str) -> list[dict[str, Any]]:
         while actual and actual[-1] == "":
             actual.pop()
 
-        expected_cols = actual[: len(headers)]
-        extra_cols = actual[len(headers):]
-
-        if expected_cols != headers:
-            lines = [
+        # Columns are matched BY NAME, not position (changed 2026-07-12): adding a language
+        # is data-only (GL-LANG), and its columns get inserted wherever reads best in the
+        # sheet (the Spanish set sits mid-sheet next to its German counterparts). The ingest
+        # requires every expected header to EXIST, reads exactly those columns wherever they
+        # are, and ignores the rest. Duplicates of an expected header are an error — the
+        # ingest could not know which column to trust.
+        missing = [h for h in headers if h not in actual]
+        if missing:
+            raise ValidationError("\n".join([
                 f"'{filename}' column mismatch:",
                 f"  Expected : {headers}",
                 f"  Got      : {actual}",
-            ]
-            missing = [h for h in headers if h not in actual]
-            unexpected = [h for h in expected_cols if h and h not in headers]
-            if missing:
-                lines.append(f"  Missing  : {missing}")
-            if unexpected:
-                lines.append(f"  Unexpected: {unexpected}")
-            raise ValidationError("\n".join(lines))
-
-        # Extra columns beyond the expected set are ignored (only their headers
-        # are noted). Data in these columns is never read — the row loop below
-        # only iterates the expected headers.
+                f"  Missing  : {missing}",
+            ]))
+        duplicated = [h for h in headers if actual.count(h) > 1]
+        if duplicated:
+            raise ValidationError(
+                f"'{filename}' has duplicated expected column(s): {duplicated} — "
+                f"remove the duplicates so the ingest knows which column to read."
+            )
+        extra_cols = [c for c in actual if c and c not in headers]
         if extra_cols:
             logger.warning(
                 "'%s' has %d unrecognised column(s) beyond the expected set — ignoring: %s",
                 filename, len(extra_cols), extra_cols,
             )
 
-        level_idx = headers.index("Level")
-        word_idx = headers.index("Word")
-        image_idx = headers.index("Image") if "Image" in headers else -1
-        free_idx = headers.index("Free") if "Free" in headers else -1
+        # Sheet position of every expected column (validated present + unique above).
+        col_of = {h: actual.index(h) for h in headers}
+        level_idx = col_of["Level"]
+        word_idx = col_of["Word"]
+        image_idx = col_of.get("Image", -1)
+        free_idx = col_of.get("Free", -1)
 
         rows: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
@@ -241,10 +244,12 @@ def read_excel(table: str) -> list[dict[str, Any]]:
             if all(_clean(c) is None for c in raw_row):
                 continue
 
-            # Build record — coerce unexpected types (datetime, float) to string
-            image_raw: Any = raw_row[image_idx] if image_idx >= 0 and image_idx < len(raw_row) else None
+            # Build record — coerce unexpected types (datetime, float) to string.
+            # Cells are read through `col_of` (the by-name map), never by list position.
+            image_raw: Any = raw_row[image_idx] if 0 <= image_idx < len(raw_row) else None
             record: dict[str, Any] = {}
-            for j, header in enumerate(headers):
+            for header in headers:
+                j = col_of[header]
                 db_col = _db_col(header)
                 val = _clean(raw_row[j] if j < len(raw_row) else None)
                 if val is not None and not isinstance(val, str):

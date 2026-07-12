@@ -35,6 +35,8 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape as _xml_escape
@@ -86,7 +88,13 @@ PITCH = "+0Hz"
 # v2: per-word voice variety (pools instead of one voice per gender).
 # v3: Azure Speech backend (different bytes than the old edge-tts engine).
 # v4: Azure Speech SDK (handles the custom-domain Foundry resource natively).
-ENGINE_VERSION = "4"
+# v5: HE-AAC 32 kbps mono .m4a delivery, transcoded from LOSSLESS PCM synthesis (owner
+#     decision 2026-07-12 after the on-device A/B) — no MP3 anywhere, no generational loss.
+ENGINE_VERSION = "5"
+
+# Delivery encoding: what the app downloads and plays. One constant so a future change
+# re-hashes (and thus re-ships) everything through the normal recipe mechanism.
+DELIVERY_KBPS = 32
 
 
 def _pick_voice(pool: list[str], seed: str) -> str:
@@ -260,15 +268,18 @@ def _speech_config():
     else:
         raise RuntimeError("Set AZURE_SPEECH_ENDPOINT (custom domain) or AZURE_SPEECH_REGION in sync/.env")
 
-    # 24 kHz mono MP3 — plenty for single-word pronunciation, small files.
+    # LOSSLESS 24 kHz mono PCM (WAV): the delivery encode (HE-AAC, see `synthesize`)
+    # happens locally from these bytes, so no lossy intermediate ever touches the chain.
     cfg.set_speech_synthesis_output_format(
-        speechsdk.SpeechSynthesisOutputFormat.Audio24Khz48KBitRateMonoMp3
+        speechsdk.SpeechSynthesisOutputFormat.Riff24Khz16BitMonoPcm
     )
     return cfg
 
 
 def synthesize(text: str, voice: str, out_path: Path) -> None:
-    """Render one MP3 to out_path via the Azure Speech SDK (blocking)."""
+    """Render one HE-AAC .m4a to out_path: Azure Speech (lossless PCM) -> afconvert
+    (HE-AAC, DELIVERY_KBPS mono). Blocking; macOS-only (afconvert), like the image
+    pipeline (sips)."""
     import azure.cognitiveservices.speech as speechsdk
 
     corrected = apply_phoneme_corrections(text)
@@ -281,5 +292,18 @@ def synthesize(text: str, voice: str, out_path: Path) -> None:
             f"Azure TTS failed for voice {voice!r}: {details.reason} {details.error_details}"
         )
 
+    with tempfile.TemporaryDirectory() as td:
+        wav = Path(td) / "in.wav"
+        m4a = Path(td) / "out.m4a"
+        wav.write_bytes(result.audio_data)
+        subprocess.run(
+            ["afconvert", "-f", "m4af", "-d", "aach", "-c", "1",
+             "-b", str(DELIVERY_KBPS * 1000), str(wav), str(m4a)],
+            check=True, capture_output=True)
+        data = m4a.read_bytes()
+    # The app chooses playback behavior by the .m4a extension — CoreAudio trusts file
+    # names over content, so a non-MP4 container here would ship as garbage. Never.
+    if data[4:8] != b"ftyp":
+        raise RuntimeError(f"afconvert produced a non-MP4 container for voice {voice!r}")
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_bytes(result.audio_data)
+    out_path.write_bytes(data)
