@@ -46,11 +46,12 @@ export async function verifyPromoCode(env: Env, code: string): Promise<Entitleme
 
 // ---- Promo device claims (UA-FR-4b: personal full-access codes) --------------
 
-/// How many distinct attested devices one full-tier promo code may bind to. Two, not one:
-/// a reinstall regenerates the App Attest key, so a cap of 1 would lock the legitimate
-/// owner out of their own code on every reinstall or phone upgrade (and iPhone+iPad is a
-/// normal single-owner pair). Casual code-forwarding still dies at device 3.
-export const PROMO_DEVICE_CAP = 2;
+/// How many distinct attested devices one full-tier promo code may bind to. Three (raised
+/// from two on 2026-07-13 when the app gained iPad support, app spec IP-FR-14): a reinstall
+/// regenerates the App Attest key, so the cap must cover iPhone + iPad + one
+/// reinstall/upgrade slot or an owner's own devices lock them out of their own code.
+/// Casual code-forwarding still dies at device 4.
+export const PROMO_DEVICE_CAP = 3;
 
 export type PromoClaimResult = "ok" | "code-in-use" | "device-check-required";
 

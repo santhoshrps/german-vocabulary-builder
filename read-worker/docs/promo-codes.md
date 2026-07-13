@@ -189,10 +189,11 @@ redeploy it (see Troubleshooting).
 ## 7. Operating codes — personal binding & revocation
 
 **Full-tier codes are personal (app spec UA-FR-4b).** A full code binds to the first
-**`PROMO_DEVICE_CAP` (2)** attested devices that redeem it, recorded in the
-`promo_claims` table (`src/entitlement.ts` → `claimPromoDevice`). Two, not one, because a
-reinstall regenerates the App Attest key — a cap of 1 would lock the owner out of their
-own code on every reinstall or phone upgrade. Any further device gets
+**`PROMO_DEVICE_CAP` (3)** attested devices that redeem it, recorded in the
+`promo_claims` table (`src/entitlement.ts` → `claimPromoDevice`). Three (raised from two
+on 2026-07-13 with iPad support, app spec IP-FR-14) because a reinstall regenerates the
+App Attest key — the cap must cover iPhone + iPad + one reinstall/upgrade slot, or the
+owner's own devices lock them out. Any further device gets
 `403 "code already in use on the maximum number of devices"`.
 
 The binding is **strict at first use, tolerant after**: a code with zero claims never

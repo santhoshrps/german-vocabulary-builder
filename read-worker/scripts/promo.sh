@@ -1,7 +1,7 @@
 #!/bin/bash
 # promo.sh — admin tool for PERSONAL full-access codes (app spec UA-FR-4b).
 #
-# One code per person. A full-tier code binds to the first PROMO_DEVICE_CAP (2) attested
+# One code per person. A full-tier code binds to the first PROMO_DEVICE_CAP (3) attested
 # devices that redeem it (promo_claims, enforced in src/entitlement.ts claimPromoDevice);
 # anyone else gets "code already in use". Revocation is per code, i.e. per person, and
 # takes effect within the session TTL (1 h).
@@ -69,7 +69,7 @@ case "$cmd" in
     echo
     echo "    $code"
     echo
-    echo "Hand it to ONE person — it binds to their first 2 devices. It is stored only as a"
+    echo "Hand it to ONE person — it binds to their first 3 devices. It is stored only as a"
     echo "hash and cannot be shown again. Revoke anytime: scripts/promo.sh revoke $label"
     ;;
   list)
