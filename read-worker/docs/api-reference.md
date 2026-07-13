@@ -89,7 +89,14 @@ Mints a session JWT. Two mutually exclusive modes.
 | 401 | `unknown device` | device id not registered |
 | 401 | `assertion failed` | assertion signature/counter check failed |
 | 403 | `invalid promo code` | promo code unknown/inactive/expired |
+| 403 | `code already in use on the maximum number of devices` | full-tier promo code bound to `PROMO_DEVICE_CAP` other devices (personal codes, `promo-codes.md` §7) |
+| 503 | `device check required - try again shortly` | full-tier promo code with **zero** claims minted without an attested device (App Attest paused) — transient, retryable |
 | 403 | `entitlement verification failed` / `no active entitlement` | StoreKit invalid or no qualifying product |
+
+> The two personal-code responses are a **contract with the app**
+> (`UnlockFlowCoordinator.redeemOutcome(for:)` matches status + body substring): 403 means
+> "dead for this device" (the app drops a stored code and reopens the unlock window), 503
+> means "transient — retry, the code is not burned". Keep the strings and statuses in step.
 
 Send the JWT as `Authorization: Bearer <token>` on all data endpoints.
 

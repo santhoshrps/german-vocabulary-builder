@@ -20,8 +20,9 @@ literally cannot fetch beyond the 100 preview words — the worker filters every
 query by the session's scope. Hiding rows client-side would be pointless because
 the data would already be on the device.
 
-> StoreKit and App Attest are deferred. Today, full access is granted **only** by
-> a `tier = 'full'` promo code.
+> StoreKit and App Attest are both live: full access comes from a StoreKit purchase
+> **or** a `tier = 'full'` promo code. Full-tier codes are **personal** — bound to
+> their first devices and individually revocable (§7, app spec UA-FR-4b).
 
 ---
 
@@ -135,7 +136,16 @@ wrangler d1 execute german-vocabulary --remote \
 
 ### Full-access code
 
-Pick a code, hand it out individually. It is **not** in the app.
+**Use the admin script** ([`scripts/promo.sh`](../scripts/promo.sh)) — it generates an
+unambiguous code, enforces unique labels, inserts the hash, and prints the plaintext
+exactly once:
+
+```bash
+scripts/promo.sh create anna                             # permanent, until revoked
+scripts/promo.sh create beta-tim 2026-12-31T00:00:00Z    # with expiry
+```
+
+Manual SQL (what the script does under the hood):
 
 ```bash
 FULL_CODE='premium-2026-DFTAXY'
@@ -176,16 +186,33 @@ redeploy it (see Troubleshooting).
 
 ---
 
-## 7. Operating codes
+## 7. Operating codes — personal binding & revocation
+
+**Full-tier codes are personal (app spec UA-FR-4b).** A full code binds to the first
+**`PROMO_DEVICE_CAP` (2)** attested devices that redeem it, recorded in the
+`promo_claims` table (`src/entitlement.ts` → `claimPromoDevice`). Two, not one, because a
+reinstall regenerates the App Attest key — a cap of 1 would lock the owner out of their
+own code on every reinstall or phone upgrade. Any further device gets
+`403 "code already in use on the maximum number of devices"`.
+
+The binding is **strict at first use, tolerant after**: a code with zero claims never
+mints without an attested device (`503 "device check required - try again shortly"` —
+transient, the app tells the user to retry shortly), while a code that already has a
+claim may re-mint unattested, so an Apple-side App Attest pause never bricks the
+legitimate owner (UA-FR-4c). The **free built-in code is exempt** from claiming (it is
+shared by every install), and so is the **dev worker** (Xcode/Simulator builds can't
+attest — mirrors its StoreKit relaxation).
+
+Day-to-day, use [`scripts/promo.sh`](../scripts/promo.sh):
 
 | Action | Command |
 |--------|---------|
-| Disable a code | `UPDATE promo_codes SET active = 0 WHERE label = 'full-grant'` |
-| Re-enable | `UPDATE promo_codes SET active = 1 WHERE label = 'full-grant'` |
-| Expire now | `UPDATE promo_codes SET expires_at = '2000-01-01T00:00:00Z' WHERE label = '…'` |
-| Delete | `DELETE FROM promo_codes WHERE label = '…'` |
-
-(Run each with `wrangler d1 execute german-vocabulary --remote --command "…"`.)
+| Create a code for one person | `scripts/promo.sh create anna` |
+| List codes + claimed-device counts | `scripts/promo.sh list` |
+| Revoke ONE person's access | `scripts/promo.sh revoke anna` |
+| Re-enable | `scripts/promo.sh enable anna` |
+| Free burned device slots (reinstalls) | `scripts/promo.sh unclaim anna` |
+| Delete a code + its claims | `scripts/promo.sh delete anna` |
 
 Revoking a code stops it minting **new** sessions immediately. Sessions already
 issued remain valid until the JWT expires (default 1 hour, `SESSION_TTL_SECONDS`).

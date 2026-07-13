@@ -4,7 +4,7 @@ import { signSession, verifySession, SessionClaims } from "./jwt";
 import { issueChallenge, consumeChallenge, rateLimit } from "./limits";
 import { serveCachedByVersion } from "./cache";
 import { verifyAttestation, verifyAssertion, attestationRequired } from "./appattest";
-import { verifyPromoCode, verifyStoreKitTransaction, storeKitXcodeMode, Entitlement, Scope } from "./entitlement";
+import { verifyPromoCode, verifyStoreKitTransaction, storeKitXcodeMode, claimPromoDevice, Entitlement, Scope } from "./entitlement";
 import {
   getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP, searchWord,
   searchCapEnforced, takeSearchRequest, refundSearchRequest, FREE_SEARCH_REQUEST_CAP,
@@ -224,6 +224,25 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
     // ---- Free / promo tier ----
     entitlement = await verifyPromoCode(env, body.promoCode);
     if (!entitlement) throw new HttpError(403, "invalid promo code");
+    // Personal full-access codes (UA-FR-4b): a full-tier code binds to the first
+    // PROMO_DEVICE_CAP attested devices that redeem it; everyone else is turned away. The
+    // free built-in code is deliberately exempt (scope "free" — it's shared by every
+    // install), and so is the dev worker (Xcode/Simulator builds can't attest, mirroring
+    // its existing StoreKit relaxation). Error contract, matched by the app on status +
+    // body ("403 code recovery" in VocabularyAPIClient.ensureOK):
+    //   403 "code already in use…"      — dead FOR THIS DEVICE: drop the stored code, prompt.
+    //   503 "device check required…"    — TRANSIENT (App Attest throttled at first-ever
+    //        redemption): NOT a credential rejection, so a stored code survives it
+    //        (UA-FR-4c) and the redeem UI says "try again in a little while".
+    if (entitlement.scope === "full" && !storeKitXcodeMode(env)) {
+      const claim = await claimPromoDevice(env, entitlement.codeHash!, attestedDeviceId ?? null);
+      if (claim === "code-in-use") {
+        throw new HttpError(403, "code already in use on the maximum number of devices");
+      }
+      if (claim === "device-check-required") {
+        throw new HttpError(503, "device check required - try again shortly");
+      }
+    }
     // Device-scoped when attested (pins the free search cap to hardware); label-scoped otherwise.
     subject = attestedDeviceId ?? `promo:${entitlement.label}`;
   } else if (storeKitXcodeMode(env) && body.signedTransaction && !body.assertion) {

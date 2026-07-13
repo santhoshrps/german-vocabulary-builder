@@ -24,6 +24,8 @@ export interface Entitlement {
   /// StoreKit only: the purchase's stable identity, used to cap how many distinct
   /// devices one signed transaction can mint sessions for (Apple-ID sharing bound).
   originalTransactionId?: string;
+  /// Promo only: sha256(code) hex — the key for per-code device claims (UA-FR-4b).
+  codeHash?: string;
 }
 
 // ---- Promo code -------------------------------------------------------------
@@ -39,7 +41,54 @@ export async function verifyPromoCode(env: Env, code: string): Promise<Entitleme
   if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) return null;
   // Anything other than an explicit "full" tier is treated as free (least privilege).
   const scope: Scope = row.tier === "full" ? "full" : "free";
-  return { type: "promo", scope, label: row.label || "promo" };
+  return { type: "promo", scope, label: row.label || "promo", codeHash: hash };
+}
+
+// ---- Promo device claims (UA-FR-4b: personal full-access codes) --------------
+
+/// How many distinct attested devices one full-tier promo code may bind to. Two, not one:
+/// a reinstall regenerates the App Attest key, so a cap of 1 would lock the legitimate
+/// owner out of their own code on every reinstall or phone upgrade (and iPhone+iPad is a
+/// normal single-owner pair). Casual code-forwarding still dies at device 3.
+export const PROMO_DEVICE_CAP = 2;
+
+export type PromoClaimResult = "ok" | "code-in-use" | "device-check-required";
+
+/// Binds a full-tier promo code to the attested devices that use it (promo_claims table).
+///
+/// Attested mint: the device keeps its existing claim, takes a free slot, or — when the
+/// code is already bound to PROMO_DEVICE_CAP other devices — is rejected ("code-in-use").
+///
+/// Unattested mint (App Attest throttled/unavailable): STRICT at first use, tolerant
+/// after. A code with zero claims never mints without a proven device ("device-check-
+/// required", transient, retryable) — that is the whole binding guarantee. A code that
+/// already has a claim may re-mint unattested, because this is almost always the claimant
+/// whose attestation Apple is momentarily throttling, and bricking them would repeat the
+/// 2026-07-12 words-download failure (UA-FR-4c). A patched client that never attests can
+/// ride that lenience — accepted: it can't be bound by attestation at all, and the code
+/// stays individually revocable.
+export async function claimPromoDevice(
+  env: Env, codeHash: string, deviceId: string | null
+): Promise<PromoClaimResult> {
+  if (!deviceId) {
+    const row = await env.DB.prepare(
+      "SELECT COUNT(*) AS n FROM promo_claims WHERE code_hash = ?"
+    ).bind(codeHash).first<{ n: number }>();
+    return (row?.n ?? 0) > 0 ? "ok" : "device-check-required";
+  }
+  // Single atomic statement: claim a slot only while one is free; re-claiming one's own
+  // slot is a no-op. D1 serializes writes, so two new devices racing for the last slot
+  // can't both get in (the second one's count subquery already sees the cap reached).
+  await env.DB.prepare(
+    `INSERT INTO promo_claims (code_hash, device_id)
+     SELECT ?1, ?2
+     WHERE (SELECT COUNT(*) FROM promo_claims WHERE code_hash = ?1) < ?3
+     ON CONFLICT (code_hash, device_id) DO NOTHING`
+  ).bind(codeHash, deviceId, PROMO_DEVICE_CAP).run();
+  const mine = await env.DB.prepare(
+    "SELECT 1 FROM promo_claims WHERE code_hash = ?1 AND device_id = ?2"
+  ).bind(codeHash, deviceId).first();
+  return mine ? "ok" : "code-in-use";
 }
 
 // ---- StoreKit 2 signed transaction (JWS) ------------------------------------

@@ -120,3 +120,15 @@ CREATE TABLE IF NOT EXISTS transaction_devices (
   first_seen              TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (original_transaction_id, device_id)
 );
+
+-- Devices bound to a FULL-tier promo code (UA-FR-4b: personal codes). The promo twin of
+-- transaction_devices: one full code may mint sessions for at most PROMO_DEVICE_CAP distinct
+-- attested devices (src/entitlement.ts claimPromoDevice) — a forwarded code stops working for
+-- everyone past the owner's own devices. Already-bound devices always keep working; deleting
+-- a code's rows frees its slots (e.g. after the owner's reinstall burns one).
+CREATE TABLE IF NOT EXISTS promo_claims (
+  code_hash  TEXT NOT NULL,                            -- promo_codes.code_hash
+  device_id  TEXT NOT NULL,                            -- devices.device_id
+  claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (code_hash, device_id)
+);
