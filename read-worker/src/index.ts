@@ -456,6 +456,8 @@ async function handleSearch(
 interface SubmissionBody {
   word?: string;
   type?: string;
+  /// Stable per-word key (`custom-<uuid>`) for share upserts — absent on search-submits.
+  client_key?: string;
   // Full-field sharing of a user's custom word (customwords.md CW-FR-ADD-3 / search.md §3):
   // every field optional, every field validated server-side below.
   translation?: string;
@@ -492,6 +494,12 @@ async function handleSubmission(
   const allowedTypes = ["noun", "verb", "adjective", "adverb"];
   const type = body?.type && allowedTypes.includes(body.type) ? body.type : null;
   const key = rateSubjectKey(claims, ip);
+  // Stable per-word client key (the app's `custom-<uuid>`): repeated shares of ONE word —
+  // first save, then every edit (app spec CW-FR-ADD-6) — UPSERT the same curation row, so
+  // the curator always sees one current version instead of a history of near-duplicates.
+  // Strict shape; anything else is treated as absent (search-submits carry no key).
+  const clientKey = /^custom-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+    .test(body?.client_key || "") ? (body!.client_key as string) : null;
 
   // Optional full fields of a shared custom word — per-field validation: word/form fields
   // keep the letters/spaces rule; sentence fields allow sentence punctuation; article is a
@@ -530,16 +538,36 @@ async function handleSubmission(
     throw new HttpError(429, "daily submission limit reached");
   }
 
-  // Dedup: if this word is already awaiting curation, don't queue it again.
-  const existing = await env.DB.prepare(
-    "SELECT 1 FROM submissions WHERE word = ? AND status = 'pending' LIMIT 1"
-  ).bind(word).first();
-  if (existing) return json({ status: "pending" }, 200);
+  // Keyed share: upsert this word's own row. An APPROVED word is already in the curation
+  // pipeline — edits don't reopen it here; a rejected one returns to 'pending' (the user
+  // improved it, the curator re-reviews). created_at refreshes so the curator sees recency;
+  // the daily cap counts rows, so edits of one word never eat the submission budget.
+  if (clientKey) {
+    const mine = await env.DB.prepare(
+      "SELECT status FROM submissions WHERE client_key = ? LIMIT 1"
+    ).bind(clientKey).first<{ status: string }>();
+    if (mine) {
+      if (mine.status === "approved") return json({ status: "approved" }, 200);
+      await env.DB.prepare(
+        `UPDATE submissions SET word = ?, type = ?, details = ?, status = 'pending',
+                created_at = datetime('now') WHERE client_key = ?`
+      ).bind(word, type, detailsJSON, clientKey).run();
+      return json({ status: "pending" }, 200);
+    }
+  } else {
+    // Keyless (search-submit) dedup: if this word is already awaiting curation, don't queue
+    // it again. Keyed shares skip this — the user's own word must not be swallowed by an
+    // unrelated pending row that happens to share the spelling.
+    const existing = await env.DB.prepare(
+      "SELECT 1 FROM submissions WHERE word = ? AND status = 'pending' LIMIT 1"
+    ).bind(word).first();
+    if (existing) return json({ status: "pending" }, 200);
+  }
 
   await env.DB.prepare(
-    `INSERT INTO submissions (id, word, type, details, source, scope, status)
-     VALUES (?, ?, ?, ?, ?, ?, 'pending')`
-  ).bind(crypto.randomUUID(), word, type, detailsJSON, key, scopeOf(claims)).run();
+    `INSERT INTO submissions (id, word, type, details, source, scope, status, client_key)
+     VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`
+  ).bind(crypto.randomUUID(), word, type, detailsJSON, key, scopeOf(claims), clientKey).run();
 
   return json({ status: "pending" }, 201);
 }

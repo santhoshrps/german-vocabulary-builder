@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS promo_codes (
 CREATE TABLE IF NOT EXISTS submissions (
   id         TEXT PRIMARY KEY,                       -- random uuid
   word       TEXT NOT NULL,                          -- the German word the user typed
+  client_key TEXT,                                   -- app's stable word id (custom-<uuid>) for upserts; NULL for search-submits
   type       TEXT,                                   -- optional: 'noun' | 'verb' | 'adjective' | 'adverb'
   details    TEXT,                                   -- optional JSON: full fields of a shared custom word
                                                      -- (translation/sentences/forms), each validated server-side
@@ -51,6 +52,11 @@ CREATE TABLE IF NOT EXISTS submissions (
 --   ALTER TABLE submissions ADD COLUMN details TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_submissions_status ON submissions (status, created_at);
+-- Existing deployments: run once — ALTER TABLE submissions ADD COLUMN client_key TEXT;
+-- Stable per-word key from the app (`custom-<uuid>`): repeated shares of one word UPSERT
+-- the same curation row (app spec CW-FR-ADD-6), so the curator sees one current version.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_submissions_client_key
+  ON submissions (client_key) WHERE client_key IS NOT NULL;
 
 -- "Not enjoying" review feedback from the iOS app (reviews.md RV-FR-FDBK). Inserted by
 -- POST /v1/feedback — sanitized and rate-limited server-side, reviewed manually by the
