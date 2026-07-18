@@ -10,10 +10,11 @@
 # parity (names only) before every deploy and asserts /health (env + version +
 # config) after it. DEPLOY_VERSION is injected by the deploy script — never set here.
 #
-# Blue/green cutover state (MS2-FR-29c): PROD's CONTENT_DB and MEDIA still point
-# at the LEGACY database/bucket until the prod content cutover (end of P2) — the
-# old world keeps serving untouched while the new one is built beside it. Dev and
-# test are fully on their v2 worlds. Flip the marked prod bindings at the cutover.
+# Blue/green state (MS2-FR-29c): ALL environments are on their v2 worlds
+# (cutover completed 2026-07-18). The legacy database ("german-vocabulary") and
+# bucket ("german-vocabulary-media") are FROZEN as instant rollback — revert the
+# prod bindings here and redeploy to roll back — and are decommissioned after
+# the soak window.
 
 name = "german-vocabulary-read-worker"
 main = "src/index.ts"
@@ -27,22 +28,19 @@ compatibility_date = "2024-09-23"
 # PROD
 # ---------------------------------------------------------------------------
 
-# CUTOVER(P2): becomes german-content-prod (79a2229f-0615-4203-8f82-d271a391b1d5)
-# once the v2 content world is published and verified via the beta manifest.
 [[d1_databases]]
 binding = "CONTENT_DB"
-database_name = "german-vocabulary"
-database_id = "b84997d9-5e78-493e-a43e-9d8aafd1ca95"
+database_name = "german-content-prod"
+database_id = "79a2229f-0615-4203-8f82-d271a391b1d5"
 
 [[d1_databases]]
 binding = "OPS_DB"
 database_name = "german-ops-prod"
 database_id = "e9a72e23-d8dd-4b3b-b550-4940728b15fc"
 
-# CUTOVER(P2): becomes german-media-prod once v2 packs are published there.
 [[r2_buckets]]
 binding = "MEDIA"
-bucket_name = "german-vocabulary-media"
+bucket_name = "german-media-prod"
 
 [observability]
 enabled = true
@@ -72,8 +70,9 @@ STOREKIT_ENV = "production"
 # bucket only. Leave unset to disable: clients then use the streamed route (and
 # /health reports the gap as "degraded").
 R2_ACCOUNT_ID = "50163e5bf5ee8a574fb5e2dd442e38ed"
-# CUTOVER(P2): becomes german-media-prod together with the MEDIA binding above.
-R2_MEDIA_BUCKET = "german-vocabulary-media"
+# Presign secrets for THIS bucket: the german-media-prod-read token pair.
+# Until set, packurl answers 503 and clients use the streamed route.
+R2_MEDIA_BUCKET = "german-media-prod"
 
 # Secrets per environment (wrangler secret put <NAME> [--env dev|test]), never committed:
 #   SESSION_JWT_SECRET           random 32+ byte signing secret (openssl rand -hex 32)

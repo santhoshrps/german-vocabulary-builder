@@ -12,11 +12,10 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
 # ---- PROD -----------------------------------------------------------------
-# CUTOVER(P2): becomes german-content-prod (79a2229f-0615-4203-8f82-d271a391b1d5).
 [[d1_databases]]
 binding = "CONTENT_DB"
-database_name = "german-vocabulary"
-database_id = "b84997d9-5e78-493e-a43e-9d8aafd1ca95"
+database_name = "german-content-prod"
+database_id = "79a2229f-0615-4203-8f82-d271a391b1d5"
 
 [observability]
 enabled = true
