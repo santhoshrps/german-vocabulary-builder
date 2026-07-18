@@ -1,4 +1,5 @@
 import { Env } from "./env";
+import { contentQuery } from "./db";
 import { utf8, sha256, bytesToHex } from "./bytes";
 import { Scope } from "./entitlement";
 
@@ -18,15 +19,10 @@ function scopeWhere(scope: Scope): string {
   return scope === "free" ? "free = 1" : "1 = 1";
 }
 
-// Defense-in-depth: the content layer is read-only. Every statement in this file
-// goes through this guard, which refuses anything that is not a SELECT — so an
-// accidental write slipping into the content path in a future change fails loudly
-// instead of mutating the shared vocabulary database.
+// The content database is read-only for this worker; the capability in src/db.ts
+// enforces SELECT-only and is the sole holder of the binding (MS2-FR-29b).
 function readOnlySelect(env: Env, sql: string): D1PreparedStatement {
-  if (!/^\s*SELECT\b/i.test(sql)) {
-    throw new Error(`content layer is read-only; refused non-SELECT: ${sql.trim().slice(0, 40)}`);
-  }
-  return env.DB.prepare(sql);
+  return contentQuery(env, sql);
 }
 
 // ---- Dataset version --------------------------------------------------------
@@ -252,37 +248,8 @@ export async function searchWord(env: Env, query: string, type?: string): Promis
 // device, so it can't be reset by reinstalling the app. The client enforces the same
 // cap and short-circuits; this is the authoritative backstop against direct API abuse.
 
-// Search requests a free device may make before further searches are refused.
-// Mirrors the app's freeSearchLimit. Enforced only in production.
-export const FREE_SEARCH_REQUEST_CAP = 100;
-
-// Whether the request cap is enforced for this deployment. Off on the dev worker
-// (APP_ATTEST_ENV="development"), which DEBUG builds target, so testing is uncapped.
-export function searchCapEnforced(env: Env): boolean {
-  return env.APP_ATTEST_ENV === "production";
-}
-
-// Atomically counts one search request and returns the POST-increment total — one
-// upsert-RETURNING statement, so concurrent requests can't both slip under the cap (the old
-// read-then-record pair was a TOCTOU). Fail closed: if D1 didn't answer, report over-cap.
-export async function takeSearchRequest(env: Env, deviceId: string): Promise<number> {
-  const row = await env.DB.prepare(
-    `INSERT INTO search_usage (device_id, request_count) VALUES (?, 1)
-     ON CONFLICT(device_id) DO UPDATE SET
-       request_count = request_count + 1,
-       updated_at = datetime('now')
-     RETURNING request_count`
-  ).bind(deviceId).first<{ request_count: number }>();
-  return row?.request_count ?? Number.MAX_SAFE_INTEGER;
-}
-
-// Refunds one search request — called when the search itself FAILS after the count was taken,
-// so a server-side error never consumes one of the device's capped requests.
-export async function refundSearchRequest(env: Env, deviceId: string): Promise<void> {
-  await env.DB.prepare(
-    "UPDATE search_usage SET request_count = MAX(request_count - 1, 0) WHERE device_id = ?"
-  ).bind(deviceId).run();
-}
+// (Search-usage accounting lives in limits.ts — it writes to the OPS database;
+// this file is the content layer and holds no write path at all. MS2-FR-29b.)
 
 // ---- Snapshot ---------------------------------------------------------------
 // Full dataset as NDJSON (one row per line). Cloudflare compresses the response;

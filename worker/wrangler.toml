@@ -1,11 +1,52 @@
+# Write worker — the publish pipeline's single write path into CONTENT (MS2-FR-29).
+# Three isolated environments; binds ONLY its environment's content database (no ops
+# database — by binding topology it cannot touch devices/claims/submissions,
+# MS2-FR-29b). Deploy via scripts/deploy.sh; each env has its own API_KEY secret
+# (the pipeline signs requests with the matching key from sync/.env.<env>).
+#
+# Blue/green cutover state (MS2-FR-29c): prod still points at the LEGACY database
+# until the v2 content world is published (phase P2) — flip at the P2 cutover.
+
 name = "german-vocabulary-worker"
 main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
+# ---- PROD -----------------------------------------------------------------
+# CUTOVER(P2): becomes german-content-prod (79a2229f-0615-4203-8f82-d271a391b1d5).
 [[d1_databases]]
-binding = "DB"
+binding = "CONTENT_DB"
 database_name = "german-vocabulary"
 database_id = "b84997d9-5e78-493e-a43e-9d8aafd1ca95"
 
 [observability]
 enabled = true
+
+[vars]
+ENV_NAME = "prod"
+
+# Secrets per environment (wrangler secret put API_KEY [--env dev|test]):
+#   API_KEY   HMAC key for pipeline request signing — DISTINCT per environment.
+
+# ---- DEV ------------------------------------------------------------------
+[[env.dev.d1_databases]]
+binding = "CONTENT_DB"
+database_name = "german-content-dev"
+database_id = "8cc25e6f-df57-4704-892c-fdc78ebc246d"
+
+[env.dev.observability]
+enabled = true
+
+[env.dev.vars]
+ENV_NAME = "dev"
+
+# ---- TEST -----------------------------------------------------------------
+[[env.test.d1_databases]]
+binding = "CONTENT_DB"
+database_name = "german-content-test"
+database_id = "8d110ea2-8f7d-4ff2-adc6-0465701bcf88"
+
+[env.test.observability]
+enabled = true
+
+[env.test.vars]
+ENV_NAME = "test"

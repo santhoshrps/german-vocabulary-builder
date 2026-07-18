@@ -1,21 +1,55 @@
+# Read worker — three fully isolated environments (MS2-FR-29/30):
+#
+#   prod (top level)  → the live app.            Deploy ONLY via scripts/deploy.sh.
+#   [env.dev]         → Xcode DEBUG builds + TestFlight phones flipped to Development.
+#   [env.test]        → automated integration tests + backend experiments; disposable.
+#
+# Each environment has its OWN content database, ops database, media bucket and
+# secrets. Wrangler named environments do NOT inherit vars or bindings, so every
+# block re-declares its full configuration; scripts/deploy.sh verifies secret
+# parity (names only) before every deploy and asserts /health (env + version +
+# config) after it. DEPLOY_VERSION is injected by the deploy script — never set here.
+#
+# Blue/green cutover state (MS2-FR-29c): prod/dev MEDIA and prod CONTENT_DB still
+# point at the LEGACY bucket/database ("german-vocabulary-media"/"german-vocabulary")
+# until the v2 content world is published (program phase P2) — the old world keeps
+# serving untouched while the new one is built beside it. The OPS split is live in
+# every environment. Flip the marked bindings at the P2 cutover.
+
 name = "german-vocabulary-read-worker"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 
-# Same D1 database as the write worker — this worker only reads from it.
+# Short-lived challenges (nonces) and rate-limit counters live in the OPS database
+# (src/limits.ts) — single-writer SQLite makes the consume/increment checks atomic,
+# which eventually-consistent KV could not.
+
+# ---------------------------------------------------------------------------
+# PROD
+# ---------------------------------------------------------------------------
+
+# CUTOVER(P2): becomes german-content-prod (79a2229f-0615-4203-8f82-d271a391b1d5)
+# once the v2 content world is published and verified via the beta manifest.
 [[d1_databases]]
-binding = "DB"
+binding = "CONTENT_DB"
 database_name = "german-vocabulary"
 database_id = "b84997d9-5e78-493e-a43e-9d8aafd1ca95"
 
-# Short-lived challenges (nonces) and rate-limit counters live in D1 (src/limits.ts:
-# `challenges` / `rate_limits` in schema/extra.sql) — single-writer SQLite makes the
-# consume/increment checks atomic, which eventually-consistent KV could not.
+[[d1_databases]]
+binding = "OPS_DB"
+database_name = "german-ops-prod"
+database_id = "e9a72e23-d8dd-4b3b-b550-4940728b15fc"
+
+# CUTOVER(P2): becomes german-media-prod once v2 packs are published there.
+[[r2_buckets]]
+binding = "MEDIA"
+bucket_name = "german-vocabulary-media"
 
 [observability]
 enabled = true
 
 [vars]
+ENV_NAME = "prod"
 # Your Apple Developer Team ID and the app's bundle id (used for App Attest appId hash).
 APP_TEAM_ID = "3VF33Y593F"
 APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
@@ -28,58 +62,46 @@ SESSION_TTL_SECONDS = "600"
 # App Attest environment: "production" or "development".
 APP_ATTEST_ENV = "production"
 # StoreKit environment. "production" verifies transactions against Apple's Root CA.
-# "xcode" (dev only) trusts locally-signed StoreKit Configuration File transactions
-# WITHOUT Apple verification or App Attest — it lives ONLY in the [env.dev] block
-# below and is additionally refused at runtime whenever APP_ATTEST_ENV="production"
-# (see storeKitXcodeMode in src/entitlement.ts). Keep this "production" here so a
-# bare `wrangler deploy` always ships the locked-down config.
+# "xcode" (dev/test only) trusts locally-signed StoreKit Configuration File transactions
+# WITHOUT Apple verification or App Attest — additionally refused at runtime whenever
+# APP_ATTEST_ENV="production" (see storeKitXcodeMode in src/entitlement.ts). Keep this
+# "production" here so a bare `wrangler deploy` always ships the locked-down config.
 STOREKIT_ENV = "production"
 # Direct-from-storage pack delivery (MS-NFR-PERF-3): account id + bucket for minting
 # presigned R2 URLs. The access key pair are SECRETS (wrangler secret put
 # R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY) from an R2 API token scoped to READ this
-# bucket only. Leave unset to disable: clients then use the streamed route.
+# bucket only. Leave unset to disable: clients then use the streamed route (and
+# /health reports the gap as "degraded").
 R2_ACCOUNT_ID = "50163e5bf5ee8a574fb5e2dd442e38ed"
+# CUTOVER(P2): becomes german-media-prod together with the MEDIA binding above.
 R2_MEDIA_BUCKET = "german-vocabulary-media"
 
-# Secrets (set with `wrangler secret put <NAME>`), never committed:
-#   SESSION_JWT_SECRET          random 32+ byte secret for signing session JWTs (openssl rand -hex 32)
-#   APPLE_APPATTEST_ROOT_CA     base64 DER of Apple App Attest Root CA (from Apple)
-#   APPLE_STOREKIT_ROOT_CA      base64 DER of Apple Root CA - G3 (from Apple)
-
-# Audio (and future image) assets: packs + manifest written by sync/audio_sync.py.
-# Create the bucket once:  wrangler r2 bucket create german-vocabulary-media
-[[r2_buckets]]
-binding = "MEDIA"
-bucket_name = "german-vocabulary-media"
-
-# Optional: large snapshot blobs served from R2 with range/resume support.
-# [[r2_buckets]]
-# binding = "SNAPSHOTS"
-# bucket_name = "german-vocabulary-snapshots"
+# Secrets per environment (wrangler secret put <NAME> [--env dev|test]), never committed:
+#   SESSION_JWT_SECRET           random 32+ byte signing secret (openssl rand -hex 32)
+#   SESSION_JWT_SECRET_PREVIOUS  ONLY during a key-rotation grace window (MS2-FR-30e)
+#   APPLE_APPATTEST_ROOT_CA      base64 DER of Apple App Attest Root CA
+#   APPLE_STOREKIT_ROOT_CA       base64 DER of Apple Root CA - G3
+#   R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY   bucket-scoped R2 read token
 
 # ---------------------------------------------------------------------------
-# Development / staging environment — the ONLY place StoreKit "xcode" mode lives.
-#
-#   Local run:   npm run dev         (wrangler dev --env dev)
-#   Deploy:      npm run deploy:dev   (wrangler deploy --env dev)
-#                → https://german-vocabulary-read-worker-dev.<subdomain>.workers.dev
-#
-# DEBUG builds of the iOS app point at the -dev origin (VocabularySyncConfig.swift);
-# release builds hit the production worker above. A bare `wrangler deploy`
-# (npm run deploy) ships the SECURE production config — xcode mode is never on it,
-# and even if it were, storeKitXcodeMode() refuses it while APP_ATTEST_ENV is
-# "production". This dev origin knowingly trusts local StoreKit transactions, so
-# keep its URL out of release builds (the #if DEBUG split guarantees that).
-#
-# Named environments do NOT inherit vars or bindings, so they are re-declared here.
-# Set this env's secrets separately, e.g.:
-#   wrangler secret put SESSION_JWT_SECRET --env dev
+# DEV — Xcode DEBUG builds + TestFlight "Development" switch.
+# The ONLY environment where StoreKit "xcode" mode lives alongside prod's bundle id.
+#   Local run:   npm run dev          (wrangler dev --env dev)
+#   Deploy:      scripts/deploy.sh dev
 # ---------------------------------------------------------------------------
+
 [[env.dev.d1_databases]]
-binding = "DB"
-database_name = "german-vocabulary"
-database_id = "b84997d9-5e78-493e-a43e-9d8aafd1ca95"
+binding = "CONTENT_DB"
+database_name = "german-content-dev"
+database_id = "8cc25e6f-df57-4704-892c-fdc78ebc246d"
 
+[[env.dev.d1_databases]]
+binding = "OPS_DB"
+database_name = "german-ops-dev"
+database_id = "ef5fc11a-a46e-415d-8b3a-99d670cea562"
+
+# CUTOVER(P2): becomes german-media-dev once the pipeline publishes dev packs there.
+# Until then dev READS the legacy bucket so DEBUG builds keep their audio/images.
 [[env.dev.r2_buckets]]
 binding = "MEDIA"
 bucket_name = "german-vocabulary-media"
@@ -88,15 +110,51 @@ bucket_name = "german-vocabulary-media"
 enabled = true
 
 [env.dev.vars]
+ENV_NAME = "dev"
 APP_TEAM_ID = "3VF33Y593F"
 APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
 ENTITLEMENT_PRODUCT_IDS = "com.ramapurampalanivel.germanwords.fullaccess.lifetime"
 SESSION_TTL_SECONDS = "600"
-# App Attest development mode — REQUIRED to pair with StoreKit "xcode" mode
-# (storeKitXcodeMode refuses xcode when this is "production").
+# App Attest development mode: accepts development-environment attestations from
+# Xcode builds AND production-environment attestations from TestFlight builds whose
+# user flipped the in-app Environment switch (MS2-FR-31).
 APP_ATTEST_ENV = "development"
 # Local Xcode StoreKit testing: trust locally-signed transactions (dev origin only).
 STOREKIT_ENV = "xcode"
-# Same direct-delivery vars for the dev worker (secrets set with --env dev).
 R2_ACCOUNT_ID = "50163e5bf5ee8a574fb5e2dd442e38ed"
+# CUTOVER(P2): becomes german-media-dev together with the MEDIA binding above.
 R2_MEDIA_BUCKET = "german-vocabulary-media"
+
+# ---------------------------------------------------------------------------
+# TEST — automated integration tests + backend sandbox (MS2-FR-32). Disposable:
+# fixtures are seeded before a suite and wiped at the START of the next run.
+#   Deploy:      scripts/deploy.sh test
+# ---------------------------------------------------------------------------
+
+[[env.test.d1_databases]]
+binding = "CONTENT_DB"
+database_name = "german-content-test"
+database_id = "8d110ea2-8f7d-4ff2-adc6-0465701bcf88"
+
+[[env.test.d1_databases]]
+binding = "OPS_DB"
+database_name = "german-ops-test"
+database_id = "7c2dd3ae-4ce1-4eb3-ba7c-7adbb835ed19"
+
+[[env.test.r2_buckets]]
+binding = "MEDIA"
+bucket_name = "german-media-test"
+
+[env.test.observability]
+enabled = true
+
+[env.test.vars]
+ENV_NAME = "test"
+APP_TEAM_ID = "3VF33Y593F"
+APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
+ENTITLEMENT_PRODUCT_IDS = "com.ramapurampalanivel.germanwords.fullaccess.lifetime"
+SESSION_TTL_SECONDS = "600"
+APP_ATTEST_ENV = "development"
+STOREKIT_ENV = "xcode"
+R2_ACCOUNT_ID = "50163e5bf5ee8a574fb5e2dd442e38ed"
+R2_MEDIA_BUCKET = "german-media-test"

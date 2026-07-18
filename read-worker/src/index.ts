@@ -1,13 +1,17 @@
 import { Env } from "./env";
 import { json, HttpError, bearerToken, clientIp } from "./http";
-import { signSession, verifySession, SessionClaims } from "./jwt";
-import { issueChallenge, consumeChallenge, rateLimit } from "./limits";
+import { signSession, verifySession, issuerFor, SessionClaims } from "./jwt";
+import {
+  issueChallenge, consumeChallenge, rateLimit,
+  searchCapEnforced, takeSearchRequest, refundSearchRequest, FREE_SEARCH_REQUEST_CAP,
+} from "./limits";
+import { opsQuery } from "./db";
+import { healthReport } from "./health";
 import { serveCachedByVersion } from "./cache";
 import { verifyAttestation, verifyAssertion, attestationRequired } from "./appattest";
 import { verifyPromoCode, verifyStoreKitTransaction, storeKitXcodeMode, claimPromoDevice, Entitlement, Scope } from "./entitlement";
 import {
   getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP, searchWord,
-  searchCapEnforced, takeSearchRequest, refundSearchRequest, FREE_SEARCH_REQUEST_CAP,
 } from "./data";
 import {
   loadManifest, scopedManifest, allowedPacks, normalizePackName, getPackObject,
@@ -67,7 +71,7 @@ async function handleRegister(env: Env, request: Request): Promise<Response> {
       throw new HttpError(401, "attestation failed");
     });
 
-  await env.DB.prepare(
+  await opsQuery(env, 
     `INSERT INTO devices (device_id, public_key, sign_count, last_seen)
      VALUES (?, ?, ?, datetime('now'))
      ON CONFLICT(device_id) DO UPDATE SET
@@ -106,7 +110,7 @@ async function verifyDeviceAssertion(env: Env, body: SessionBody): Promise<strin
   }
   if (!(await consumeChallenge(env, body.challenge))) throw new HttpError(401, "bad challenge");
 
-  const device = await env.DB.prepare(
+  const device = await opsQuery(env, 
     "SELECT public_key, sign_count FROM devices WHERE device_id = ?"
   ).bind(body.deviceId).first<{ public_key: string; sign_count: number }>();
   if (!device) throw new HttpError(401, "unknown device");
@@ -169,7 +173,7 @@ async function tryVerifyDeviceAssertion(env: Env, body: SessionBody): Promise<st
 // (TOCTOU). The conditional UPDATE is the authoritative gate — only one writer can satisfy
 // `sign_count < ?`, so the clone/replay defense holds under concurrency.
 async function advanceSignCount(env: Env, deviceId: string, newCount: number): Promise<void> {
-  const res = await env.DB.prepare(
+  const res = await opsQuery(env, 
     "UPDATE devices SET sign_count = ?, last_seen = datetime('now') WHERE device_id = ? AND sign_count < ?"
   ).bind(newCount, deviceId, newCount).run();
   if ((res.meta.changes ?? 0) === 0) throw new HttpError(401, "assertion counter reused");
@@ -186,12 +190,12 @@ async function enforceTransactionDeviceCap(
   env: Env, originalTransactionId: string | undefined, deviceId: string
 ): Promise<void> {
   if (!originalTransactionId) return; // payload carried no identity — nothing to bind on
-  const known = await env.DB.prepare(
+  const known = await opsQuery(env, 
     "SELECT 1 FROM transaction_devices WHERE original_transaction_id = ? AND device_id = ?"
   ).bind(originalTransactionId, deviceId).first();
   if (known) return; // an already-bound device always keeps working
 
-  const row = await env.DB.prepare(
+  const row = await opsQuery(env, 
     "SELECT COUNT(*) AS c FROM transaction_devices WHERE original_transaction_id = ?"
   ).bind(originalTransactionId).first<{ c: number }>();
   if ((row?.c ?? 0) >= TRANSACTION_DEVICE_CAP) {
@@ -199,7 +203,7 @@ async function enforceTransactionDeviceCap(
     throw new HttpError(403, "device limit reached for this purchase");
   }
 
-  await env.DB.prepare(
+  await opsQuery(env, 
     `INSERT INTO transaction_devices (original_transaction_id, device_id)
      VALUES (?, ?) ON CONFLICT(original_transaction_id, device_id) DO NOTHING`
   ).bind(originalTransactionId, deviceId).run();
@@ -274,7 +278,8 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
 
   const ttl = parseInt(env.SESSION_TTL_SECONDS || "3600", 10);
   const token = await signSession(
-    env.SESSION_JWT_SECRET, subject, entitlement.type, entitlement.scope, ttl, nowSeconds()
+    env.SESSION_JWT_SECRET, issuerFor(env.ENV_NAME), subject, entitlement.type, entitlement.scope,
+    ttl, nowSeconds()
   );
   return json({ token, expiresIn: ttl, entitlement: entitlement.type, scope: entitlement.scope });
 }
@@ -284,7 +289,11 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
 async function requireSession(env: Env, request: Request): Promise<SessionClaims> {
   const token = bearerToken(request);
   if (!token) throw new HttpError(401, "missing bearer token");
-  const claims = await verifySession(env.SESSION_JWT_SECRET, token, nowSeconds());
+  // Current key, plus the previous one during a rotation grace window (MS2-FR-30e).
+  const secrets = [env.SESSION_JWT_SECRET, env.SESSION_JWT_SECRET_PREVIOUS].filter(
+    (s): s is string => !!s
+  );
+  const claims = await verifySession(secrets, issuerFor(env.ENV_NAME), token, nowSeconds());
   if (!claims) throw new HttpError(401, "invalid or expired token");
   return claims;
 }
@@ -326,7 +335,7 @@ async function requireFreshAssertion(
   if (!(await consumeChallenge(env, challenge))) throw new HttpError(401, "bad challenge");
 
   const deviceId = claims.sub;
-  const device = await env.DB.prepare(
+  const device = await opsQuery(env, 
     "SELECT public_key, sign_count FROM devices WHERE device_id = ?"
   ).bind(deviceId).first<{ public_key: string; sign_count: number }>();
   if (!device) throw new HttpError(401, "unknown device");
@@ -530,7 +539,7 @@ async function handleSubmission(
   }
 
   // Daily cap: bound sustained submission flooding from one client.
-  const recent = await env.DB.prepare(
+  const recent = await opsQuery(env, 
     "SELECT COUNT(*) AS c FROM submissions WHERE source = ? AND created_at > datetime('now', '-1 day')"
   ).bind(key).first<{ c: number }>();
   if ((recent?.c ?? 0) >= 20) {
@@ -543,12 +552,12 @@ async function handleSubmission(
   // improved it, the curator re-reviews). created_at refreshes so the curator sees recency;
   // the daily cap counts rows, so edits of one word never eat the submission budget.
   if (clientKey) {
-    const mine = await env.DB.prepare(
+    const mine = await opsQuery(env, 
       "SELECT status FROM submissions WHERE client_key = ? LIMIT 1"
     ).bind(clientKey).first<{ status: string }>();
     if (mine) {
       if (mine.status === "approved") return json({ status: "approved" }, 200);
-      await env.DB.prepare(
+      await opsQuery(env, 
         `UPDATE submissions SET word = ?, type = ?, details = ?, status = 'pending',
                 created_at = datetime('now') WHERE client_key = ?`
       ).bind(word, type, detailsJSON, clientKey).run();
@@ -558,13 +567,13 @@ async function handleSubmission(
     // Keyless (search-submit) dedup: if this word is already awaiting curation, don't queue
     // it again. Keyed shares skip this — the user's own word must not be swallowed by an
     // unrelated pending row that happens to share the spelling.
-    const existing = await env.DB.prepare(
+    const existing = await opsQuery(env, 
       "SELECT 1 FROM submissions WHERE word = ? AND status = 'pending' LIMIT 1"
     ).bind(word).first();
     if (existing) return json({ status: "pending" }, 200);
   }
 
-  await env.DB.prepare(
+  await opsQuery(env, 
     `INSERT INTO submissions (id, word, type, details, source, scope, status, client_key)
      VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`
   ).bind(crypto.randomUUID(), word, type, detailsJSON, key, scopeOf(claims), clientKey).run();
@@ -615,7 +624,7 @@ async function handleFeedback(
   }
 
   // Daily cap: bound sustained flooding from one client (RV-FR-FDBK-6).
-  const recent = await env.DB.prepare(
+  const recent = await opsQuery(env, 
     "SELECT COUNT(*) AS c FROM feedback WHERE subject = ? AND created_at > datetime('now', '-1 day')"
   ).bind(key).first<{ c: number }>();
   if ((recent?.c ?? 0) >= 3) {
@@ -623,7 +632,7 @@ async function handleFeedback(
     throw new HttpError(429, "daily feedback limit reached");
   }
 
-  await env.DB.prepare(
+  await opsQuery(env, 
     `INSERT INTO feedback (id, subject, text, app_version, cefr_level, locale, status)
      VALUES (?, ?, ?, ?, ?, ?, 'new')`
   ).bind(crypto.randomUUID(), key, text, appVersion, cefrLevel, locale).run();
@@ -719,9 +728,11 @@ export default {
     try {
       // Unauthenticated liveness probe (project rule: every service exposes /health).
       // Deliberately static — it touches no D1/R2, so it can't amplify load, and it lets
-      // monitors distinguish "worker down" from "route missing".
+      // monitors distinguish "worker down" from "route missing". Reports environment
+      // identity, deployed version, and a names-only config self-check (MS2-FR-30b/30c);
+      // scripts/deploy.sh asserts all three after every deploy.
       if (request.method === "GET" && url.pathname === "/health") {
-        return json({ status: "ok" });
+        return json(healthReport(env));
       }
 
       if (version !== "v1") return json({ error: "not found" }, 404);

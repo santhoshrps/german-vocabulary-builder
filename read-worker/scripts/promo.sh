@@ -6,14 +6,14 @@
 # anyone else gets "code already in use". Revocation is per code, i.e. per person, and
 # takes effect within the session TTL (1 h).
 #
-# Usage (from anywhere; talks to the REMOTE D1 both workers share):
-#   scripts/promo.sh create <label> [expires-ISO8601]   mint a code for one person, print it ONCE
-#   scripts/promo.sh list                                all codes + tier/active/expiry/claimed devices
-#   scripts/promo.sh revoke <label>                      disable (active=0) — the person loses access
-#   scripts/promo.sh enable <label>                      re-enable a revoked code
-#   scripts/promo.sh unclaim <label>                     free ALL device slots (e.g. after a reinstall
-#                                                        burned one) — the code itself stays valid
-#   scripts/promo.sh delete <label>                      remove the code and its claims entirely
+# Usage (from anywhere; talks to the REMOTE OPS database of ONE environment —
+# MS2-FR-29. --env is REQUIRED: an admin tool always names its world explicitly):
+#   scripts/promo.sh --env <dev|test|prod> create <label> [expires-ISO8601]  mint a code, print it ONCE
+#   scripts/promo.sh --env <dev|test|prod> list          all codes + tier/active/expiry/claimed devices
+#   scripts/promo.sh --env <dev|test|prod> revoke <label>   disable — the person loses access
+#   scripts/promo.sh --env <dev|test|prod> enable <label>   re-enable a revoked code
+#   scripts/promo.sh --env <dev|test|prod> unclaim <label>  free ALL device slots (code stays valid)
+#   scripts/promo.sh --env <dev|test|prod> delete <label>   remove the code and its claims entirely
 #
 # The plaintext code is printed exactly once at create time and stored ONLY as a SHA-256
 # hash — it cannot be recovered later. Codes use A-Z/2-9 without I/O/0/1 (unambiguous to
@@ -22,7 +22,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."   # read-worker/, where wrangler.toml lives
 
-DB="german-vocabulary"
+# Environment selection (MS2-FR-29): promo codes live in the per-environment OPS
+# database. No default on purpose — a personal code minted into the wrong world is
+# an entitlement bug, so the operator always states the target.
+if [[ "${1:-}" == "--env" ]]; then
+  ENV_NAME="${2:-}"; shift 2 || true
+else
+  echo "error: --env <dev|test|prod> is required (first argument)" >&2; exit 1
+fi
+case "$ENV_NAME" in
+  dev|test|prod) DB="german-ops-$ENV_NAME" ;;
+  *) echo "error: unknown environment '$ENV_NAME' (dev|test|prod)" >&2; exit 1 ;;
+esac
+echo "→ environment: $ENV_NAME (database: $DB)" >&2
 
 run() { npx wrangler d1 execute "$DB" --remote --command "$1"; }
 

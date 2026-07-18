@@ -1,5 +1,6 @@
 data/
 sync/.env
+sync/.env.*
 sync/audio_cache
 sync/image_cache/
 sync/image_review/
@@ -12,3 +13,5 @@ __pycache__/
 .claude
 .venv/
 .DS_Store
+.DS_Store
+backups/

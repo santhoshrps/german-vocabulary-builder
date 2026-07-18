@@ -2,10 +2,14 @@ import { utf8, bytesToB64Url, b64UrlToBytes, timingSafeEqualBytes } from "./byte
 
 // Minimal HS256 JWT. The same worker signs and verifies, so a symmetric secret is fine.
 
-// Issuer claim: stamped into every token and REQUIRED on verify, so a token signed by any
-// other system that happens to share the secret (or a future second service) can't be
-// replayed against this worker.
-const ISSUER = "gv-read-worker";
+// Issuer claim: stamped into every token and REQUIRED on verify. It carries the
+// ENVIRONMENT identity (MS2-FR-29): "gv-read-worker/prod" vs "gv-read-worker/dev" —
+// so a token minted by one environment is rejected by every other, even in the
+// worst case of a shared or confused signing secret. Also rejects tokens signed by
+// any other system that happens to share the secret.
+export function issuerFor(envName: string): string {
+  return `gv-read-worker/${envName}`;
+}
 
 export interface SessionClaims {
   sub: string;     // device_id (or "promo:<label>" for test sessions)
@@ -28,6 +32,7 @@ async function hmacKey(secret: string): Promise<CryptoKey> {
 
 export async function signSession(
   secret: string,
+  issuer: string,
   sub: string,
   ent: string,
   scope: string,
@@ -35,7 +40,7 @@ export async function signSession(
   now: number
 ): Promise<string> {
   const header = bytesToB64Url(utf8(JSON.stringify({ alg: "HS256", typ: "JWT" })));
-  const claims: SessionClaims = { sub, ent, scope, iss: ISSUER, iat: now, exp: now + ttlSeconds };
+  const claims: SessionClaims = { sub, ent, scope, iss: issuer, iat: now, exp: now + ttlSeconds };
   const payload = bytesToB64Url(utf8(JSON.stringify(claims)));
   const signingInput = `${header}.${payload}`;
   const key = await hmacKey(secret);
@@ -43,8 +48,12 @@ export async function signSession(
   return `${signingInput}.${bytesToB64Url(sig)}`;
 }
 
+// Verifies against one or more accepted secrets — normally just the current one; during a
+// key rotation the previous secret rides along for a grace window (MS2-FR-30e) so live
+// sessions survive the rotation. Minting never uses the previous key.
 export async function verifySession(
-  secret: string,
+  secrets: readonly string[],
+  issuer: string,
   token: string,
   now: number
 ): Promise<SessionClaims | null> {
@@ -63,10 +72,18 @@ export async function verifySession(
     return null;
   }
 
-  const key = await hmacKey(secret);
-  const expected = new Uint8Array(await crypto.subtle.sign("HMAC", key, utf8(`${header}.${payload}`)));
   const provided = b64UrlToBytes(sig);
-  if (!timingSafeEqualBytes(provided, expected)) return null;
+  let signatureValid = false;
+  for (const secret of secrets) {
+    if (!secret) continue;
+    const key = await hmacKey(secret);
+    const expected = new Uint8Array(await crypto.subtle.sign("HMAC", key, utf8(`${header}.${payload}`)));
+    if (timingSafeEqualBytes(provided, expected)) {
+      signatureValid = true;
+      break;
+    }
+  }
+  if (!signatureValid) return null;
 
   let claims: SessionClaims;
   try {
@@ -74,7 +91,7 @@ export async function verifySession(
   } catch {
     return null;
   }
-  if (claims.iss !== ISSUER) return null;
+  if (claims.iss !== issuer) return null;
   if (typeof claims.exp !== "number" || claims.exp <= now) return null;
   return claims;
 }

@@ -1,6 +1,11 @@
 interface Env {
-  DB: D1Database;
+  // The CONTENT database for this environment (MS2-FR-29): the write worker is the
+  // publish pipeline's single write path into content. It binds NO ops database —
+  // by binding topology it cannot touch devices/claims/submissions (MS2-FR-29b).
+  CONTENT_DB: D1Database;
   API_KEY: string;
+  ENV_NAME: string;        // "prod" | "dev" | "test" — reported by /health
+  DEPLOY_VERSION?: string; // git SHA injected by scripts/deploy.sh
 }
 
 const ALLOWED_TABLES = new Set(["verbs", "nouns", "adverbs_adjectives"]);
@@ -104,7 +109,7 @@ async function handleGetState(table: string, env: Env): Promise<Response> {
     return json({ error: "invalid table" }, 400);
   }
   try {
-    const result = await env.DB.prepare(
+    const result = await env.CONTENT_DB.prepare(
       `SELECT id, content_hash FROM ${table}`
     ).all<{ id: string; content_hash: string }>();
 
@@ -171,7 +176,7 @@ async function handlePostSync(
   for (const row of body.upsert) {
     const values = columns.map((col) => row[col] ?? null);
     statements.push(
-      env.DB.prepare(
+      env.CONTENT_DB.prepare(
         `INSERT INTO ${table} (${columns.join(", ")}) VALUES (${placeholders})
          ON CONFLICT(id) DO UPDATE SET ${updateSet}, updated_at = datetime('now')`
       ).bind(...values)
@@ -184,7 +189,7 @@ async function handlePostSync(
     const idChunk = body.delete.slice(i, i + DELETE_CHUNK_SIZE);
     const idPlaceholders = idChunk.map(() => "?").join(", ");
     statements.push(
-      env.DB.prepare(
+      env.CONTENT_DB.prepare(
         `DELETE FROM ${table} WHERE id IN (${idPlaceholders})`
       ).bind(...idChunk)
     );
@@ -195,7 +200,7 @@ async function handlePostSync(
   }
 
   try {
-    await env.DB.batch(statements);
+    await env.CONTENT_DB.batch(statements);
     return json({ upserted: body.upsert.length, deleted: body.delete.length });
   } catch (err) {
     console.error("sync batch failed", {
@@ -210,6 +215,21 @@ async function handlePostSync(
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    // Unauthenticated liveness + identity probe (MS2-FR-30b/30c): environment name,
+    // deployed version, and a names-only config presence check. Touches no D1.
+    if (request.method === "GET" && new URL(request.url).pathname === "/health") {
+      const missing: string[] = [];
+      if (!env.CONTENT_DB) missing.push("CONTENT_DB");
+      if (!env.API_KEY) missing.push("API_KEY");
+      if (!env.ENV_NAME) missing.push("ENV_NAME");
+      return json({
+        status: missing.length === 0 ? "ok" : "misconfigured",
+        env: env.ENV_NAME ?? "unknown",
+        version: env.DEPLOY_VERSION ?? "unknown",
+        missing,
+      });
+    }
+
     const authResponse = await verifyHmac(request, env);
     if (authResponse) return authResponse;
 

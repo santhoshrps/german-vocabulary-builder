@@ -9,6 +9,7 @@
 // before trusting it in production, and set APPLE_STOREKIT_ROOT_CA.
 
 import { Env } from "./env";
+import { opsQuery } from "./db";
 import { utf8, sha256, bytesToHex, b64UrlToBytes, b64ToBytes } from "./bytes";
 import { extractSPKI } from "./crypto/der";
 import { verifyChainToAppleRoot } from "./crypto/x509";
@@ -33,7 +34,7 @@ export interface Entitlement {
 export async function verifyPromoCode(env: Env, code: string): Promise<Entitlement | null> {
   if (!code) return null;
   const hash = bytesToHex(await sha256(utf8(code)));
-  const row = await env.DB.prepare(
+  const row = await opsQuery(env, 
     "SELECT label, tier, active, expires_at FROM promo_codes WHERE code_hash = ?"
   ).bind(hash).first<{ label: string | null; tier: string | null; active: number; expires_at: string | null }>();
 
@@ -72,7 +73,7 @@ export async function claimPromoDevice(
   env: Env, codeHash: string, deviceId: string | null
 ): Promise<PromoClaimResult> {
   if (!deviceId) {
-    const row = await env.DB.prepare(
+    const row = await opsQuery(env, 
       "SELECT COUNT(*) AS n FROM promo_claims WHERE code_hash = ?"
     ).bind(codeHash).first<{ n: number }>();
     return (row?.n ?? 0) > 0 ? "ok" : "device-check-required";
@@ -80,13 +81,13 @@ export async function claimPromoDevice(
   // Single atomic statement: claim a slot only while one is free; re-claiming one's own
   // slot is a no-op. D1 serializes writes, so two new devices racing for the last slot
   // can't both get in (the second one's count subquery already sees the cap reached).
-  await env.DB.prepare(
+  await opsQuery(env, 
     `INSERT INTO promo_claims (code_hash, device_id)
      SELECT ?1, ?2
      WHERE (SELECT COUNT(*) FROM promo_claims WHERE code_hash = ?1) < ?3
      ON CONFLICT (code_hash, device_id) DO NOTHING`
   ).bind(codeHash, deviceId, PROMO_DEVICE_CAP).run();
-  const mine = await env.DB.prepare(
+  const mine = await opsQuery(env, 
     "SELECT 1 FROM promo_claims WHERE code_hash = ?1 AND device_id = ?2"
   ).bind(codeHash, deviceId).first();
   return mine ? "ok" : "code-in-use";
