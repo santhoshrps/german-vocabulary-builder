@@ -844,7 +844,7 @@ export default {
         if (!allowedPacks(manifest, scopeOf(claims)).has(norm)) {
           throw new HttpError(403, "pack not available for this scope");
         }
-        const url = await presignPackURL(env, norm);
+        const url = await presignPackURL(env, manifest, norm);
         if (!url) throw new HttpError(503, "direct delivery not configured");
         console.log(JSON.stringify({ evt: "MEDIATRACE packurl", name: norm }));
         return json({ url, expiresSeconds: PACK_URL_TTL_SECONDS });

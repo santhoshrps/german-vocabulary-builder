@@ -17,7 +17,7 @@ export interface AudioManifest {
   version: string;
   // `hash`: content-identity (id:audio_hash) for diffing. `sha`: digest of the actual
   // .pack blob, for client-side integrity verification of the downloaded bytes.
-  packs: Record<string, { hash: string; sha?: string; bytes: number; count: number }>;
+  packs: Record<string, { hash: string; sha?: string; bytes: number; count: number; key?: string }>;
   scopes: Record<string, string[]>;
 }
 
@@ -68,6 +68,16 @@ export function normalizePackName(raw: string): string {
   return name;
 }
 
+// Object key for a pack: v2 manifests carry an immutable content-suffixed `key`
+// (audio/packs/<name>-<sha12>.pack — promote/rollback are pointer swaps, objects
+// are never overwritten); legacy manifests fall back to the name-derived path.
+// Defense-in-depth: a manifest key must stay inside the packs prefix.
+function packKey(manifest: AudioManifest, name: string): string {
+  const key = manifest.packs[name]?.key;
+  if (key && key.startsWith("audio/packs/")) return key;
+  return `audio/packs/${name}.pack`;
+}
+
 // Returns the R2 object for a pack the caller is entitled to, or throws.
 export async function getPackObject(
   env: Env,
@@ -79,7 +89,7 @@ export async function getPackObject(
     throw new HttpError(403, "pack not available for this scope");
   }
   if (!env.MEDIA) throw new HttpError(503, "media storage not configured");
-  const obj = await env.MEDIA.get(`audio/packs/${name}.pack`);
+  const obj = await env.MEDIA.get(packKey(manifest, name));
   if (!obj) throw new HttpError(404, "pack not found");
   return obj;
 }
@@ -126,7 +136,7 @@ function awsEncode(s: string): string {
 /// Mints a presigned GET URL for one pack object, or null when presigning
 /// isn't configured (missing account/bucket/token env) — callers then fall
 /// back to the streamed route.
-export async function presignPackURL(env: Env, name: string): Promise<string | null> {
+export async function presignPackURL(env: Env, manifest: AudioManifest, name: string): Promise<string | null> {
   const accountId = env.R2_ACCOUNT_ID;
   const bucket = env.R2_MEDIA_BUCKET;
   const accessKey = env.R2_ACCESS_KEY_ID;
@@ -136,7 +146,7 @@ export async function presignPackURL(env: Env, name: string): Promise<string | n
   const host = `${accountId}.r2.cloudflarestorage.com`;
   // Key segments are [a-z0-9.]+ (see normalizePackName), so encoding is identity —
   // but encode per-segment anyway so a future name rule can't silently break signing.
-  const key = `audio/packs/${name}.pack`;
+  const key = packKey(manifest, name);
   const canonicalUri = `/${bucket}/` + key.split("/").map(awsEncode).join("/");
 
   const now = new Date();

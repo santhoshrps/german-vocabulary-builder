@@ -10,11 +10,10 @@
 # parity (names only) before every deploy and asserts /health (env + version +
 # config) after it. DEPLOY_VERSION is injected by the deploy script — never set here.
 #
-# Blue/green cutover state (MS2-FR-29c): prod/dev MEDIA and prod CONTENT_DB still
-# point at the LEGACY bucket/database ("german-vocabulary-media"/"german-vocabulary")
-# until the v2 content world is published (program phase P2) — the old world keeps
-# serving untouched while the new one is built beside it. The OPS split is live in
-# every environment. Flip the marked bindings at the P2 cutover.
+# Blue/green cutover state (MS2-FR-29c): PROD's CONTENT_DB and MEDIA still point
+# at the LEGACY database/bucket until the prod content cutover (end of P2) — the
+# old world keeps serving untouched while the new one is built beside it. Dev and
+# test are fully on their v2 worlds. Flip the marked prod bindings at the cutover.
 
 name = "german-vocabulary-read-worker"
 main = "src/index.ts"
@@ -100,11 +99,9 @@ binding = "OPS_DB"
 database_name = "german-ops-dev"
 database_id = "ef5fc11a-a46e-415d-8b3a-99d670cea562"
 
-# CUTOVER(P2): becomes german-media-dev once the pipeline publishes dev packs there.
-# Until then dev READS the legacy bucket so DEBUG builds keep their audio/images.
 [[env.dev.r2_buckets]]
 binding = "MEDIA"
-bucket_name = "german-vocabulary-media"
+bucket_name = "german-media-dev"
 
 [env.dev.observability]
 enabled = true
@@ -122,8 +119,10 @@ APP_ATTEST_ENV = "development"
 # Local Xcode StoreKit testing: trust locally-signed transactions (dev origin only).
 STOREKIT_ENV = "xcode"
 R2_ACCOUNT_ID = "50163e5bf5ee8a574fb5e2dd442e38ed"
-# CUTOVER(P2): becomes german-media-dev together with the MEDIA binding above.
-R2_MEDIA_BUCKET = "german-vocabulary-media"
+# Presign secrets for THIS bucket: the german-media-dev-read token pair
+# (wrangler secret put R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY --env dev).
+# Until set, packurl answers 503 and clients use the streamed route.
+R2_MEDIA_BUCKET = "german-media-dev"
 
 # ---------------------------------------------------------------------------
 # TEST — automated integration tests + backend sandbox (MS2-FR-32). Disposable:

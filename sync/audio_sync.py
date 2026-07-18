@@ -141,15 +141,18 @@ def apply_overrides(
             audio_overrides.apply(d, rec, pool, (row.get("word") or "").strip())
 
 
-def collect_words(overrides: audio_overrides.Store | None = None) -> list[dict[str, Any]]:
+def collect_words(overrides: audio_overrides.Store | None = None,
+                  skip_invalid: bool = False) -> list[dict[str, Any]]:
     """Read every table and return the flat list of audio descriptors, with any
-    committed replacement overrides (audio_overrides.json) already applied."""
+    committed replacement overrides (audio_overrides.json) already applied.
+    skip_invalid mirrors sync.read_excel: invalid sheet rows are skipped (their
+    previously synced audio is simply not part of this run)."""
     if overrides is None:
         overrides = audio_overrides.load()
     words: list[dict[str, Any]] = []
     rows_by_table: dict[str, list[dict[str, Any]]] = {}
     for table in sync.TABLE_CONFIG:
-        rows, _, _ = sync.read_excel(table)
+        rows, _, _ = sync.read_excel(table, skip_invalid=skip_invalid)
         rows_by_table[table] = rows
         logger.info("  %s: %d rows", table, len(rows))
         for row in rows:
