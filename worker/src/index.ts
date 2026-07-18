@@ -8,25 +8,38 @@ interface Env {
   DEPLOY_VERSION?: string; // git SHA injected by scripts/deploy.sh
 }
 
-const ALLOWED_TABLES = new Set(["verbs", "nouns", "adverbs_adjectives"]);
+const ALLOWED_TABLES = new Set([
+  "verbs", "nouns", "adverbs_adjectives", "translations", "id_aliases",
+]);
 
 // Max ids per DELETE statement — keeps bound parameters well under SQLite/D1 limits
 const DELETE_CHUNK_SIZE = 100;
 
-// Fixed column order per table — drives parameterised INSERT, never sourced from user input
+// Fixed column order per table — drives parameterised INSERT, never sourced from user
+// input. SCHEMA v2 (WD-ID/LG-FR-9): core tables carry German + sense only; source-
+// language text lives in `translations`; `id_aliases` maps v1 ids to v2. Deploying
+// this against a v1 database is safe by construction: any sync against it fails on
+// the schema mismatch, which is exactly the freeze the blue/green cutover wants.
 const TABLE_COLUMNS: Record<string, string[]> = {
   verbs: [
-    "id", "content_hash", "free", "level", "capital", "type", "word", "english",
-    "german_sentence", "english_sentence", "ich", "du", "er_sie_es",
+    "id", "content_hash", "free", "level", "capital", "type", "word", "sense",
+    "german_sentence", "ich", "du", "er_sie_es",
     "wir", "ihr", "sie_sie", "past_participle", "simple_past",
   ],
   nouns: [
     "id", "content_hash", "free", "level", "capital", "type", "article", "word",
-    "plural", "image", "english", "german_sentence", "english_sentence",
+    "plural", "sense", "image", "german_sentence",
   ],
   adverbs_adjectives: [
-    "id", "content_hash", "free", "level", "capital", "type", "word", "english",
-    "german_sentence", "english_sentence", "comparative", "superlative",
+    "id", "content_hash", "free", "level", "capital", "type", "word", "sense",
+    "german_sentence", "comparative", "superlative",
+  ],
+  translations: [
+    "id", "content_hash", "word_id", "lang", "word", "sentence",
+    "article", "article_plural", "plural",
+  ],
+  id_aliases: [
+    "id", "content_hash", "new_id", "reason",
   ],
 };
 

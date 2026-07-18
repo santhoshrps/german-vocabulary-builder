@@ -1,3 +1,16 @@
+"""Words publish CLI (v2): spreadsheet -> per-environment content database.
+
+V2 flow (WD-ID / LG-FR-9..14): sync/dataset.py reads the sheets registry-driven
+(sync/registry.py) into German core rows + translations rows + id aliases, and this
+CLI diffs and publishes all five tables against the target environment's write
+worker (sync/envs.py; --env, default dev, typed gate for prod).
+
+LEGACY-COMPAT surface (remove at P2): TABLE_CONFIG / read_excel / compute_id are
+the v1 reader, kept ONLY because the media pipeline (audio_sync, image_sync,
+media_replace, image_regen/review) still keys its caches and R2 objects by v1 ids
+until the P2 media re-label. New code imports dataset/registry, never these.
+"""
+
 import argparse
 import hashlib
 import hmac
@@ -15,17 +28,27 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
+import dataset as dataset_mod
+import envs
+from registry import TABLES as V2_TABLES
+
 logger = logging.getLogger("sync")
 
+# Set by _load_environment() (v2 flow); the module-level defaults keep the LEGACY
+# read path importable for the media pipeline without an environment.
 WORKER_URL = os.environ.get("WORKER_URL", "").rstrip("/")
 API_KEY = os.environ.get("API_KEY", "")
 DATA_DIR = Path(__file__).parent.parent / "data"
+
+# ---------------------------------------------------------------------------
+# LEGACY-COMPAT (v1 reader) — media pipeline only; remove at the P2 re-label.
+# ---------------------------------------------------------------------------
 
 TABLE_CONFIG: dict[str, tuple[str, list[str]]] = {
     "verbs": (
         "verbs.xlsx",
         [
-            "Level", "Capital", "Type", "Word", "English",
+            "Level", "Capital", "Type", "German_Word", "English_Word",
             "German_Sentence", "English_Sentence",
             "ich", "du", "er_sie_es", "wir", "ihr", "sie_Sie",
             "past_participle", "simple_past", "Free",
@@ -34,27 +57,31 @@ TABLE_CONFIG: dict[str, tuple[str, list[str]]] = {
     "nouns": (
         "nouns.xlsx",
         [
-            "Level", "Capital", "Type", "Article", "Word", "Plural", "Image",
-            "English", "German_Sentence", "English_Sentence", "Free",
+            "Level", "Capital", "Type", "German_Article", "German_Word", "German_Plural",
+            "Image", "English_Word", "German_Sentence", "English_Sentence", "Free",
         ],
     ),
     "adverbs_adjectives": (
         "adverbs_adjectives.xlsx",
         [
-            "Level", "Capital", "Type", "Word", "English",
-            "German_Sentence", "English_Sentence", "Comparative", "Superlative", "Free",
+            "Level", "Capital", "Type", "German_Word", "English_Word",
+            "German_Sentence", "English_Sentence", "German_Comparative", "German_Superlative", "Free",
         ],
     ),
 }
 
 HEADER_TO_DB: dict[str, str] = {
     "sie_Sie": "sie_sie",
+    "German_Word": "word",
+    "German_Article": "article",
+    "German_Plural": "plural",
     "German_Sentence": "german_sentence",
+    "English_Word": "english",
     "English_Sentence": "english_sentence",
     "past_participle": "past_participle",
     "simple_past": "simple_past",
-    "Comparative": "comparative",
-    "Superlative": "superlative",
+    "German_Comparative": "comparative",
+    "German_Superlative": "superlative",
 }
 
 # Required DB column names that must be non-empty for each table
@@ -252,7 +279,7 @@ def read_excel(
         # Sheet position of every expected column (validated present + unique above).
         col_of = {h: actual.index(h) for h in headers}
         level_idx = col_of["Level"]
-        word_idx = col_of["Word"]
+        word_idx = col_of["German_Word"]
         image_idx = col_of.get("Image", -1)
         free_idx = col_of.get("Free", -1)
 
@@ -542,7 +569,11 @@ def sync_table(
     to_insert, to_update, to_delete = compute_diff(excel_rows, db_state)
 
     # A skipped row must not read as "removed from Excel": keep its DB row as-is.
-    preserved = [row_id for row_id in to_delete if row_id in protected_ids]
+    # The "*" sentinel (partial --table publish) preserves ALL would-be deletions.
+    if "*" in protected_ids:
+        preserved = list(to_delete)
+    else:
+        preserved = [row_id for row_id in to_delete if row_id in protected_ids]
     if preserved:
         to_delete = [row_id for row_id in to_delete if row_id not in protected_ids]
         logger.warning(
@@ -585,9 +616,28 @@ def sync_table(
 # Entry point
 # ---------------------------------------------------------------------------
 
+V2_PUBLISH_ORDER = ("verbs", "nouns", "adverbs_adjectives", "translations", "id_aliases")
+
+
+def _load_environment(name: str) -> "envs.Environment":
+    """Resolve the target environment (sync/envs.py) and point the HTTP layer at it."""
+    global WORKER_URL, API_KEY
+    env = envs.load_environment(name)
+    WORKER_URL = env.worker_url
+    API_KEY = env.api_key
+    return env
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Sync German vocabulary Excel files to Cloudflare D1.",
+        description="Publish the vocabulary spreadsheets to an environment's content database.",
+    )
+    parser.add_argument(
+        "--env",
+        choices=envs.environment_names(),
+        default=envs.DEFAULT_ENV,
+        help="Target environment (default: %(default)s). prod additionally requires "
+             "the typed confirmation (MS2-FR-30).",
     )
     parser.add_argument(
         "--dry-run",
@@ -604,9 +654,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--table",
-        choices=list(TABLE_CONFIG.keys()),
+        choices=list(V2_TABLES.keys()),
         metavar="TABLE",
-        help=f"Sync only one table. Choices: {', '.join(TABLE_CONFIG.keys())}.",
+        help=f"Publish only one word table (its translations and aliases still "
+             f"publish). Choices: {', '.join(V2_TABLES.keys())}.",
     )
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument(
@@ -623,18 +674,14 @@ def main() -> None:
 
     _setup_logging(args.verbose, args.quiet)
 
-    missing = [k for k in ("WORKER_URL", "API_KEY") if not os.environ.get(k)]
-    if missing:
-        logger.error("Missing environment variables: %s", ", ".join(missing))
-        logger.error("Copy sync/.env.example to sync/.env and fill in the values.")
+    try:
+        env = _load_environment(args.env)
+    except envs.EnvironmentError_ as exc:
+        logger.error("%s", exc)
         sys.exit(1)
+    logger.info("→ environment: %s (%s)", env.name, env.worker_url)
 
-    if not WORKER_URL.startswith("https://"):
-        logger.error("WORKER_URL must use https:// (got %r).", WORKER_URL)
-        logger.error("Plaintext http would expose signed requests in transit.")
-        sys.exit(1)
-
-    tables = [args.table] if args.table else list(TABLE_CONFIG.keys())
+    word_tables = [args.table] if args.table else list(V2_TABLES.keys())
 
     if args.dry_run:
         logger.info("[DRY RUN] No changes will be written to the DB.")
@@ -643,29 +690,93 @@ def main() -> None:
     failures: list[str] = []
     aborted: list[str] = []
 
-    # Read + validate ALL tables first so the cross-table id guard sees the whole
-    # dataset before anything is written. A table that fails validation is skipped
-    # (recorded as a failure); the others still sync.
-    excel: dict[str, tuple[list[dict[str, Any]], int, set[str]]] = {}
-    for table in tables:
+    # Read + validate ALL word tables first: the aggregated dataset feeds the
+    # global-uniqueness guards and the coverage report before anything is written.
+    datasets: dict[str, "dataset_mod.TableDataset"] = {}
+    for table in word_tables:
         try:
-            excel[table] = read_excel(table, skip_invalid=args.skip_invalid)
-        except ValidationError as exc:
+            datasets[table] = dataset_mod.read_dataset(table, skip_invalid=args.skip_invalid)
+        except dataset_mod.ValidationError as exc:
             logger.error("%s: %s", table, exc)
             failures.append(table)
 
-    if len(excel) > 1:
-        problems = find_cross_table_id_collisions({t: rows for t, (rows, _, _) in excel.items()})
-        if problems:
-            logger.error(
-                "Cross-table id collision(s) — the same Level+Word exists in two tables. "
-                "These would corrupt the audio cache and image decisions (ids are global there). "
-                "Fix the data; nothing was synced:\n  %s", "\n  ".join(problems),
-            )
+    if not datasets:
+        logger.error("Nothing readable — aborting.")
+        sys.exit(1)
+
+    # Global guards across the whole dataset: a v2 id must be unique across ALL
+    # word tables (ids are global in media/packs/approvals), and a legacy id may
+    # alias only one v2 id.
+    id_owner: dict[str, str] = {}
+    alias_owner: dict[str, str] = {}
+    guard_problems: list[str] = []
+    for table, ds in datasets.items():
+        for row in ds.core:
+            prev = id_owner.get(row["id"])
+            if prev is not None:
+                guard_problems.append(f"id {row['id']} ({row['word']!r}) in both {prev} and {table}")
+            id_owner[row["id"]] = table
+        for alias in ds.aliases:
+            prev = alias_owner.get(alias["id"])
+            if prev is not None:
+                guard_problems.append(
+                    f"legacy id {alias['id']} maps to two v2 ids ({prev} / {alias['new_id']})"
+                )
+            alias_owner[alias["id"]] = alias["new_id"]
+    if guard_problems:
+        logger.error(
+            "Global identity guard failed — nothing was synced:\n  %s",
+            "\n  ".join(guard_problems),
+        )
+        sys.exit(1)
+
+    # Coverage preview (LG-FR-14) — always shown before anything uploads.
+    print("\nLanguage coverage:")
+    for line in dataset_mod.coverage_report(datasets):
+        print(line)
+    print()
+
+    # Production gate (MS2-FR-30): typed confirmation, refused non-interactively.
+    if not args.dry_run:
+        try:
+            envs.confirm_production(env, action="publish vocabulary")
+        except envs.EnvironmentError_ as exc:
+            logger.error("%s", exc)
             sys.exit(1)
 
+    # Assemble the five physical tables. Skipped rows protect their previously
+    # published counterparts everywhere: core (v2 id), translations (v2 id per
+    # language), and aliases (legacy id).
+    all_langs = list(dataset_mod.LANGUAGES)
+    plan: list[tuple[str, list[dict[str, Any]], int, set[str]]] = []
+    for table in V2_PUBLISH_ORDER:
+        if table in datasets:
+            ds = datasets[table]
+            plan.append((table, ds.core, ds.skipped, set(ds.protected)))
+    if any(t in datasets for t in V2_TABLES):
+        translations = [r for ds in datasets.values() for r in ds.translations]
+        aliases = [r for ds in datasets.values() for r in ds.aliases]
+        protected_translations = {
+            f"{pid}:{code}"
+            for ds in datasets.values() for pid in ds.protected for code in all_langs
+        }
+        protected_aliases = {a for ds in datasets.values() for a in ds.protected_aliases}
+        if args.table:
+            logger.warning(
+                "--table publishes only '%s' word rows, but translations/id_aliases "
+                "sync from the SAME partial read — other tables' translations are "
+                "protected from deletion only via their skipped/protected sets. "
+                "Prefer full publishes.", args.table,
+            )
+            # Partial read: the diff cannot distinguish "row absent because its
+            # table wasn't read" from "row removed" — so delete nothing.
+            protected_translations |= {"*"}  # sentinel handled in sync_table
+            protected_aliases |= {"*"}
+        plan.append(("translations", translations, 0, protected_translations))
+        plan.append(("id_aliases", aliases, 0, protected_aliases))
+
     with httpx.Client(event_hooks={"request": [_sign_request]}) as client:
-        for table, (rows, skipped, protected_ids) in excel.items():
+        for table, rows, skipped, protected_ids in plan:
             try:
                 result = sync_table(client, table, rows, skipped, protected_ids, dry_run=args.dry_run)
             except httpx.HTTPError as exc:
