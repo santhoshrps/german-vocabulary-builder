@@ -105,6 +105,21 @@ B2   B2.1   B2.2
 C1   C1.1   C1.2   ... etc.
 ```
 
+**Type** must be the table's canonical value (checked after lowercasing, so `Verb`/`VERB`
+are fine; `Verrb` is not) — per table, not one global set, so a `verb` row pasted into
+`nouns.xlsx` fails just like a typo:
+
+| Table | Allowed Type |
+|---|---|
+| `verbs` | `verb` |
+| `nouns` | `noun` |
+| `adverbs_adjectives` | `adverb` or `adjective` |
+
+Previously a typo'd Type synced silently to D1 and the app misclassified the word at
+runtime. Now it's a row-level validation error: the sync aborts with the row number, raw
+cell value, and word — or skips the row under `--skip-invalid` with the usual
+preserve-don't-delete protection for a previously-synced word.
+
 **Required fields per table** (must be non-empty):
 
 | Table | Required fields |

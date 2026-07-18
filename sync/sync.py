@@ -64,6 +64,17 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
     "adverbs_adjectives": ["type", "english", "german_sentence", "english_sentence"],
 }
 
+# Canonical `type` values each TABLE may contain (validated after lowercasing). Per-table,
+# not one global set: "verb" inside nouns.xlsx is just as wrong as a typo like "noum".
+# Previously a typo'd Type synced silently to D1 and the app misclassified the word at
+# runtime (the ledger/apply paths coerce unknown types) — now it fails the sync like every
+# other validation error, with --skip-invalid as the explicit escape hatch.
+ALLOWED_TYPES: dict[str, set[str]] = {
+    "verbs": {"verb"},
+    "nouns": {"noun"},
+    "adverbs_adjectives": {"adverb", "adjective"},
+}
+
 # A1, A2, B1, B2, C1, C2 with optional .1 or .2 sub-level
 VALID_LEVEL = re.compile(r"^(A1|A2|B1|B2|C1|C2)(\.[12])?$")
 
@@ -299,6 +310,18 @@ def read_excel(
                 if not record.get(field):
                     label = repr(word_raw) if word_raw else "(unknown word)"
                     row_errors.append(f"  Row {row_num}: required field '{field}' is empty (word={label})")
+
+            # Type must be one of this table's canonical values (checked on the lowercased
+            # form, reported with the raw cell so the operator can find it in the sheet).
+            # An empty Type is already reported by the required-fields check above.
+            type_raw = record.get("type")
+            if type_raw and str(type_raw).strip().lower() not in ALLOWED_TYPES[table]:
+                label = repr(word_raw) if word_raw else "(unknown word)"
+                allowed = "/".join(sorted(ALLOWED_TYPES[table]))
+                row_errors.append(
+                    f"  Row {row_num}: invalid Type {str(type_raw)!r} "
+                    f"— '{table}' allows only {allowed} (word={label})"
+                )
 
             if row_errors:
                 validation_errors.extend(row_errors)
