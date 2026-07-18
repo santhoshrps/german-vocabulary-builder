@@ -2,6 +2,7 @@ import { Env } from "./env";
 import { contentQuery } from "./db";
 import { utf8, sha256, bytesToHex } from "./bytes";
 import { Scope } from "./entitlement";
+import { DEFAULT_LANG, resolveChain } from "./languages";
 
 export const TABLES = ["verbs", "nouns", "adverbs_adjectives"] as const;
 export type TableName = (typeof TABLES)[number];
@@ -16,7 +17,7 @@ const ROWS_PER_REQUEST_CAP = 200;
 // ever see rows flagged free = 1; full sessions see everything. This is the
 // server-side paywall: a free client literally cannot fetch beyond the preview.
 function scopeWhere(scope: Scope): string {
-  return scope === "free" ? "free = 1" : "1 = 1";
+  return scope === "free" ? "c.free = 1" : "1 = 1";
 }
 
 // The content database is read-only for this worker; the capability in src/db.ts
@@ -25,18 +26,90 @@ function readOnlySelect(env: Env, sql: string): D1PreparedStatement {
   return contentQuery(env, sql);
 }
 
+// ---- Served shape (v2 schema, v1-compatible wire format) --------------------
+//
+// SCHEMA v2 (WD-ID/LG-FR-9): core tables carry German + sense; source-language
+// text lives in `translations`, one row per word × language. The WIRE SHAPE stays
+// v1-compatible on purpose (forward-compat floor, MS2-FR-23): every served row
+// still carries `english` / `english_sentence` — filled with the REQUESTED
+// language resolved through its fallback chain (?lang=es-MX → es-MX → es-419 →
+// en, LG-FR-12/13). Today's app builds keep working untouched; a Chinese user's
+// rows simply arrive with Chinese text in those fields. Additive v2 fields
+// (`sense`, `translation_article`, `translation_article_plural`,
+// `translation_plural`) ride along; old clients ignore them.
+//
+// The served `content_hash` is COMPOSITE: core hash + the chain's translation
+// hashes. The manifest uses the same expression, so a translation edit changes
+// exactly that word's hash and the normal delta machinery ships it — and a
+// language switch changes every hash, which IS the full re-fetch the switch
+// needs (ContentSyncCoordinator.resyncForSourceLanguageChange).
+
+const CORE_COLUMNS: Record<TableName, string[]> = {
+  verbs: [
+    "id", "free", "level", "capital", "type", "word", "sense", "german_sentence",
+    "ich", "du", "er_sie_es", "wir", "ihr", "sie_sie", "past_participle",
+    "simple_past", "updated_at",
+  ],
+  nouns: [
+    "id", "free", "level", "capital", "type", "article", "word", "plural",
+    "sense", "image", "german_sentence", "updated_at",
+  ],
+  adverbs_adjectives: [
+    "id", "free", "level", "capital", "type", "word", "sense", "german_sentence",
+    "comparative", "superlative", "updated_at",
+  ],
+};
+
+interface Overlay {
+  select: string;      // full SELECT list (core columns + resolved language fields)
+  joins: string;       // LEFT JOINs for the chain
+  joinBinds: string[]; // one bind per chain entry (the language codes)
+  hashExpr: string;    // the composite content_hash expression
+  englishExpr: string; // resolved translation word (for search)
+}
+
+function buildOverlay(table: TableName, chain: string[]): Overlay {
+  const joins = chain
+    .map((_, i) => `LEFT JOIN translations t${i} ON t${i}.word_id = c.id AND t${i}.lang = ?`)
+    .join(" ");
+  const co = (field: string) =>
+    chain.length === 1
+      ? `t0.${field}`
+      : `COALESCE(${chain.map((_, i) => `t${i}.${field}`).join(", ")})`;
+  const hashExpr = [
+    "c.content_hash",
+    ...chain.map((_, i) => `COALESCE(t${i}.content_hash, '')`),
+  ].join(" || ':' || ");
+  const select = [
+    ...CORE_COLUMNS[table].map((c) => `c.${c}`),
+    `${hashExpr} AS content_hash`,
+    `${co("word")} AS english`,
+    `${co("sentence")} AS english_sentence`,
+    `${co("article")} AS translation_article`,
+    `${co("article_plural")} AS translation_article_plural`,
+    `${co("plural")} AS translation_plural`,
+  ].join(", ");
+  return { select, joins, joinBinds: [...chain], hashExpr, englishExpr: co("word") };
+}
+
+export { resolveChain, DEFAULT_LANG };
+
 // ---- Dataset version --------------------------------------------------------
-// Prefer an explicit value in meta.dataset_version (bumped by the write worker).
-// Otherwise derive one from per-table COUNT(*) + MAX(updated_at): COUNT reflects
-// deletions, MAX(updated_at) reflects inserts/updates — so any change moves it.
+// Prefer an explicit value in meta.dataset_version (bumped by the publish pipeline).
+// Otherwise derive one from per-table COUNT(*) + MAX(updated_at) — including the
+// translations and id_aliases tables, so ANY content edit moves the version.
+// Language-independent by design: a change in one language bumps everyone's
+// version, and the per-language manifest then limits actual transfer to the
+// rows whose composite hash really changed (a no-op diff for the others).
 
 // Per-isolate cache of the computed version, per scope. getVersion() runs at the top of EVERY
 // data request (it keys the edge cache) and /v1/version is each client's foreground poll —
-// without this, D1 QPS scales with USER count instead of with how often the data changes
-// (docs/caching.md's core promise), and the no-meta fallback is three table scans per hit.
+// without this, D1 QPS scales with USER count instead of with how often the data changes.
 // The TTL matches /v1/version's public max-age (30s), so clients observe no extra staleness.
 const VERSION_CACHE_TTL_MS = 30_000;
 const versionCache = new Map<Scope, { version: string; expiresAt: number }>();
+
+const VERSIONED_EXTRA_TABLES = ["translations", "id_aliases"] as const;
 
 export async function getVersion(env: Env, scope: Scope): Promise<string> {
   const cached = versionCache.get(scope);
@@ -56,7 +129,13 @@ export async function getVersion(env: Env, scope: Scope): Promise<string> {
     const parts: string[] = [scope];
     for (const t of TABLES) {
       const row = await readOnlySelect(env,
-        `SELECT COUNT(*) AS c, COALESCE(MAX(updated_at), '') AS m FROM ${t} WHERE ${scopeWhere(scope)}`
+        `SELECT COUNT(*) AS c, COALESCE(MAX(updated_at), '') AS m FROM ${t} AS c WHERE ${scopeWhere(scope)}`
+      ).first<{ c: number; m: string }>();
+      parts.push(`${t}:${row?.c ?? 0}:${row?.m ?? ""}`);
+    }
+    for (const t of VERSIONED_EXTRA_TABLES) {
+      const row = await readOnlySelect(env,
+        `SELECT COUNT(*) AS c, COALESCE(MAX(updated_at), '') AS m FROM ${t}`
       ).first<{ c: number; m: string }>();
       parts.push(`${t}:${row?.c ?? 0}:${row?.m ?? ""}`);
     }
@@ -69,12 +148,18 @@ export async function getVersion(env: Env, scope: Scope): Promise<string> {
 }
 
 // ---- Manifest ---------------------------------------------------------------
-// { table: { id: content_hash } } for client-side reconciliation (incl. deletes).
-export async function getManifest(env: Env, scope: Scope): Promise<Record<string, Record<string, string>>> {
+// { table: { id: composite_hash } } for client-side reconciliation (incl. deletes).
+// The hash is language-resolved (see the served-shape note above), so the caller's
+// chain is part of the manifest identity — cache tags carry it.
+export async function getManifest(
+  env: Env, scope: Scope, chain: string[]
+): Promise<Record<string, Record<string, string>>> {
   const manifest: Record<string, Record<string, string>> = {};
   for (const t of TABLES) {
-    const res = await readOnlySelect(env,`SELECT id, content_hash FROM ${t} WHERE ${scopeWhere(scope)}`)
-      .all<{ id: string; content_hash: string }>();
+    const o = buildOverlay(t, chain);
+    const res = await readOnlySelect(env,
+      `SELECT c.id AS id, ${o.hashExpr} AS content_hash FROM ${t} c ${o.joins} WHERE ${scopeWhere(scope)}`
+    ).bind(...o.joinBinds).all<{ id: string; content_hash: string }>();
     const map: Record<string, string> = {};
     for (const r of res.results) map[r.id] = r.content_hash;
     manifest[t] = map;
@@ -89,12 +174,15 @@ export async function getManifest(env: Env, scope: Scope): Promise<Record<string
 // sub-batches well under that limit and merged — otherwise a full-tier delta
 // sync (which requests up to ROWS_PER_REQUEST_CAP ids at once) would throw and
 // surface as a 500.
-const ROWS_BIND_CHUNK = 90;
+const ROWS_BIND_CHUNK = 80;
 
-export async function getRows(env: Env, table: TableName, ids: string[], scope: Scope): Promise<unknown[]> {
+export async function getRows(
+  env: Env, table: TableName, ids: string[], scope: Scope, chain: string[]
+): Promise<unknown[]> {
   const capped = ids.slice(0, ROWS_PER_REQUEST_CAP);
   if (capped.length === 0) return [];
 
+  const o = buildOverlay(table, chain);
   const rows: unknown[] = [];
   for (let i = 0; i < capped.length; i += ROWS_BIND_CHUNK) {
     const chunk = capped.slice(i, i + ROWS_BIND_CHUNK);
@@ -102,8 +190,9 @@ export async function getRows(env: Env, table: TableName, ids: string[], scope: 
     // The scope filter is essential here too: a free client must not be able to
     // pull a full-tier row by guessing its id.
     const res = await readOnlySelect(env,
-      `SELECT * FROM ${table} WHERE id IN (${placeholders}) AND ${scopeWhere(scope)}`
-    ).bind(...chunk).all();
+      `SELECT ${o.select} FROM ${table} c ${o.joins} ` +
+      `WHERE c.id IN (${placeholders}) AND ${scopeWhere(scope)}`
+    ).bind(...o.joinBinds, ...chunk).all();
     rows.push(...res.results);
   }
   return rows;
@@ -112,12 +201,13 @@ export async function getRows(env: Env, table: TableName, ids: string[], scope: 
 export const ROWS_CAP = ROWS_PER_REQUEST_CAP;
 
 // ---- Search -----------------------------------------------------------------
-// Look up a word across all tables by its German text OR English translation.
-// Unlike the sync endpoints this is deliberately NOT scope-filtered: it searches
-// the WHOLE vocabulary so a free user can discover full-set words (the teaser).
-// Each hit carries its table and `free` flag so the client can mark which results
-// are part of full access and must NOT be added to the local store. Still a SELECT,
-// so it goes through the same read-only guard.
+// Look up a word across all tables by its German text OR its translation in the
+// caller's language (resolved chain). Unlike the sync endpoints this is
+// deliberately NOT scope-filtered: it searches the WHOLE vocabulary so a free
+// user can discover full-set words (the teaser). Each hit carries its table and
+// `free` flag so the client can mark which results are part of full access and
+// must NOT be added to the local store. Still a SELECT, so it goes through the
+// same read-only guard.
 export interface SearchHit {
   table: TableName;
   free: boolean;
@@ -126,23 +216,26 @@ export interface SearchHit {
 
 const SEARCH_LIMIT_PER_TABLE = 25;
 
-// Columns matched per table: the German word + English translation, PLUS each table's inflected /
-// derived forms (search.md SE-FR-ACCESS-8) — verb conjugations (present, simple past, past
-// participle), adjective/adverb comparative & superlative, and noun plural — so a learner who types
-// an inflected form finds the base word. Column names are literals from this file (never user input),
-// so they are safe to interpolate into the SQL; the query value itself is always bound.
-const SEARCH_COLUMNS: Record<TableName, string[]> = {
-  verbs: ["word", "english", "ich", "du", "er_sie_es", "wir", "ihr", "sie_sie", "simple_past", "past_participle"],
-  nouns: ["word", "english", "plural"],
-  adverbs_adjectives: ["word", "english", "comparative", "superlative"],
+// German columns matched per table: the word PLUS each table's inflected / derived forms
+// (search.md SE-FR-ACCESS-8) — verb conjugations, adjective/adverb comparative &
+// superlative, noun plural — so a learner who types an inflected form finds the base
+// word. The TRANSLATION side matches the resolved language expression (LG-FR-13), not a
+// column. Column names are literals from this file (never user input), so they are safe
+// to interpolate into the SQL; the query value itself is always bound.
+const SEARCH_FORM_COLUMNS: Record<TableName, string[]> = {
+  verbs: ["ich", "du", "er_sie_es", "wir", "ihr", "sie_sie", "simple_past", "past_participle"],
+  nouns: ["plural"],
+  adverbs_adjectives: ["comparative", "superlative"],
 };
 
-// German umlauts the search folds away so matching is diacritic-insensitive (search.md SE-FR-ACCESS-8):
-// "Hauser" finds "Häuser", "groser" finds "größer". Each entry lists the upper- and lower-case form and
-// the ASCII base. We fold ONLY these combining diacritics — exactly what the iOS client's
-// `localizedStandardContains` does via Unicode diacritic-stripping — so local and backend search behave
-// identically. ß is deliberately left untouched: it has no Unicode decomposition, so the client doesn't
-// fold it either (folding it to "ss" here would make the backend more lenient than local).
+// German umlauts the search folds away so matching is diacritic-insensitive (search.md
+// SE-FR-ACCESS-8): "Hauser" finds "Häuser". Each entry lists the upper- and lower-case
+// form and the ASCII base. We fold ONLY these combining diacritics — exactly what the iOS
+// client's `localizedStandardContains` does via Unicode diacritic-stripping — so local and
+// backend search behave identically. ß is deliberately left untouched: it has no Unicode
+// decomposition, so the client doesn't fold it either. (Per-language folding rules join
+// the language registry with LG-FR-15; today's set serves German + the Latin-script
+// translation languages, and CJK text passes through unfolded, which is correct.)
 const UMLAUT_FOLDS: ReadonlyArray<{ upper: string; lower: string; base: string }> = [
   { upper: "Ä", lower: "ä", base: "a" },
   { upper: "Ö", lower: "ö", base: "o" },
@@ -156,9 +249,10 @@ function foldTerm(s: string): string {
   return out;
 }
 
-// The SQL expression that folds a column the same way as `foldTerm`. SQLite/D1 has no unaccent() and
-// its LOWER() only lowercases ASCII, so we REPLACE both umlaut cases explicitly, then LOWER() for the
-// remaining A–Z. `col` is a literal from SEARCH_COLUMNS (never user input), so it is safe to embed.
+// The SQL expression that folds a column (or expression) the same way as `foldTerm`.
+// SQLite/D1 has no unaccent() and its LOWER() only lowercases ASCII, so we REPLACE both
+// umlaut cases explicitly, then LOWER() for the remaining A–Z. `col` is a literal from
+// this file (never user input), so it is safe to embed.
 function foldedColumnSql(col: string): string {
   let expr = col;
   for (const { upper, lower, base } of UMLAUT_FOLDS) {
@@ -167,7 +261,9 @@ function foldedColumnSql(col: string): string {
   return `LOWER(${expr})`;
 }
 
-export async function searchWord(env: Env, query: string, type?: string): Promise<SearchHit[]> {
+export async function searchWord(
+  env: Env, query: string, type: string | undefined, chain: string[]
+): Promise<SearchHit[]> {
   const folded = foldTerm(query);
   const like = `%${folded}%`;      // German: match anywhere in the word/forms
   const prefix = `${folded}%`;     // starts-with
@@ -179,39 +275,35 @@ export async function searchWord(env: Env, query: string, type?: string): Promis
   else if (type === "noun") tables = ["nouns"];
   else if (type === "adjective" || type === "adverb") tables = ["adverbs_adjectives"];
 
-  const wordSql = foldedColumnSql("word");
-  const englishSql = foldedColumnSql("english");
-  // Word-boundary matching for the translation AND inflected forms: pad with spaces and look for
-  // " query" (a word starts with it), "query " (a word ends with it), or " query " (a whole word). So
-  // "hund" won't match "t·hund·er" and "test" won't match the "-test" ending of "kostest", while "dog"
-  // still finds "hot dog" and "am größten" is found by "größten" (search.md SE-FR-ACCESS-3/8).
-  const engPadded = `(' ' || ${englishSql} || ' ')`;
-  const engStarts = `% ${folded}%`;   // a translation word starts with the query
-  const engEnds = `%${folded} %`;     // a translation word ends with the query
-  const wholeWord = `% ${folded} %`;  // the query is a complete space-delimited word (translation or a form)
-
   const hits: SearchHit[] = [];
   for (const t of tables) {
-    const cols = SEARCH_COLUMNS[t];
-    // Inflected/derived form columns (everything except the base word + English translation), padded
-    // so they match only WHOLE words — never a shared inflection ending.
-    const inflPadded = cols
-      .filter((c) => c !== "word" && c !== "english")
-      .map((c) => `(' ' || ${foldedColumnSql(c)} || ' ')`);
+    const o = buildOverlay(t, chain);
+    const wordSql = foldedColumnSql("c.word");
+    const englishSql = foldedColumnSql(`COALESCE(${o.englishExpr}, '')`);
+    // Word-boundary matching for the translation AND inflected forms: pad with spaces and
+    // look for " query" / "query " / " query " — so "hund" won't match "t·hund·er", while
+    // "dog" still finds "hot dog" (search.md SE-FR-ACCESS-3/8).
+    const engPadded = `(' ' || ${englishSql} || ' ')`;
+    const engStarts = `% ${folded}%`;
+    const engEnds = `%${folded} %`;
+    const wholeWord = `% ${folded} %`;
 
-    // MATCHING: the base WORD matches anywhere (compounds like See·hund); inflected forms and the
-    // English translation match only at a WORD boundary (SE-FR-ACCESS-3/8).
+    const inflPadded = SEARCH_FORM_COLUMNS[t]
+      .map((c) => `(' ' || ${foldedColumnSql(`COALESCE(c.${c}, '')`)} || ' ')`);
+
+    // MATCHING: the base WORD matches anywhere (compounds like See·hund); inflected forms
+    // and the translation match only at a WORD boundary.
     const whereParts = [
-      `${wordSql} LIKE ?`,                        // base word contains the query
-      ...inflPadded.map((p) => `${p} LIKE ?`),    // an inflected form HAS it as a whole word
-      `${engPadded} LIKE ?`,                      // a translation word starts with the query
-      `${engPadded} LIKE ?`,                      // a translation word ends with the query
+      `${wordSql} LIKE ?`,
+      ...inflPadded.map((p) => `${p} LIKE ?`),
+      `${engPadded} LIKE ?`,
+      `${engPadded} LIKE ?`,
     ];
     const whereBinds = [like, ...inflPadded.map(() => wholeWord), engStarts, engEnds];
 
-    // Rank so the per-table LIMIT keeps the BEST candidates (rank-then-limit, SE-FR-ACCESS-9),
-    // mirroring the client tiers: word exact → whole inflected form → word starts/ends → word mid-word
-    // → English whole word → (else = English word start/end). Ties: shorter word first.
+    // Rank so the per-table LIMIT keeps the BEST candidates (rank-then-limit,
+    // SE-FR-ACCESS-9): word exact → whole inflected form → word starts/ends → word
+    // mid-word → translation whole word → (else = translation word start/end).
     const wholeForm = inflPadded.length ? inflPadded.map((p) => `${p} LIKE ?`).join(" OR ") : null;
     const orderBy =
       "ORDER BY CASE" +
@@ -220,18 +312,19 @@ export async function searchWord(env: Env, query: string, type?: string): Promis
       ` WHEN ${wordSql} LIKE ? OR ${wordSql} LIKE ? THEN 2` +
       ` WHEN ${wordSql} LIKE ? THEN 3` +
       ` WHEN ${engPadded} LIKE ? THEN 4` +
-      " ELSE 5 END, LENGTH(word)";
+      " ELSE 5 END, LENGTH(c.word)";
     const orderBinds = [
-      folded,                                  // word exact
-      ...inflPadded.map(() => wholeWord),      // whole inflected form (tier 1)
-      prefix, suffix,                          // word starts/ends
-      like,                                    // word mid-word
-      wholeWord,                               // English whole word
+      folded,
+      ...inflPadded.map(() => wholeWord),
+      prefix, suffix,
+      like,
+      wholeWord,
     ];
 
     const res = await readOnlySelect(env,
-      `SELECT * FROM ${t} WHERE ${whereParts.join(" OR ")} ${orderBy} LIMIT ${SEARCH_LIMIT_PER_TABLE}`
-    ).bind(...whereBinds, ...orderBinds).all<Record<string, unknown>>();
+      `SELECT ${o.select} FROM ${t} c ${o.joins} ` +
+      `WHERE ${whereParts.join(" OR ")} ${orderBy} LIMIT ${SEARCH_LIMIT_PER_TABLE}`
+    ).bind(...o.joinBinds, ...whereBinds, ...orderBinds).all<Record<string, unknown>>();
     for (const row of res.results) {
       // adverbs_adjectives holds both; an adjective/adverb filter narrows by its `type` column.
       if ((type === "adjective" || type === "adverb") && row.type !== type) continue;
@@ -241,23 +334,22 @@ export async function searchWord(env: Env, query: string, type?: string): Promis
   return hits;
 }
 
-// ---- Free-tier search request cap ------------------------------------------
-// A free user may run a bounded number of search REQUESTS per device before being
-// asked to upgrade; within the cap, searches return full results (including paid-word
-// previews). The count is kept server-side in `search_usage`, keyed to the attested
-// device, so it can't be reset by reinstalling the app. The client enforces the same
-// cap and short-circuits; this is the authoritative backstop against direct API abuse.
-
 // (Search-usage accounting lives in limits.ts — it writes to the OPS database;
 // this file is the content layer and holds no write path at all. MS2-FR-29b.)
 
 // ---- Snapshot ---------------------------------------------------------------
-// Full dataset as NDJSON (one row per line). Cloudflare compresses the response;
-// the phone streams + inserts line-by-line without buffering it all in memory.
-export async function buildSnapshotNdjson(env: Env, scope: Scope): Promise<string> {
+// Full dataset as NDJSON (one row per line), language-resolved like every other
+// read. Cloudflare compresses the response; the phone streams + inserts
+// line-by-line without buffering it all in memory.
+export async function buildSnapshotNdjson(
+  env: Env, scope: Scope, chain: string[]
+): Promise<string> {
   const lines: string[] = [];
   for (const t of TABLES) {
-    const res = await readOnlySelect(env,`SELECT * FROM ${t} WHERE ${scopeWhere(scope)}`).all();
+    const o = buildOverlay(t, chain);
+    const res = await readOnlySelect(env,
+      `SELECT ${o.select} FROM ${t} c ${o.joins} WHERE ${scopeWhere(scope)}`
+    ).bind(...o.joinBinds).all();
     for (const row of res.results) {
       lines.push(JSON.stringify({ t, row }));
     }

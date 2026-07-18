@@ -108,6 +108,10 @@ print(f'✅ {env} verified at ' + '$url' + f' — version {sha}{extra}')
 do_env() {
   local env="$1"
   if [[ "$env" == "prod" ]]; then
+    if [[ -f PROD_FREEZE ]]; then
+      echo "❌ production deploys are frozen (see PROD_FREEZE). The cutover step lifts this." >&2
+      exit 1
+    fi
     read -r -p "About to deploy PRODUCTION. Type 'prod' to continue: " answer
     [[ "$answer" == "prod" ]] || { echo "aborted" >&2; exit 1; }
     WARN_NAMES=("${read_warn[@]}"); check_parity read-worker "$env" "${read_required_prod[@]}"

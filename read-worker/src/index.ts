@@ -8,6 +8,7 @@ import {
 import { opsQuery } from "./db";
 import { healthReport } from "./health";
 import { serveCachedByVersion } from "./cache";
+import { resolveChain, chainKey } from "./languages";
 import { verifyAttestation, verifyAssertion, attestationRequired } from "./appattest";
 import { verifyPromoCode, verifyStoreKitTransaction, storeKitXcodeMode, claimPromoDevice, Entitlement, Scope } from "./entitlement";
 import {
@@ -366,8 +367,13 @@ async function handleManifest(
   env: Env, request: Request, ctx: ExecutionContext, scope: Scope
 ): Promise<Response> {
   const version = await getVersion(env, scope);
-  return serveCachedByVersion(request, ctx, version, `manifest:${scope}`, 300, async () => ({
-    body: JSON.stringify({ version, manifest: await getManifest(env, scope) }),
+  // The manifest is language-resolved (composite hashes, LG-FR-13): the chain is
+  // part of the cached body's identity AND its ETag — two languages must never
+  // share a 304 or a cached entry.
+  const chain = resolveChain(new URL(request.url).searchParams.get("lang"));
+  const key = chainKey(chain);
+  return serveCachedByVersion(request, ctx, `${version}:${key}`, `manifest:${scope}:${key}`, 300, async () => ({
+    body: JSON.stringify({ version, manifest: await getManifest(env, scope, chain) }),
     contentType: "application/json",
   }));
 }
@@ -383,9 +389,11 @@ async function handleRows(
   if (ids.length > ROWS_CAP) throw new HttpError(400, `too many ids (max ${ROWS_CAP})`);
 
   const version = await getVersion(env, scope);
-  const tag = `rows:${scope}:${table}:${ids.slice().sort().join(",")}`;
-  return serveCachedByVersion(request, ctx, version, tag, 300, async () => ({
-    body: JSON.stringify({ version, table, rows: await getRows(env, table, ids, scope) }),
+  const chain = resolveChain(url.searchParams.get("lang"));
+  const key = chainKey(chain);
+  const tag = `rows:${scope}:${key}:${table}:${ids.slice().sort().join(",")}`;
+  return serveCachedByVersion(request, ctx, `${version}:${key}`, tag, 300, async () => ({
+    body: JSON.stringify({ version, table, rows: await getRows(env, table, ids, scope, chain) }),
     contentType: "application/json",
   }));
 }
@@ -394,8 +402,10 @@ async function handleSnapshot(
   env: Env, request: Request, ctx: ExecutionContext, scope: Scope
 ): Promise<Response> {
   const version = await getVersion(env, scope);
-  return serveCachedByVersion(request, ctx, version, `snapshot:${scope}`, 86400, async () => ({
-    body: await buildSnapshotNdjson(env, scope),
+  const chain = resolveChain(new URL(request.url).searchParams.get("lang"));
+  const key = chainKey(chain);
+  return serveCachedByVersion(request, ctx, `${version}:${key}`, `snapshot:${scope}:${key}`, 86400, async () => ({
+    body: await buildSnapshotNdjson(env, scope, chain),
     // text/plain, not application/x-ndjson (2026-07-12): the client parses BYTES and never
     // reads this header, and only types on Cloudflare's compressible list get wire
     // compression — x-ndjson isn't listed, which shipped the ~20 MB snapshot raw. This is
@@ -417,7 +427,10 @@ async function handleSearch(
   const ip = clientIp(request);
   // Sanitize server-side (letters + spaces only, capped) — strips junk and SQL LIKE wildcards.
   const q = sanitizeTerm(url.searchParams.get("q") || "").slice(0, 64);
-  if (q.length < 2) throw new HttpError(400, "query too short");
+  // Two letters minimum for alphabetic queries — but ONE CJK ideograph/kana is a
+  // complete word (Chinese source language, LG-FR-13), so it searches alone.
+  const cjk = /[\u3400-\u4DBF\u4E00-\u9FFF\u3040-\u30FF]/u.test(q);
+  if (q.length < (cjk ? 1 : 2)) throw new HttpError(400, "query too short");
 
   // Rate limit per device (StoreKit) or per IP (free/promo, which share a subject). A search is a
   // LIKE scan across all tables, so cap it above human use but below scripted scraping.
@@ -434,11 +447,13 @@ async function handleSearch(
   // change invalidates. Without this, each search was an uncached leading-wildcard LIKE scan
   // of all tables per request. Rate limit + free-cap accounting run BEFORE the cache, so a
   // cache hit still consumes a free search.
+  const chain = resolveChain(url.searchParams.get("lang"));
+  const langKey = chainKey(chain);
   const respond = async (): Promise<Response> => {
     const version = await getVersion(env, "full");
-    const tag = `search:${encodeURIComponent(q)}:${type ?? ""}`;
-    return serveCachedByVersion(request, ctx, version, tag, 300, async () => ({
-      body: JSON.stringify({ query: q, results: await searchWord(env, q, type) }),
+    const tag = `search:${langKey}:${encodeURIComponent(q)}:${type ?? ""}`;
+    return serveCachedByVersion(request, ctx, `${version}:${langKey}`, tag, 300, async () => ({
+      body: JSON.stringify({ query: q, results: await searchWord(env, q, type, chain) }),
       contentType: "application/json",
     }));
   };
