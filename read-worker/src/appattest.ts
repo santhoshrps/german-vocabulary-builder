@@ -103,8 +103,17 @@ export async function verifyAttestation(
   if (!timingSafeEqualBytes(rpIdHash, wantApp)) throw new Error("attest: appId mismatch");
 
   // 5. aaguid must match the configured App Attest environment.
-  const wantAaguid = env.APP_ATTEST_ENV === "development" ? AAGUID_DEV : AAGUID_PROD;
-  if (!aaguid || !timingSafeEqualBytes(aaguid, wantAaguid)) throw new Error("attest: aaguid mismatch");
+  // Production verifies strictly. The development worker accepts BOTH attest
+  // environments (MS2-FR-31): Xcode builds attest as development, while TestFlight
+  // builds flipped to the dev world via the in-app Environment switch attest as
+  // production — both are legitimate dev-world clients.
+  const isProd = env.APP_ATTEST_ENV === "production";
+  const aaguidOK = aaguid !== null && (
+    isProd
+      ? timingSafeEqualBytes(aaguid, AAGUID_PROD)
+      : timingSafeEqualBytes(aaguid, AAGUID_DEV) || timingSafeEqualBytes(aaguid, AAGUID_PROD)
+  );
+  if (!aaguidOK) throw new Error("attest: aaguid mismatch");
 
   // 5b. Apple's algorithm requires the counter to be 0 at attestation. A freshly generated key
   //     is always 0; a non-zero value means the key was already used (or crafted authData), i.e.
