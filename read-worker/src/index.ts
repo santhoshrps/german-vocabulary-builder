@@ -9,7 +9,7 @@ import { opsQuery } from "./db";
 import { issueGrants, serveFile, GRANTS_MAX_IDS } from "./mediafiles";
 import { healthReport } from "./health";
 import { serveCachedByVersion } from "./cache";
-import { resolveChain, chainKey } from "./languages";
+import { resolveChain, chainKey, isKnownLang } from "./languages";
 import { verifyAttestation, verifyAssertion, attestationRequired } from "./appattest";
 import { verifyPromoCode, verifyStoreKitTransaction, storeKitXcodeMode, claimPromoDevice, Entitlement, Scope } from "./entitlement";
 import {
@@ -522,6 +522,11 @@ async function handleSubmission(
   if (word.length < 2) throw new HttpError(400, "missing or invalid word");
   const allowedTypes = ["noun", "verb", "adjective", "adverb"];
   const type = body?.type && allowedTypes.includes(body.type) ? body.type : null;
+  // The submitter's source language (LG-FR-14): the app sends ?lang= on every
+  // request; validated against the registry, so the curator knows which language
+  // the shared translation text is written in. Unknown/absent → "en".
+  const langParam = new URL(request.url).searchParams.get("lang") ?? "";
+  const lang = isKnownLang(langParam) ? langParam : "en";
   const key = rateSubjectKey(claims, ip);
   // Stable per-word client key (the app's `custom-<uuid>`): repeated shares of ONE word —
   // first save, then every edit (app spec CW-FR-ADD-6) — UPSERT the same curation row, so
@@ -594,9 +599,9 @@ async function handleSubmission(
   }
 
   await opsQuery(env, 
-    `INSERT INTO submissions (id, word, type, details, source, scope, status, client_key)
-     VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)`
-  ).bind(crypto.randomUUID(), word, type, detailsJSON, key, scopeOf(claims), clientKey).run();
+    `INSERT INTO submissions (id, word, type, details, source, scope, status, client_key, lang)
+     VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`
+  ).bind(crypto.randomUUID(), word, type, detailsJSON, key, scopeOf(claims), clientKey, lang).run();
 
   return json({ status: "pending" }, 201);
 }

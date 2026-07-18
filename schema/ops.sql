@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS submissions (
   source     TEXT,                                   -- session subject (e.g. 'promo:label' or device id)
   scope      TEXT,                                   -- caller scope at submit time ('free' | 'full')
   status     TEXT NOT NULL DEFAULT 'pending',        -- 'pending' | 'approved' | 'rejected'
+  lang       TEXT NOT NULL DEFAULT 'en',              -- submitter's source language (LG-FR-14)
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
