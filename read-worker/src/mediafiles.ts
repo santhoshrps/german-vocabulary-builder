@@ -54,7 +54,12 @@ export async function catalogIndex(env: Env): Promise<Map<string, CatalogIndexEn
     if (!key || !key.startsWith("media/catalog/")) continue;
     const catalog = await loadJSON<{ entries: { id: string; free: number; hash: string; bytes: number }[] }>(env, key);
     for (const e of catalog?.entries ?? []) {
-      index.set(e.id, { kind: shard, hash: e.hash, free: e.free === 1, bytes: e.bytes });
+      // Keyed by "<shard>:<id>", NEVER bare id: a word's audio entry and its image
+      // entry share the same id, so a flat map would let the image overwrite the
+      // audio (an audio grant request would be answered with the image — found
+      // 2026-07-18 before any client shipped). Grant requests carry the same
+      // composite form.
+      index.set(`${shard}:${e.id}`, { kind: shard, hash: e.hash, free: e.free === 1, bytes: e.bytes });
     }
   }
   indexCache = { key: cacheKey, index };
@@ -89,7 +94,9 @@ export async function issueGrants(
   const grants: Grant[] = [];
   const denied: string[] = [];
   for (const id of ids) {
-    const entry = index.get(id);
+    // ids MUST be kind-composite ("audio:<id>" / "image:<id>") — the response echoes
+    // the requested composite id so the client's matching stays exact.
+    const entry = id.startsWith("audio:") || id.startsWith("image:") ? index.get(id) : undefined;
     if (!entry || (scope !== "full" && !entry.free)) {
       denied.push(id);
       continue;
