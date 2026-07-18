@@ -18,6 +18,12 @@ Schema — `{ "<noun_id>": Decision }`, where Decision is:
   input_fingerprint sha256(gloss | word | german_sentence) — the inputs the image depends on
   verifier          {"correct": 0.97, "natural": 0.95, "appeal": 0.9}  (optional)
   updated           ISO date the decision last changed
+  replace_requested true when a targeted replacement was requested (media_replace.py / reviewer
+                    regen actions) for a noun that HAS an approved image: the approved record —
+                    and therefore the shipped image — stays live while fresh candidates are
+                    generated and reviewed (zero-gap swap). Cleared by the next record_approved.
+  replace_fingerprint  set once replacement candidates are queued: the input_fingerprint they
+                    were generated for, so a content edit after queueing re-triggers generation.
 """
 
 from __future__ import annotations
@@ -82,6 +88,11 @@ def is_settled_current(store: Store, noun: dict[str, Any]) -> bool:
     rec = store.get(noun["id"])
     if not rec or rec.get("status") not in ("approved", "none", "review"):
         return False
+    if rec.get("replace_requested"):
+        # A targeted replacement is pending — never settled, regardless of fingerprint.
+        # (image_sync additionally treats "replacement candidates already queued" as done
+        # for the round, via replace_fingerprint + the review queue.)
+        return False
     return rec.get("input_fingerprint") == input_fingerprint(noun)
 
 
@@ -141,6 +152,20 @@ def mark_none(store: Store, noun: dict[str, Any], today: str) -> Decision:
     return rec
 
 
+def request_replacement(store: Store, noun_id: str) -> str | None:
+    """Ask for a fresh image for one noun, zero-gap: an APPROVED record is kept (the current
+    image keeps shipping) and marked replace_requested so sourcing regenerates candidates; any
+    other record (review/none) is simply forgotten, which re-triggers generation the normal way.
+    Returns the currently shipped content_hash (None when there is no approved image)."""
+    rec = store.get(noun_id)
+    if rec is not None and rec.get("status") == "approved":
+        rec["replace_requested"] = True
+        rec.pop("replace_fingerprint", None)   # not queued yet — a fresh round must generate
+        return rec.get("content_hash")
+    store.pop(noun_id, None)
+    return None
+
+
 def prune(store: Store, live_ids: set[str]) -> int:
     """Drop decisions for nouns no longer flagged/present. Returns how many were removed."""
     stale = [nid for nid in store if nid not in live_ids]
@@ -162,6 +187,29 @@ def live_content_hashes(store: Store) -> set[str]:
     """Content hashes still referenced by an approved decision — the masters to keep (prune the rest)."""
     return {rec["content_hash"] for rec in store.values()
             if rec.get("status") == "approved" and rec.get("content_hash")}
+
+
+# ---------------------------------------------------------------------------
+# Review queue IO (non-committed; candidates live in the local master cache).
+# Centralized here so image_sync, image_review, image_regen and media_replace all
+# read/write the ONE queue file the same way without importing each other.
+# ---------------------------------------------------------------------------
+
+REVIEW_QUEUE_PATH = image_config.REVIEW_DIR / "review_queue.json"
+
+
+def load_review_queue(path: Path = REVIEW_QUEUE_PATH) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except FileNotFoundError:
+        return {}
+    except Exception:  # noqa: BLE001 — a broken queue only costs re-generating candidates
+        return {}
+
+
+def save_review_queue(queue: dict[str, Any], path: Path = REVIEW_QUEUE_PATH) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(queue, indent=2, ensure_ascii=False) + "\n", "utf-8")
 
 
 # ---------------------------------------------------------------------------

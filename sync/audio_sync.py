@@ -52,6 +52,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 import audio_engine
+import audio_overrides
 import media_delivery  # shared .pack/manifest/R2 layer (also used by image_sync.py)
 import sync  # reuse read_excel / TABLE_CONFIG / logging setup from the text pipeline
 
@@ -98,37 +99,79 @@ def _descriptor(word_id: str, level: str, kind: str, free: int,
     }
 
 
-def collect_words() -> list[dict[str, Any]]:
-    """Read every table and return a flat list of audio descriptors.
+def _row_descriptors(table: str, row: dict[str, Any]) -> list[dict[str, Any]]:
+    """All audio descriptors for one vocabulary row, BEFORE overrides.
 
     Every word emits a "singular" descriptor. Nouns with a plural also emit "<id>_plural"
     (variant="plural"); any word with a German example sentence also emits "<id>_sentence"
     (variant="sentence"). Each: {id, level, kind, free, text, voice, audio_hash, variant}.
+    Shared with media_replace.py so a replacement preview is built from EXACTLY the
+    descriptors the real sync will use. Returns [] for a row with no speakable word.
     """
+    spec = audio_engine.synthesis_for(table, row)
+    if spec is None:
+        return []
+    wid = row["id"]
+    level = (row.get("level") or "").strip().lower()
+    kind = _kind_of(table, row)
+    free = int(row.get("free") or 0)
+    descs = [_descriptor(wid, level, kind, free, *spec, "singular")]
+
+    # Extra spoken forms — each a variant id "<id>_<variant>" so it synthesizes, caches,
+    # packs and re-syncs independently of the singular and of each other.
+    if table == "nouns":
+        pspec = audio_engine.plural_synthesis_for(row)
+        if pspec is not None:
+            descs.append(_descriptor(f"{wid}_plural", level, kind, free, *pspec, "plural"))
+    sspec = audio_engine.sentence_synthesis_for(row)
+    if sspec is not None:
+        descs.append(_descriptor(f"{wid}_sentence", level, kind, free, *sspec, "sentence"))
+    return descs
+
+
+def apply_overrides(
+    table: str, row: dict[str, Any], descs: list[dict[str, Any]], overrides: audio_overrides.Store
+) -> None:
+    """Apply any committed replacement overrides to a row's descriptors, in place.
+    Clips without an override record are untouched — their hash stays byte-identical."""
+    for d in descs:
+        rec = overrides.get(d["id"])
+        if rec:
+            pool = audio_engine.voice_pool_for(table, row, d["variant"])
+            audio_overrides.apply(d, rec, pool, (row.get("word") or "").strip())
+
+
+def collect_words(overrides: audio_overrides.Store | None = None) -> list[dict[str, Any]]:
+    """Read every table and return the flat list of audio descriptors, with any
+    committed replacement overrides (audio_overrides.json) already applied."""
+    if overrides is None:
+        overrides = audio_overrides.load()
     words: list[dict[str, Any]] = []
+    rows_by_table: dict[str, list[dict[str, Any]]] = {}
     for table in sync.TABLE_CONFIG:
-        rows = sync.read_excel(table)
+        rows, _, _ = sync.read_excel(table)
+        rows_by_table[table] = rows
         logger.info("  %s: %d rows", table, len(rows))
         for row in rows:
-            spec = audio_engine.synthesis_for(table, row)
-            if spec is None:
+            descs = _row_descriptors(table, row)
+            if not descs:
                 logger.warning("  skipping %s (no speakable word)", row.get("id"))
                 continue
-            wid = row["id"]
-            level = (row.get("level") or "").strip().lower()
-            kind = _kind_of(table, row)
-            free = int(row.get("free") or 0)
-            words.append(_descriptor(wid, level, kind, free, *spec, "singular"))
+            apply_overrides(table, row, descs, overrides)
+            words.extend(descs)
 
-            # Extra spoken forms — each a variant id "<id>_<variant>" so it synthesizes, caches,
-            # packs and re-syncs independently of the singular and of each other.
-            if table == "nouns":
-                pspec = audio_engine.plural_synthesis_for(row)
-                if pspec is not None:
-                    words.append(_descriptor(f"{wid}_plural", level, kind, free, *pspec, "plural"))
-            sspec = audio_engine.sentence_synthesis_for(row)
-            if sspec is not None:
-                words.append(_descriptor(f"{wid}_sentence", level, kind, free, *sspec, "sentence"))
+    # Ids are the audio cache keys and pack-member ids across ALL tables — a cross-table
+    # collision would make two words fight over one clip. Guard here, where it would corrupt.
+    problems = sync.find_cross_table_id_collisions(rows_by_table)
+    if problems:
+        raise sync.ValidationError(
+            "cross-table id collision(s) — same Level+Word in two tables:\n  " + "\n  ".join(problems)
+        )
+
+    stale = set(overrides) - {w["id"] for w in words}
+    if stale:
+        logger.warning("audio_overrides.json has %d entr(y/ies) for unknown clip id(s): %s",
+                       len(stale), ", ".join(sorted(stale)))
     return words
 
 

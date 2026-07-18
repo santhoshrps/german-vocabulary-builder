@@ -40,19 +40,9 @@ import sync
 load_dotenv(Path(__file__).parent / ".env")
 logger = logging.getLogger("image_review")
 
-REVIEW_QUEUE_PATH = cfg.REVIEW_DIR / "review_queue.json"
-
-
-def _load_queue() -> dict:
-    try:
-        return json.loads(REVIEW_QUEUE_PATH.read_text("utf-8"))
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def _save_queue(q: dict) -> None:
-    cfg.REVIEW_DIR.mkdir(parents=True, exist_ok=True)
-    REVIEW_QUEUE_PATH.write_text(json.dumps(q, indent=2, ensure_ascii=False) + "\n", "utf-8")
+# Queue IO lives in image_decisions — one implementation for every tool.
+_load_queue = image_decisions.load_review_queue
+_save_queue = image_decisions.save_review_queue
 
 
 def _page(queue: dict, opts: dict) -> bytes:
@@ -231,18 +221,19 @@ class _Handler(BaseHTTPRequestHandler):
             self.queue.pop(nid, None)
         elif action == "no_sentence":
             # Reject these candidates and regenerate WITHOUT the example sentence next round:
-            # record the per-noun preference (durable) and forget the decision so image_sync
-            # re-generates it (sentence-free).
+            # record the per-noun preference (durable) and request a fresh round. For a noun
+            # that already ships an approved image (a replacement in review), the approved
+            # record — and the live image — are KEPT until a new pick lands (zero-gap).
             image_decisions.set_no_sentence(self.opts, nid, True)
             image_decisions.save_prompt_opts(self.opts)
-            self.store.pop(nid, None)
+            image_decisions.request_replacement(self.store, nid)
             self.queue.pop(nid, None)
         elif action == "regen_note":
             # Reviewer feedback ("show the full head" / "make it a red Porsche") — record it and
-            # forget the decision so the next image_sync round regenerates with the note appended.
+            # request a fresh round with the note appended (zero-gap for approved images, as above).
             image_decisions.set_note(self.opts, nid, data.get("note"))
             image_decisions.save_prompt_opts(self.opts)
-            self.store.pop(nid, None)
+            image_decisions.request_replacement(self.store, nid)
             self.queue.pop(nid, None)
         elif action == "pick":
             chosen = next((c for c in entry.get("candidates", [])

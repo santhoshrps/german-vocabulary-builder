@@ -11,6 +11,7 @@ python sync.py                        # sync all three tables
 python sync.py --table verbs          # sync only verbs
 python sync.py --dry-run              # preview changes without writing to DB
 python sync.py --dry-run --table nouns
+python sync.py --skip-invalid         # skip invalid rows, sync the rest
 python sync.py -v                     # verbose (per-step debug detail)
 python sync.py -q                     # quiet (warnings + errors + summary only)
 ```
@@ -44,6 +45,7 @@ uv pip compile requirements.in -o requirements.txt   # uv
 |------|-------------|
 | `--dry-run` | Fetches DB state and computes the diff, but does not call `POST /sync`. Prints what would be added, updated, and deleted. Safe to run at any time. |
 | `--table TABLE` | Restricts the sync to one table. Choices: `verbs`, `nouns`, `adverbs_adjectives`. |
+| `--skip-invalid` | Rows that fail row-level validation (empty required field, bad Level, empty Word) are skipped with a warning instead of failing the whole table; the remaining valid rows sync normally. A skipped word that already exists in the DB is **preserved, not deleted** — the previously-synced version stays live until the row is fixed. Structural errors (missing file, bad headers, multiple sheets) still abort the table. |
 | `-v`, `--verbose` | Debug-level output: per-step progress (reading Excel, fetching DB state). |
 | `-q`, `--quiet` | Suppresses progress chatter — only warnings, errors, and the final summary print. Mutually exclusive with `--verbose`. |
 
@@ -82,7 +84,7 @@ DB (via Worker)  ──fetch──▶  { id: content_hash }
 | More than one sheet | Error + abort (remove extra sheets) |
 | File is completely empty | Error + abort |
 | Header row doesn't match expected columns exactly | Error + abort (lists missing and unexpected columns) |
-| Any data row has validation errors (see below) | All errors listed, then abort |
+| Any data row has validation errors (see below) | All errors listed, then abort — unless `--skip-invalid` is set, in which case the bad rows are skipped with a warning and the rest sync |
 | No valid rows after parsing | Error + abort |
 
 For each data row:
@@ -110,6 +112,12 @@ C1   C1.1   C1.2   ... etc.
 | verbs | Type, Word, English, German_Sentence, English_Sentence |
 | nouns | Type, Article, Word, English, German_Sentence, English_Sentence |
 | adverbs_adjectives | Type, Word, English, German_Sentence, English_Sentence |
+
+**Cross-table id guard**: after all tables are read (full runs only, not `--table`), the sync
+aborts if the same Level+Word exists in two tables. `id = sha256(level|word)` has no table
+component, so such a pair would share one id — harmless inside D1, but corrupting everywhere
+ids are global (the audio cache, pack members, the image decisions store). The same guard runs
+in `audio_sync.py` and `media_replace.py`.
 
 ### Step 3 — Compute row identity and content hash
 
@@ -282,6 +290,12 @@ python audio_sync.py --prune-files # also delete orphaned per-word MP3s from R2
 | `--prune-files` | **After** uploading, delete `audio/files/<hash>.mp3` objects in R2 that the current vocabulary no longer references (orphans). Opt-in, since it deletes. Skipped under `--dry-run`. |
 | `-v` / `-q` | Verbose / quiet logging. |
 
+**Targeted replacements**: committed per-clip overrides in `sync/audio_overrides.json`
+(written by `media_replace.py --approve`, see the media-replacement section) are applied
+during collection — a replaced clip gets a new recipe hash (take/voice/hint) and flows
+through synthesis, packing and publish like any changed word. Clips without an override
+are hash-identical to before the feature existed.
+
 What it does:
 1. Reads every table; for each word derives `(text, voice)` — nouns spoken as
    `"<article> <word>"`, other types as the bare word — and an `audio_hash` of
@@ -395,3 +409,67 @@ everything goes to review; no Content Safety → a one-time warning).
 `python sync.py` (text) → `python image_sync.py` (images) → `python image_review.py` (the uncertain
 ones) → commit `image_decisions.json`. **No worker deploy needed** — images ride the existing
 `/v1/audio/*` endpoints. Build the app in Xcode.
+
+---
+
+## Targeted media replacement (`media_replace.py`)
+
+Redo the audio and/or image for SPECIFIC words, driven by a backlog sheet:
+`data/media_replacements.xlsx`. Add a row whenever you notice a bad clip or picture; run the
+tool whenever you like. The tool records intent and previews — the normal pipelines
+(`audio_sync.py`, `image_sync.py`, `image_review.py`) do the heavy work.
+
+### Sheet columns
+
+| Column | Who fills it | Meaning |
+|--------|--------------|---------|
+| `Word`, `Type` | you | Identify the word (`die Stadt` and `Stadt` both work). Type = `noun`/`verb`/`adjective`/`adverb` and picks the table. |
+| `Level (auto)` | tool | Filled on resolution. Fill it yourself only when the tool reports the word exists at several levels. |
+| `Replace_Audio` / `Replace_Image` | you | Mark either or both with `x`. |
+| `Audio_Variants` | you | Which clips: `all` (default) / `singular` / `plural` / `sentence` / `a+b` combos. |
+| `Voice` | you | Optional exact Azure voice pin. Default: each take **rotates to a different voice** within the word's gender-appropriate pool — same text + same neural voice would reproduce the same bad clip. |
+| `Pronunciation_Hint` | you | Optional respelling substituted for the word in all spoken text (fixes mispronunciations). |
+| `Image_Note` | you | Optional feedback appended to the image-generation prompt (persists like reviewer notes). |
+| `Status` | tool | Lifecycle text. **Clear it to request another round** (reject a preview / re-replace). |
+
+### Audio lifecycle (preview → approve → publish)
+
+1. `python media_replace.py` — resolves the word, synthesizes the next take into
+   `data/media_preview/` (file names carry variant, take and voice), Status = `PREVIEW`.
+2. Listen. Bad? Clear Status and re-run — the take advances, the voice rotates again.
+3. `python media_replace.py --approve` (optionally `--approve Hund "die Stadt"`) — commits the
+   take to **`sync/audio_overrides.json`**. **Commit this file to git** — a machine without it
+   reverts every replacement on its next audio_sync run.
+4. `python audio_sync.py` — synthesizes and publishes through the normal pipeline. Only packs
+   containing replaced clips re-upload; installed apps re-download only those packs.
+   The old master becomes an orphan (`--prune-files` cleans it).
+
+The take enters the audio recipe hash, which is what makes replacement propagate: recipe hash →
+pack hash → manifest version → client re-download. Clips without an override hash byte-identically
+to before this feature existed (tested), so nothing else ever re-ships.
+
+### Image lifecycle (zero-gap swap)
+
+1. `python media_replace.py` — marks the word's decision `replace_requested`. The **current
+   image keeps shipping** (nothing is deleted); Status = `queued`.
+2. `python image_sync.py` — generates fresh candidates (with your `Image_Note`), queues review.
+   The approved record survives; packs still carry the old image.
+3. `python image_review.py` — pick one: the decision is overwritten, the next publish swaps the
+   image, the old master becomes an orphan. Status = `done ✓`. If the round produced nothing
+   usable, the current image is kept and the request cleared (`kept current`).
+   The reviewer's "no sentence" / "regenerate with note" actions now also keep an approved
+   image live while the next round runs.
+
+### Flags
+
+| Flag | Meaning |
+|------|---------|
+| `--approve [WORD …]` | Approve previewed audio takes (all previews, or only the named words). |
+| `--dry-run` | Full resolution + planned actions report; changes nothing. |
+| `--audio-only` / `--images-only` | Process only that side of the marks. |
+
+The tool never touches R2 and needs no R2 credentials; audio previews need the Azure Speech
+keys. Rows that fail validation (unknown word, ambiguous level, image on a non-noun, invalid
+variant/voice, duplicate row) get their error in `Status` and never block other rows; the run
+exits non-zero. State files: `sync/audio_overrides.json` (committed — approved takes),
+`data/media_preview/state.json` (local — preview takes + progress markers).

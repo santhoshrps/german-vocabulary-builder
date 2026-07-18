@@ -222,17 +222,50 @@ def sentence_synthesis_for(row: dict[str, Any]) -> tuple[str, str] | None:
     return _variant_text_voice(row.get("german_sentence"))
 
 
-def audio_hash(text: str, voice: str) -> str:
+def audio_hash(text: str, voice: str, take: int = 0) -> str:
     """Deterministic hash of the synthesis *input* (text + voice + recipe).
 
     Lets the pipeline decide whether a word needs (re)synthesis WITHOUT calling
     the TTS service: same input -> same hash -> reuse the cached MP3. Changing a
     word's example sentence (which is not part of the spoken text) does not change
     this hash, so audio is not needlessly regenerated.
+
+    `take` is the per-word re-take counter (audio_overrides.json). take=0 MUST
+    hash exactly as before the parameter existed — anything else would re-ship
+    the entire audio set — so it only enters the payload when non-zero.
     """
     corrected = apply_phoneme_corrections(text)
     payload = f"{ENGINE_VERSION}|{voice}|{RATE}|{VOLUME}|{PITCH}|{corrected}"
+    if take:
+        payload += f"|take{take}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def rotated_voice(base_voice: str, pool: list[str], take: int) -> str:
+    """The voice for re-take N of a clip: walk the enabled pool starting from the
+    base pick, so every take is guaranteed a DIFFERENT voice from the previous one
+    (same text + same neural voice would reproduce a nearly identical — equally
+    bad — clip). Deterministic: (base_voice, take) alone decides, no history
+    needed, so preview and publish always agree. Wraps after len(pool) takes.
+    """
+    if take <= 0:
+        return base_voice
+    allowed = [v for v in pool if v not in DISABLED_VOICES]
+    if base_voice not in allowed or len(allowed) < 2:
+        return base_voice
+    return allowed[(allowed.index(base_voice) + take) % len(allowed)]
+
+
+def voice_pool_for(table: str, row: dict[str, Any], variant: str) -> list[str]:
+    """The pool the base voice for this clip was picked from — needed to rotate
+    within the same (gender-appropriate) pool on a re-take. Mirrors the pick
+    logic in synthesis_for/_variant_text_voice exactly."""
+    if variant == "singular" and table == "nouns":
+        art = (row.get("article") or "").strip().lower()
+        if art not in ("der", "die", "das"):
+            art = detect_gender_fallback((row.get("word") or "").strip())
+        return {"der": MASCULINE_VOICES, "die": FEMININE_VOICES, "das": NEUTER_VOICES}[art]
+    return ALL_VOICES
 
 
 def _ssml(text: str, voice: str) -> str:

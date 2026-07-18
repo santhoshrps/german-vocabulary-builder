@@ -164,10 +164,20 @@ def compute_content_hash(row: dict[str, Any]) -> str:
 # Excel reading and validation
 # ---------------------------------------------------------------------------
 
-def read_excel(table: str) -> list[dict[str, Any]]:
+def read_excel(
+    table: str,
+    skip_invalid: bool = False,
+) -> tuple[list[dict[str, Any]], int, set[str]]:
     """Read and validate the Excel file for a table.
 
-    Raises ValidationError on any structural or row-level problem.
+    Returns (valid_rows, skipped_row_count, protected_ids).
+
+    Structural problems (missing file, bad headers, ...) always raise
+    ValidationError. Row-level problems raise too by default; with
+    skip_invalid=True the offending rows are skipped with a warning instead,
+    and the sync continues with the valid rows. protected_ids holds the ids of
+    skipped rows whose Level+Word were still computable — the diff must NOT
+    delete their existing DB counterparts just because the row was skipped.
     """
     filename, headers = TABLE_CONFIG[table]
     path = DATA_DIR / filename
@@ -238,6 +248,8 @@ def read_excel(table: str) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         validation_errors: list[str] = []
+        skipped_rows = 0
+        protected_ids: set[str] = set()
 
         for row_num, raw_row in enumerate(rows_iter, start=2):  # row 1 is the header
             # Silently skip completely blank rows
@@ -290,6 +302,11 @@ def read_excel(table: str) -> list[dict[str, Any]]:
 
             if row_errors:
                 validation_errors.extend(row_errors)
+                skipped_rows += 1
+                # If the row's identity (Level+Word) is intact, remember its id so
+                # the diff won't delete the previously-synced DB row for this word.
+                if word_raw and VALID_LEVEL.match(level_str):
+                    protected_ids.add(compute_id(level_str, str(word_raw)))
                 continue
 
             row_id = compute_id(level_str, str(word_raw))
@@ -321,17 +338,43 @@ def read_excel(table: str) -> list[dict[str, Any]]:
             rows.append(record)
 
         if validation_errors:
-            raise ValidationError(
-                f"'{filename}' has {len(validation_errors)} validation error(s):\n"
-                + "\n".join(validation_errors)
+            if not skip_invalid:
+                raise ValidationError(
+                    f"'{filename}' has {len(validation_errors)} validation error(s):\n"
+                    + "\n".join(validation_errors)
+                    + "\n  (re-run with --skip-invalid to skip these rows and sync the rest)"
+                )
+            logger.warning(
+                "'%s': skipping %d invalid row(s) (--skip-invalid):\n%s",
+                filename, skipped_rows, "\n".join(validation_errors),
             )
 
         if not rows:
             raise ValidationError(f"'{filename}' contains no valid data rows.")
 
-        return rows
+        return rows, skipped_rows, protected_ids
     finally:
         wb.close()
+
+
+def find_cross_table_id_collisions(rows_by_table: dict[str, list[dict[str, Any]]]) -> list[str]:
+    """Same Level+Word appearing in TWO tables. compute_id has no table component, so such a
+    pair shares one id — harmless inside D1 (separate tables) but corrupting everywhere ids are
+    global: the audio cache, pack members, and the image decisions store. Zero occurrences in
+    the data today; this guard keeps it that way. Returns human-readable problem lines."""
+    seen: dict[str, tuple[str, str, str]] = {}
+    problems: list[str] = []
+    for table, rows in rows_by_table.items():
+        for row in rows:
+            prev = seen.get(row["id"])
+            if prev is not None and prev[0] != table:
+                problems.append(
+                    f"id {row['id']}: '{prev[2]}' ({prev[1]}, {prev[0]}) collides with "
+                    f"'{row['word']}' ({row['level']}, {table})"
+                )
+            else:
+                seen[row["id"]] = (table, row["level"], row["word"])
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -460,13 +503,13 @@ def _confirm_large_change(table: str, total: int, counts: dict[str, int]) -> boo
 def sync_table(
     client: httpx.Client,
     table: str,
+    excel_rows: list[dict[str, Any]],
+    skipped: int,
+    protected_ids: set[str],
     dry_run: bool,
 ) -> dict[str, int]:
-    """Sync one table. Returns counts of inserted, updated, and deleted rows."""
+    """Sync one table from its pre-read Excel rows. Returns change counts."""
     logger.info("\n[%s]", table)
-
-    logger.debug("  Reading and validating Excel...")
-    excel_rows = read_excel(table)
     logger.info("  %d valid rows in Excel.", len(excel_rows))
 
     logger.debug("  Fetching DB state...")
@@ -474,7 +517,22 @@ def sync_table(
     logger.info("  %d rows in DB.", len(db_state))
 
     to_insert, to_update, to_delete = compute_diff(excel_rows, db_state)
-    counts = {"inserted": len(to_insert), "updated": len(to_update), "deleted": len(to_delete)}
+
+    # A skipped row must not read as "removed from Excel": keep its DB row as-is.
+    preserved = [row_id for row_id in to_delete if row_id in protected_ids]
+    if preserved:
+        to_delete = [row_id for row_id in to_delete if row_id not in protected_ids]
+        logger.warning(
+            "  %d DB row(s) correspond to skipped Excel rows — preserving them, not deleting.",
+            len(preserved),
+        )
+
+    counts = {
+        "inserted": len(to_insert),
+        "updated": len(to_update),
+        "deleted": len(to_delete),
+        "skipped": skipped,
+    }
 
     logger.info(
         "  Diff: %d to add, %d to update, %d to delete.",
@@ -514,6 +572,14 @@ def main() -> None:
         help="Show what would change without writing anything to the DB.",
     )
     parser.add_argument(
+        "--skip-invalid",
+        action="store_true",
+        help="Skip rows that fail row-level validation (empty required fields, "
+             "bad Level, ...) and sync the remaining valid rows, instead of "
+             "failing the whole table. Skipped words keep their existing DB row "
+             "if they have one. Structural errors still fail the table.",
+    )
+    parser.add_argument(
         "--table",
         choices=list(TABLE_CONFIG.keys()),
         metavar="TABLE",
@@ -550,18 +616,35 @@ def main() -> None:
     if args.dry_run:
         logger.info("[DRY RUN] No changes will be written to the DB.")
 
-    totals: dict[str, int] = {"inserted": 0, "updated": 0, "deleted": 0}
+    totals: dict[str, int] = {"inserted": 0, "updated": 0, "deleted": 0, "skipped": 0}
     failures: list[str] = []
     aborted: list[str] = []
 
+    # Read + validate ALL tables first so the cross-table id guard sees the whole
+    # dataset before anything is written. A table that fails validation is skipped
+    # (recorded as a failure); the others still sync.
+    excel: dict[str, tuple[list[dict[str, Any]], int, set[str]]] = {}
+    for table in tables:
+        try:
+            excel[table] = read_excel(table, skip_invalid=args.skip_invalid)
+        except ValidationError as exc:
+            logger.error("%s: %s", table, exc)
+            failures.append(table)
+
+    if len(excel) > 1:
+        problems = find_cross_table_id_collisions({t: rows for t, (rows, _, _) in excel.items()})
+        if problems:
+            logger.error(
+                "Cross-table id collision(s) — the same Level+Word exists in two tables. "
+                "These would corrupt the audio cache and image decisions (ids are global there). "
+                "Fix the data; nothing was synced:\n  %s", "\n  ".join(problems),
+            )
+            sys.exit(1)
+
     with httpx.Client(event_hooks={"request": [_sign_request]}) as client:
-        for table in tables:
+        for table, (rows, skipped, protected_ids) in excel.items():
             try:
-                result = sync_table(client, table, dry_run=args.dry_run)
-            except ValidationError as exc:
-                logger.error("%s: %s", table, exc)
-                failures.append(table)
-                continue
+                result = sync_table(client, table, rows, skipped, protected_ids, dry_run=args.dry_run)
             except httpx.HTTPError as exc:
                 logger.error("%s: request failed: %s", table, exc)
                 failures.append(table)
@@ -578,6 +661,8 @@ def main() -> None:
     print(f"  Added   : {totals['inserted']}")
     print(f"  Updated : {totals['updated']}")
     print(f"  Deleted : {totals['deleted']}")
+    if totals["skipped"]:
+        print(f"  Skipped : {totals['skipped']} invalid row(s) — NOT synced (see warnings above)")
     if aborted:
         print(f"  Aborted : {len(aborted)} table(s) — {', '.join(aborted)} (not uploaded)")
     if failures:

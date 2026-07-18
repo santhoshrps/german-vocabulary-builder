@@ -50,7 +50,6 @@ load_dotenv(Path(__file__).parent / ".env")
 
 logger = logging.getLogger("image_sync")
 
-REVIEW_QUEUE_PATH = cfg.REVIEW_DIR / "review_queue.json"
 SAVE_EVERY = 20  # checkpoint decisions+queue this often so a crash never loses sourcing/review work
 
 
@@ -63,7 +62,7 @@ def collect_nouns(include_unflagged: bool = False) -> list[dict[str, Any]]:
     x or y → row['image'] == 1). With include_unflagged=True, every noun is returned — used both by
     `--include-unflagged` sourcing and, always, for packing/pruning so an approved unflagged noun is
     shipped and never pruned on a marked-only run."""
-    rows = sync.read_excel("nouns")
+    rows, _, _ = sync.read_excel("nouns")
     if include_unflagged:
         return rows
     return [r for r in rows if r.get("image") == 1]
@@ -90,21 +89,11 @@ def _ensure_master_local(client, bucket: str | None, content_hash: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Review queue (non-committed; candidates live in the local master cache)
+# Review queue (IO lives in image_decisions — one implementation for all tools)
 # ---------------------------------------------------------------------------
 
-def _load_review_queue() -> dict[str, Any]:
-    try:
-        return json.loads(REVIEW_QUEUE_PATH.read_text("utf-8"))
-    except FileNotFoundError:
-        return {}
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def _save_review_queue(queue: dict[str, Any]) -> None:
-    cfg.REVIEW_DIR.mkdir(parents=True, exist_ok=True)
-    REVIEW_QUEUE_PATH.write_text(json.dumps(queue, indent=2, ensure_ascii=False) + "\n", "utf-8")
+_load_review_queue = image_decisions.load_review_queue
+_save_review_queue = image_decisions.save_review_queue
 
 
 def _queue_entry(noun: dict[str, Any], outcome) -> dict[str, Any]:
@@ -150,9 +139,15 @@ def _source_pass(nouns, store, queue, opts, *, client, bucket, dry_run, limit, f
         # (Re)generate when the content changed or is new (approved/none/review all re-trigger on a
         # changed fingerprint). A noun already settled for its current content is NOT regenerated —
         # except a `review` noun whose queued candidates were lost, which we repopulate.
+        rec = store.get(n["id"]) or {}
+        if rec.get("replace_requested"):
+            # Zero-gap replacement: candidates already generated for the CURRENT content and
+            # waiting in the review queue count as done for this round; anything else
+            # (not queued yet, queue lost, content edited since) generates a fresh round.
+            return not (n["id"] in queue
+                        and rec.get("replace_fingerprint") == image_decisions.input_fingerprint(n))
         if image_decisions.needs_processing(store, n):
             return True
-        rec = store.get(n["id"]) or {}
         return rec.get("status") == "review" and n["id"] not in queue
 
     todo = [n for n in nouns if _should_generate(n)]
@@ -221,15 +216,35 @@ def _source_pass(nouns, store, queue, opts, *, client, bucket, dry_run, limit, f
         elif outcome.status == "review":
             for pc in outcome.candidates:
                 _write_master(pc.master, pc.content_hash)  # local masters; review server transcodes to JPEG
-            image_decisions.mark_review(store, noun, today)
+            rec = store.get(nid) or {}
+            if rec.get("status") == "approved" and rec.get("replace_requested"):
+                # Zero-gap replacement: KEEP the approved record (the current image keeps
+                # shipping) while the fresh candidates await review. Stamp the fingerprint
+                # the candidates were generated for so a later content edit re-triggers.
+                rec["replace_fingerprint"] = image_decisions.input_fingerprint(noun)
+                rec["updated"] = today
+            else:
+                image_decisions.mark_review(store, noun, today)
             queue[nid] = _queue_entry(noun, outcome)
         elif outcome.status == "error":
             # Generation FAILED — do NOT settle. Leave the decision untouched so the next run's
             # _should_generate() picks it up again. (No queue/store mutation here on purpose.)
             pass
         else:  # "none" — a clean miss (e.g. content-safety blocked): settle so we don't loop forever.
-            image_decisions.mark_none(store, noun, today)
-            queue.pop(nid, None)
+            rec = store.get(nid) or {}
+            if rec.get("status") == "approved" and rec.get("replace_requested"):
+                # Replacement round produced nothing usable — keep the existing image rather
+                # than shipping a blank. Clear the request so we don't loop forever; asking
+                # again (media_replace row or reviewer note) starts a fresh round.
+                rec.pop("replace_requested", None)
+                rec.pop("replace_fingerprint", None)
+                rec["updated"] = today
+                queue.pop(nid, None)
+                logger.info("  replacement for %s produced nothing — keeping the current image",
+                            noun.get("word", nid))
+            else:
+                image_decisions.mark_none(store, noun, today)
+                queue.pop(nid, None)
         stats[outcome.status] = stats.get(outcome.status, 0) + 1
 
         if i % SAVE_EVERY == 0:
@@ -469,7 +484,9 @@ def run(*, dry_run: bool, no_source: bool, limit: int, force: bool, prune_files:
             logger.info("Flagged %d newly-approved word(s) as 'y' (red) in nouns.xlsx — run `python sync.py` "
                         "to propagate the image flag to D1.", newly)
 
-    n_review = sum(1 for r in store.values() if r.get("status") == "review")
+    # Queue length, not store status: a zero-gap replacement awaits review while its
+    # store record stays "approved" (the old image keeps shipping).
+    n_review = len(queue)
     if n_review:
         logger.info("%d noun(s) await review — run: python image_review.py", n_review)
 
