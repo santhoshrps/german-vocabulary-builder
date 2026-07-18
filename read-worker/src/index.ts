@@ -821,6 +821,63 @@ export default {
         const claims = await requireSession(env, request);
         return await handleFeedback(env, request, claims);
       }
+      // ---- Media v2 (MS2-FR-3/20): channel manifests + immutable catalogs ----
+      // The channel manifest is a small pointer set (media/channels/<live|beta>.json);
+      // catalogs are immutable content-suffixed objects, served with long cache
+      // lifetimes keyed by their own key. Catalog METADATA is served to any
+      // authenticated session (entries carry the free flag; the byte-level paywall
+      // stays on packs/files, same doctrine as search's whole-vocabulary teaser).
+      if (request.method === "GET" && route === "media" && sub === "channel") {
+        const claims = await requireSession(env, request);
+        if (!(await rateLimit(env, `mediachannel:${rateSubjectKey(claims, ip)}`, 60, 600, nowSeconds()))) {
+          throw new HttpError(429, "rate limited");
+        }
+        if (!env.MEDIA) throw new HttpError(503, "media storage not configured");
+        const channel = url.searchParams.get("channel") === "beta" ? "beta" : "live";
+        const obj = await env.MEDIA.get(`media/channels/${channel}.json`);
+        if (!obj) throw new HttpError(404, "channel not published");
+        return new Response(await obj.text(), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=60" },
+        });
+      }
+      if (request.method === "GET" && route === "media" && sub === "catalog") {
+        const claims = await requireSession(env, request);
+        if (!(await rateLimit(env, `mediacatalog:${rateSubjectKey(claims, ip)}`, 60, 600, nowSeconds()))) {
+          throw new HttpError(429, "rate limited");
+        }
+        if (!env.MEDIA) throw new HttpError(503, "media storage not configured");
+        const kind = (parts[3] || "").toLowerCase();
+        if (!/^[a-z0-9]{1,20}$/.test(kind)) throw new HttpError(400, "invalid kind");
+        const channel = url.searchParams.get("channel") === "beta" ? "beta" : "live";
+        const chObj = await env.MEDIA.get(`media/channels/${channel}.json`);
+        if (!chObj) throw new HttpError(404, "channel not published");
+        const manifest = JSON.parse(await chObj.text()) as {
+          catalogs?: Record<string, { key?: string; sha?: string }>;
+        };
+        const meta = manifest.catalogs?.[kind];
+        // Defense-in-depth: the key must stay inside the catalog prefix.
+        if (!meta?.key || !meta.key.startsWith("media/catalog/")) {
+          throw new HttpError(404, "no such catalog");
+        }
+        const cacheKey = new Request(`https://read-cache.internal/${meta.key}`, { method: "GET" });
+        const cache = caches.default;
+        const hit = await cache.match(cacheKey);
+        if (hit) return hit;
+        const obj = await env.MEDIA.get(meta.key);
+        if (!obj) throw new HttpError(404, "catalog object missing");
+        const response = new Response(await obj.text(), {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+            // Immutable content-suffixed object: cache hard; a new catalog is a NEW key.
+            "Cache-Control": "public, max-age=86400, immutable",
+            ...(meta.sha ? { ETag: `"${meta.sha}"` } : {}),
+          },
+        });
+        ctx.waitUntil(cache.put(cacheKey, response.clone()));
+        return response;
+      }
       if (request.method === "GET" && route === "audio" && sub === "manifest") {
         const claims = await requireSession(env, request);
         if (!(await rateLimit(env, `audiomanifest:${rateSubjectKey(claims, ip)}`, 60, 600, nowSeconds()))) {
