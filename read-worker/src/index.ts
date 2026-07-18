@@ -6,6 +6,7 @@ import {
   searchCapEnforced, takeSearchRequest, refundSearchRequest, FREE_SEARCH_REQUEST_CAP,
 } from "./limits";
 import { opsQuery } from "./db";
+import { issueGrants, serveFile, GRANTS_MAX_IDS } from "./mediafiles";
 import { healthReport } from "./health";
 import { serveCachedByVersion } from "./cache";
 import { resolveChain, chainKey } from "./languages";
@@ -820,6 +821,30 @@ export default {
       if (request.method === "POST" && route === "feedback") {
         const claims = await requireSession(env, request);
         return await handleFeedback(env, request, claims);
+      }
+      // Per-file delivery (MS2-FR-6): the grant token IS the authorization — no
+      // session needed here (grants are minted only to authenticated, entitled
+      // sessions below, and expire in minutes).
+      if (request.method === "GET" && route === "media" && sub === "file") {
+        const kind = parts[3] || "";
+        const hash = (parts[4] || "").toLowerCase();
+        return await serveFile(env, ctx, kind, hash,
+                               url.searchParams.get("e"), url.searchParams.get("g"), nowSeconds());
+      }
+      // Batch grants (MS2-FR-6): entitlement checked per file against the catalog.
+      if (request.method === "POST" && route === "media" && sub === "grants") {
+        const claims = await requireSession(env, request);
+        if (!(await rateLimit(env, `mediagrants:${rateSubjectKey(claims, ip)}`, 30, 600, nowSeconds()))) {
+          throw new HttpError(429, "rate limited");
+        }
+        const body = await request.json<{ ids?: unknown }>().catch(() => ({} as { ids?: unknown }));
+        const ids = Array.isArray(body.ids)
+          ? body.ids.filter((x): x is string => typeof x === "string").slice(0, GRANTS_MAX_IDS)
+          : [];
+        if (ids.length === 0) throw new HttpError(400, "no ids");
+        const result = await issueGrants(env, scopeOf(claims), ids, nowSeconds());
+        console.log(JSON.stringify({ evt: "MEDIATRACE grants", n: result.grants.length, denied: result.denied.length }));
+        return json(result);
       }
       // ---- Media v2 (MS2-FR-3/20): channel manifests + immutable catalogs ----
       // The channel manifest is a small pointer set (media/channels/<live|beta>.json);
