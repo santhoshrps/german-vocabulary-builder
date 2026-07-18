@@ -334,6 +334,17 @@ export async function searchWord(
   return hits;
 }
 
+// ---- Identity aliases -------------------------------------------------------
+// The v1 -> v2 re-key map (WD-ID-4/5), served whole: ~12k tiny rows, one edge-
+// cached fetch per dataset version per client. The app applies it after every
+// sync (ONGOING, not one-time — late sheet fixes still re-attach progress).
+export async function getAliases(env: Env): Promise<{ old: string; new: string; reason: string }[]> {
+  const res = await readOnlySelect(env,
+    'SELECT id AS old_id, new_id, reason FROM id_aliases'
+  ).all<{ old_id: string; new_id: string; reason: string }>();
+  return res.results.map((r) => ({ old: r.old_id, new: r.new_id, reason: r.reason }));
+}
+
 // (Search-usage accounting lives in limits.ts — it writes to the OPS database;
 // this file is the content layer and holds no write path at all. MS2-FR-29b.)
 

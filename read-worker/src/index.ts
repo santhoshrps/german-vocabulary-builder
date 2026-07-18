@@ -13,6 +13,7 @@ import { verifyAttestation, verifyAssertion, attestationRequired } from "./appat
 import { verifyPromoCode, verifyStoreKitTransaction, storeKitXcodeMode, claimPromoDevice, Entitlement, Scope } from "./entitlement";
 import {
   getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP, searchWord,
+  getAliases,
 } from "./data";
 import {
   loadManifest, scopedManifest, allowedPacks, normalizePackName, getPackObject,
@@ -795,6 +796,15 @@ export default {
         const claims = await requireSession(env, request);
         await requireFreshAssertion(env, request, claims);
         return await handleSnapshot(env, request, ctx, scopeOf(claims));
+      }
+      // Identity re-key map (WD-ID-4/5): id_aliases as one cached JSON body.
+      if (request.method === "GET" && route === "aliases") {
+        const claims = await requireSession(env, request);
+        const version = await getVersion(env, scopeOf(claims));
+        return await serveCachedByVersion(request, ctx, `${version}:aliases`, "aliases", 3600, async () => ({
+          body: JSON.stringify({ version, aliases: await getAliases(env) }),
+          contentType: "application/json",
+        }));
       }
       if (request.method === "GET" && route === "search") {
         const claims = await requireSession(env, request);
