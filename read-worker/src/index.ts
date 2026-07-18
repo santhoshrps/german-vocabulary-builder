@@ -358,8 +358,11 @@ async function requireFreshAssertion(
 
 async function handleVersion(env: Env, scope: Scope): Promise<Response> {
   const version = await getVersion(env, scope);
-  return json({ version }, 200, {
-    ETag: `"${version}"`,
+  // minClient: the forward-compat floor (MS2-FR-23). Clients compare it to their
+  // own content-schema generation and show a friendly update prompt when behind.
+  const minClient = parseInt(env.MIN_CLIENT_GENERATION ?? "1", 10) || 1;
+  return json({ version, minClient }, 200, {
+    ETag: `"${version}:${minClient}"`,
     "Cache-Control": "public, max-age=30",
   });
 }

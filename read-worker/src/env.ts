@@ -21,6 +21,11 @@ export interface Env {
   // (`wrangler deploy --var DEPLOY_VERSION:<sha>`), reported by /health. Absent
   // only on ad-hoc deploys, which the deploy script exists to prevent.
   DEPLOY_VERSION?: string;
+  // Forward-compat floor (MS2-FR-23): the minimum app content-schema generation
+  // this backend still serves. Bumped ONLY for a truly breaking content change;
+  // older apps then show a friendly "update the app" state instead of failing
+  // weirdly. Absent → 1.
+  MIN_CLIENT_GENERATION?: string;
   APP_TEAM_ID: string;
   APP_BUNDLE_ID: string;
   ENTITLEMENT_PRODUCT_IDS: string;

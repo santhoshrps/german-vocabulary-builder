@@ -56,6 +56,8 @@ ENTITLEMENT_PRODUCT_IDS = "com.ramapurampalanivel.germanwords.fullaccess.lifetim
 # usable for a small window; the client renews on demand in the foreground (it reads `expiresIn`,
 # so this is transparent — no app change) and never renews in the background.
 SESSION_TTL_SECONDS = "600"
+# Forward-compat floor (MS2-FR-23): bump ONLY for a breaking content change.
+MIN_CLIENT_GENERATION = "1"
 # App Attest environment: "production" or "development".
 APP_ATTEST_ENV = "production"
 # StoreKit environment. "production" verifies transactions against Apple's Root CA.
@@ -111,6 +113,8 @@ APP_TEAM_ID = "3VF33Y593F"
 APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
 ENTITLEMENT_PRODUCT_IDS = "com.ramapurampalanivel.germanwords.fullaccess.lifetime"
 SESSION_TTL_SECONDS = "600"
+# Forward-compat floor (MS2-FR-23): bump ONLY for a breaking content change.
+MIN_CLIENT_GENERATION = "1"
 # App Attest development mode: accepts development-environment attestations from
 # Xcode builds AND production-environment attestations from TestFlight builds whose
 # user flipped the in-app Environment switch (MS2-FR-31).
@@ -152,6 +156,8 @@ APP_TEAM_ID = "3VF33Y593F"
 APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
 ENTITLEMENT_PRODUCT_IDS = "com.ramapurampalanivel.germanwords.fullaccess.lifetime"
 SESSION_TTL_SECONDS = "600"
+# Forward-compat floor (MS2-FR-23): bump ONLY for a breaking content change.
+MIN_CLIENT_GENERATION = "1"
 APP_ATTEST_ENV = "development"
 STOREKIT_ENV = "xcode"
 R2_ACCOUNT_ID = "50163e5bf5ee8a574fb5e2dd442e38ed"
