@@ -63,6 +63,24 @@ CREATE TABLE IF NOT EXISTS feedback (
 
 CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback (status, created_at);
 
+-- Content reports (words.md WD-REP-5): a learner flagged a clip/picture/card at the
+-- moment they met it. Stored pending for MANUAL curator review — never auto-acted-on;
+-- the fix flows through the normal content pipeline and the curator closes the row.
+CREATE TABLE IF NOT EXISTS content_reports (
+  id          TEXT PRIMARY KEY,                       -- random uuid
+  word_id     TEXT NOT NULL,                          -- the word's stable id (v2, 16 hex)
+  kind        TEXT NOT NULL,                          -- 'word' | 'plural' | 'sentence' | 'image' | 'card'
+  reason      TEXT,                                   -- fixed reason slug (media reports); NULL for card
+  comment     TEXT,                                   -- optional sanitized free text, <= 500 chars
+  fingerprint TEXT,                                   -- content hash of the reported file (stale-report detection)
+  subject     TEXT NOT NULL,                          -- session subject (rate-limit key only, no PII)
+  app_version TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'pending',        -- 'pending' | 'reviewed'
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_content_reports_status ON content_reports (status, created_at);
+
 -- Per-device lifetime count of free-tier search requests (cap enforced in prod only).
 CREATE TABLE IF NOT EXISTS search_usage (
   device_id     TEXT PRIMARY KEY,                     -- devices.device_id

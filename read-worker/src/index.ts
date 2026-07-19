@@ -620,6 +620,74 @@ function sanitizeFeedback(s: string): string {
   return s.replace(/[^\p{L}\p{N} .,!?;:'"()\-–—\n]/gu, "").trim().slice(0, FEEDBACK_TEXT_MAX);
 }
 
+// Content reports (words.md WD-REP-5): a learner flagged a clip/picture/card. Same write
+// discipline as /submissions and /feedback — session-authenticated, per-field validated,
+// burst + daily capped per subject, stored 'pending' for MANUAL curator review only.
+interface ReportBody {
+  word_id?: string;
+  kind?: string;
+  reason?: string;
+  comment?: string;
+  fingerprint?: string;
+  app_version?: string;
+}
+
+const REPORT_KINDS = new Set(["word", "plural", "sentence", "image", "card"]);
+const REPORT_REASONS = new Set([
+  "sounds-wrong", "mismatch", "poor-quality",   // audio (WD-REP-2)
+  "inappropriate",                              // picture adds this; shares the other two
+]);
+
+async function handleContentReport(
+  env: Env, request: Request, claims: SessionClaims
+): Promise<Response> {
+  const body = (await request.json().catch(() => null)) as ReportBody | null;
+  const ip = clientIp(request);
+
+  // Identity fields are strict: a malformed word id / kind is a rejected report (there
+  // is nothing reviewable without them). Reason must be a known slug on media reports;
+  // the card report carries free text instead (comment) and no reason.
+  const wordId = (body?.word_id || "").toLowerCase();
+  if (!/^[0-9a-f]{16}$/.test(wordId)) throw new HttpError(400, "invalid word id");
+  const kind = body?.kind || "";
+  if (!REPORT_KINDS.has(kind)) throw new HttpError(400, "invalid kind");
+  const reason = body?.reason || "";
+  if (kind === "card") {
+    if (reason) throw new HttpError(400, "card reports carry no reason");
+  } else if (!REPORT_REASONS.has(reason)) {
+    throw new HttpError(400, "invalid reason");
+  }
+  const comment = sanitizeFeedback(body?.comment || "");
+  if (kind === "card" && comment.length < 2) throw new HttpError(400, "missing text");
+  const fingerprint = /^[0-9a-f]{16,64}$/.test(body?.fingerprint || "")
+    ? (body!.fingerprint as string) : null;
+  const appVersion = /^[0-9]+(\.[0-9]+){0,3}$/.test(body?.app_version || "")
+    ? (body!.app_version as string) : "unknown";
+
+  const key = rateSubjectKey(claims, ip);
+  // Burst: a handful per 10 minutes; daily cap bounds sustained flooding (WD-REP-5).
+  if (!(await rateLimit(env, `reports:${key}`, 5, 600, nowSeconds()))) {
+    console.warn("report rate limited", { key });
+    throw new HttpError(429, "rate limited");
+  }
+  const recent = await opsQuery(env,
+    "SELECT COUNT(*) AS c FROM content_reports WHERE subject = ? AND created_at > datetime('now', '-1 day')"
+  ).bind(key).first<{ c: number }>();
+  if ((recent?.c ?? 0) >= 20) {
+    console.warn("report daily cap reached", { key });
+    throw new HttpError(429, "daily report limit reached");
+  }
+
+  await opsQuery(env,
+    `INSERT INTO content_reports (id, word_id, kind, reason, comment, fingerprint, subject, app_version, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+  ).bind(crypto.randomUUID(), wordId, kind, reason || null, comment || null,
+         fingerprint, key, appVersion).run();
+
+  console.log(JSON.stringify({ evt: "REPORT", kind, reason: reason || "-" }));
+  return json({ status: "received" }, 201);
+}
+
 // "Not enjoying" review feedback from the app (reviews.md RV-FR-FDBK). A write path like
 // /submissions: session-authenticated, per-field validated, rate-limited per subject, stored
 // as 'new' for manual operator review. D1 only — deliberately no e-mail/notification leg.
@@ -826,6 +894,11 @@ export default {
       if (request.method === "POST" && route === "feedback") {
         const claims = await requireSession(env, request);
         return await handleFeedback(env, request, claims);
+      }
+      // Content reports (words.md WD-REP-5): pending rows for manual curator review.
+      if (request.method === "POST" && route === "reports") {
+        const claims = await requireSession(env, request);
+        return await handleContentReport(env, request, claims);
       }
       // Per-file delivery (MS2-FR-6): the grant token IS the authorization — no
       // session needed here (grants are minted only to authenticated, entitled

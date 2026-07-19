@@ -61,6 +61,30 @@ scripts/backup-ops.sh install-schedule     read-worker/scripts/promo.sh --env X 
 - `/health` on every worker: env identity, deployed git SHA, missing/degraded
   config names. The deploy script asserts it after every deploy.
 
+## Custom domain switch-on (#33 — readiness checklist, not yet executed)
+
+The workers serve from `*.workers.dev` today. Moving to a custom domain (e.g.
+`api.<domain>` for prod, `api-dev.<domain>` / `api-test.<domain>`) is a config
+flip, prepared so it can happen without a breaking moment:
+
+1. **Zone**: add the domain to this Cloudflare account (nameservers moved).
+   TLS certificates and HTTP/3 come with the zone automatically.
+2. **Workers**: per environment in `read-worker/wrangler.toml` (and `worker/`),
+   add `routes = [{ pattern = "api.<domain>", custom_domain = true }]` to the
+   matching env block. Deploy via `scripts/deploy.sh` as always. The
+   `workers.dev` URL KEEPS serving — both names are bound; nothing breaks.
+3. **Verify**: `scripts/deploy.sh` wire-verifies against the URLs in its
+   `read_url()` helper — update those to the new hostnames in the same commit
+   that adds the routes (the typed prod gate applies as usual).
+4. **App**: `BackendEnvironment.readWorkerURL` constants switch to the new
+   hostnames in an ordinary release. Old installs keep working via workers.dev
+   until they update (additive transition, no floor bump needed).
+5. **Decommission**: after the fleet has moved (App Store analytics), set
+   `workers_dev = false` per env to retire the old names.
+6. **Not affected**: R2 presigned pack URLs (they point at the bucket host,
+   not the worker), App Attest (bundle-id bound, not host bound), session JWTs
+   (issuer is env-stamped, not host-stamped).
+
 ## Known limitations
 
 - Loudness (EBU R128) measurement in `qa` requires ffmpeg (`brew install ffmpeg`);
