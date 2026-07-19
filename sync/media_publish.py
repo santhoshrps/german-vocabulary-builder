@@ -589,16 +589,29 @@ def gc(env: envs.Environment, grace_days: int, apply: bool) -> None:
     client = media_delivery.r2_client()
     bucket = env.r2_bucket
     referenced: set[str] = set()
+
+    def _add_refs(manifest: dict | None) -> None:
+        if not manifest:
+            return
+        for meta in manifest.get("packs", {}).values():
+            # Content-suffixed key (v2) OR the name-derived legacy path, whichever a manifest
+            # carries — so gc never deletes a pack any manifest still points at (H8).
+            key = meta.get("key")
+            if not key and isinstance(meta, dict):
+                continue
+            referenced.add(key)
+        referenced.update(meta["key"] for meta in manifest.get("catalogs", {}).values() if meta.get("key"))
+
     for ch in CHANNELS:
-        m = _get_json(client, bucket, f"{CHANNELS_PREFIX}/{ch}.json")
-        if m:
-            referenced.update(meta["key"] for meta in m.get("packs", {}).values())
-            referenced.update(meta["key"] for meta in m.get("catalogs", {}).values())
+        _add_refs(_get_json(client, bucket, f"{CHANNELS_PREFIX}/{ch}.json"))
     for hist_key in _existing_keys(client, bucket, f"{CHANNELS_PREFIX}/history/"):
-        m = _get_json(client, bucket, hist_key)
-        if m:
-            referenced.update(meta["key"] for meta in m.get("packs", {}).values())
-            referenced.update(meta["key"] for meta in m.get("catalogs", {}).values())
+        _add_refs(_get_json(client, bucket, hist_key))
+    # H8: the legacy client manifest (audio/manifest.json) is a live serving pointer too — protect
+    # every pack it references so gc can never delete a pack the shipped app still downloads.
+    legacy = _get_json(client, bucket, LEGACY_MANIFEST_KEY)
+    if legacy:
+        for name, meta in legacy.get("packs", {}).items():
+            referenced.add(meta.get("key") or f"{PACKS_PREFIX}/{name}.pack")
 
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=grace_days)
     victims: list[str] = []

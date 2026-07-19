@@ -1,9 +1,11 @@
 """
-Image sync — orchestrate the noun-image pipeline and publish into the shared media manifest.
+Image GENERATION — orchestrate the noun-image pipeline: source, review-queue, approve into the
+decisions store + the durable R2 master mirror. Publishing packs/manifests is media_publish.py's
+job (it reads the decisions store). The old pack-publish path here rewrote the shared manifest with
+name-keyed metas and could clobber media_publish's output (audit 2026-07-19, H7); it was removed.
 
 Mirrors audio_sync.py: collect the flagged nouns, do only the work that's needed (idempotent via the
-decisions store), build the `image/<level>` + `image/free` packs from the approved images, and publish
-them through media_delivery (namespace-aware — preserves the audio packs).
+decisions store) — source each flagged noun's image and queue it for manual approval.
 
 Per noun (unless --no-source), the engine GENERATES the image(s) via Azure Foundry and queues EVERY
 image for manual review (no stock search, no auto-verify) — a person approves each in image_review.py.
@@ -11,14 +13,13 @@ Approved images are written to the local master cache AND mirrored to R2 (image/
 fresh checkout never re-generates. Re-runs skip everything already settled for its current content.
 
 Usage:
-  python image_sync.py                 # source what's needed, build + publish image packs
+  python image_sync.py                 # source what's needed into decisions + master mirror
   python image_sync.py --dry-run       # build/report locally, upload nothing
-  python image_sync.py --no-source     # skip sourcing; (re)build/publish from existing decisions+cache
+  python image_sync.py --no-source     # skip sourcing (reconcile/prune only)
   python image_sync.py --limit 50      # process at most 50 not-yet-settled nouns this run
   python image_sync.py --workers 4     # generate 4 nouns in parallel (errors retry, never settle)
   python image_sync.py --include-unflagged --limit 100  # also do nouns NOT marked x/y (big set — cap it)
   python image_sync.py --free-first    # generate the free-tier nouns before the rest
-  python image_sync.py --force         # re-upload every image pack (recovery)
   python image_sync.py --prune-files   # delete orphan image/files masters in R2
   python image_sync.py --delete-all    # RESET images to a clean slate (R2 images + local state; audio untouched)
 
@@ -285,53 +286,6 @@ def _source_pass(nouns, store, queue, opts, *, client, bucket, dry_run, limit, f
 # Pack build + publish
 # ---------------------------------------------------------------------------
 
-def _build_owned_packs(nouns, store, *, client, bucket, dry_run) -> dict[str, list[media_delivery.Member]]:
-    """Group approved images into image/<level> + image/free packs. Each member is keyed by the noun's
-    serverID and carries its content_hash + WebP bytes (hydrated from R2 if the local master is gone)."""
-    by_id = {n["id"]: n for n in nouns}
-    owned: dict[str, list[media_delivery.Member]] = {}
-    missing = 0
-    for nid, rec in image_decisions.approved(store).items():
-        noun = by_id.get(nid)
-        if noun is None:
-            continue  # approved but no longer flagged — will be pruned from decisions
-        h = rec["content_hash"]
-        if not dry_run and not _ensure_master_local(client, bucket, h):
-            logger.warning("  pack: skipping %s — master %s not found locally or in R2", nid, h[:8])
-            missing += 1
-            continue
-        path = _master_path(h)
-        if not path.exists():
-            if not dry_run:
-                missing += 1
-            continue
-        member: media_delivery.Member = (nid, h, path.read_bytes())
-        owned.setdefault(cfg.pack_name(noun["level"]), []).append(member)
-        if noun.get("free"):
-            owned.setdefault(cfg.FREE_PACK_NAME, []).append(member)
-    if missing:
-        logger.warning("  %d approved image(s) had no available master and were left out.", missing)
-    return owned
-
-
-def _distinct_image_count(owned: dict[str, list[media_delivery.Member]]) -> int:
-    """Number of distinct images across all packs — a free image rides both its level pack and the
-    free pack, so we dedupe by noun id to count the actual picture files, not pack memberships."""
-    return len({nid for members in owned.values() for (nid, _h, _b) in members})
-
-
-def publish_images(store, *, client, bucket, force: bool = False) -> tuple[int, int]:
-    """Build the image packs from the current approved decisions and publish them + the merged
-    manifest to R2. Returns (packs published, distinct images in those packs). Shared by run() and
-    image_review.py's publish-on-exit, so approving images and (re)building the manifest use the exact
-    same path."""
-    nouns = collect_nouns(include_unflagged=True)   # pack any approved noun, flagged or not
-    owned = _build_owned_packs(nouns, store, client=client, bucket=bucket, dry_run=False)
-    media_delivery.publish(owned_packs=owned, owns=cfg.owns_pack, client=client, bucket=bucket,
-                           force=force, dry_run=False)
-    return len(owned), _distinct_image_count(owned)
-
-
 def _flag_ids_in_sheet(ids: set[str]) -> int:
     """Set nouns.xlsx Image → 'y' for the given noun ids (identity = compute_id(level, word)), when a
     row is not already flagged. Rewrites the sheet once; returns the count newly flagged. Safe no-op
@@ -431,7 +385,7 @@ def _reencode_pass(store, *, client, bucket, dry_run) -> None:
     logger.info("Re-encoded %d master(s) to Apple-conformant HEIC.", done)
 
 
-def run(*, dry_run: bool, no_source: bool, limit: int, force: bool, prune_files: bool,
+def run(*, dry_run: bool, no_source: bool, limit: int, prune_files: bool,
         free_first: bool = False, reencode_masters: bool = False, workers: int = 1,
         include_unflagged: bool = False, client=None, bucket: str | None = None) -> None:
     logger.info("Reading nouns…")
@@ -463,10 +417,10 @@ def run(*, dry_run: bool, no_source: bool, limit: int, force: bool, prune_files:
     for nid in [q for q in queue if q not in live_ids]:
         queue.pop(nid, None)
 
-    owned = _build_owned_packs(all_nouns, store, client=client, bucket=bucket, dry_run=dry_run)
-    logger.info("Image packs: %d (incl. free), %d distinct image(s).", len(owned), _distinct_image_count(owned))
-    media_delivery.publish(owned_packs=owned, owns=cfg.owns_pack, client=client, bucket=bucket,
-                           force=force, dry_run=dry_run)
+    # Pack/manifest publishing is media_publish.py's job (it reads image_decisions + the
+    # master cache to build the immutable v2 packs/catalogs). This tool only SOURCES images
+    # into decisions + the master mirror. The old pack-publish here rewrote the shared
+    # manifest with name-keyed metas and could clobber media_publish's output (audit H7).
 
     # Re-encoding replaces masters (new hashes), so the old ones are now orphaned → always prune then.
     if (prune_files or reencode_masters) and not dry_run and client is not None:
@@ -521,19 +475,19 @@ def _confirm_reset() -> bool:
 def reset_all(*, client, bucket: str | None, dry_run: bool) -> None:
     """Wipe the IMAGE side back to a clean slate — images only, never audio.
 
-    R2 (if online): rewrite the shared manifest with NO image packs (foreign/audio packs preserved),
-    delete the image pack objects, then delete every image/files master. Locally: remove the master
-    cache, the review directory (queue + previews), the prompt-notes file and the decisions store.
+    R2 (if online): delete every image/files master. (Pack/manifest state is media_publish.py's
+    domain — the next publish rebuilds the image packs/catalog from the now-empty decisions and
+    a promote drops them from the channel; this tool no longer touches the shared manifest.)
+    Locally: remove the master cache, the review directory (queue + previews), the prompt-notes
+    file and the decisions store.
     """
-    # 1. R2: drop image packs from the shared manifest + delete their objects (audio packs kept).
+    # 1. R2: delete every image master (audio untouched). Packs/catalogs are rebuilt by
+    #    media_publish from the emptied decisions store; gc reclaims the orphaned pack objects.
     if not dry_run and client is not None:
-        logger.info("R2: removing all image packs from the shared manifest (audio preserved)…")
-        media_delivery.publish(owned_packs={}, owns=cfg.owns_pack, client=client, bucket=bucket,
-                               force=False, dry_run=False)
         logger.info("R2: deleting all image/files masters…")
         media_delivery.prune_orphan_files(client, bucket, cfg.FILES_PREFIX, cfg.FILE_EXT, set())
     else:
-        logger.info("[DRY RUN] would remove all image packs from the manifest and delete image/files masters in R2.")
+        logger.info("[DRY RUN] would delete every image/files master in R2.")
 
     # 2. Local: cache, review dir (queue + previews), prompt notes, decisions.
     targets = [cfg.CACHE_DIR, cfg.REVIEW_DIR, image_decisions.PROMPT_OPTS_PATH, cfg.DECISIONS_PATH]
@@ -564,7 +518,6 @@ def main() -> None:
     parser.add_argument("--workers", type=int, default=1, metavar="N",
                         help="Generate N nouns in parallel (threads). Default 1. 3–4 is a good balance "
                              "vs. Azure rate limits; failures are isolated and retried, never settled.")
-    parser.add_argument("--force", action="store_true", help="Re-upload every image pack (recovery).")
     parser.add_argument("--reencode-masters", action="store_true",
                         help="Transcode all approved masters to Apple-conformant HEIC (sips) without "
                              "re-sourcing/regenerating — fixes the HEVC 'reserved bit' warning. One-shot, idempotent.")
@@ -604,7 +557,7 @@ def main() -> None:
         return
 
     try:
-        run(dry_run=args.dry_run, no_source=args.no_source, limit=args.limit, force=args.force,
+        run(dry_run=args.dry_run, no_source=args.no_source, limit=args.limit,
             prune_files=args.prune_files, free_first=args.free_first,
             reencode_masters=args.reencode_masters, workers=args.workers,
             include_unflagged=args.include_unflagged, client=client, bucket=bucket)

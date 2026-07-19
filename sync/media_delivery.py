@@ -1,26 +1,21 @@
 """
-Shared media-delivery layer for the build pipeline.
+Shared media-delivery PRIMITIVES for the build pipeline.
 
-There is ONE media manifest and ONE pack space in R2, served by the read-worker and
-consumed by the iOS MediaSyncManager, spanning every media category (word audio,
-plural, example-sentence audio, and images). Each producer — audio_sync.py and
-image_sync.py — owns a DISJOINT set of pack names and calls `publish()` to update
-ONLY its own packs while preserving the others, so the two pipelines share the one
-manifest without ever clobbering each other.
+This module is the generic, media-agnostic machinery: the `.pack` container format,
+pack hashing + blob-integrity digest, the manifest builder (version + scope map), the
+R2 client, the content-addressed master store, and orphan pruning. The generation tools
+(audio_sync.py, image_sync.py) use the master-store + client helpers to mirror their
+finished files; the PUBLISHER (media_publish.py) uses the pack/manifest builders.
 
-This module is the generic, media-agnostic machinery both producers reuse: the
-`.pack` container format, pack hashing + blob-integrity digest, the manifest
-(version + scope map), the namespace-aware publish/merge, the R2 client, the
-content-addressed master store, and orphan pruning. The category-specific parts
-(what a "word" is, how it is produced/cached) stay in each producer.
+Publishing is media_publish.py's job ALONE. The old `publish()`/`fetch_remote_manifest()`
+here let each producer rewrite the shared audio/manifest.json in place — which clobbered
+media_publish's output with name-keyed metas (audit 2026-07-19, H7). They were removed;
+producers no longer touch R2 pack/manifest state.
 
 R2 layout (the "audio/" root is historical — it is the media root for ALL kinds):
-  audio/manifest.json                  # the single media manifest (all categories)
-  audio/packs/<name>.pack              # delivery bundles: free, nouns/a1.1, sentence/a1.1, image/a1.1, image/free, …
-  <files_prefix>/<content_hash>.<ext>  # per-producer content-addressed masters (audio/files/<h>.mp3, image/files/<h>.heic)
-
-The `.pack` container + manifest schema match Others/Docs/audio.md and the iOS
-`MediaStore.parse`, so adding a category needs no client change.
+  audio/manifest.json                  # v2-maintained legacy client manifest (media_publish only)
+  audio/packs/<name>-<sha12>.pack      # immutable content-suffixed delivery bundles
+  <files_prefix>/<content_hash>.<ext>  # content-addressed masters (audio/files/<h>.m4a, image/files/<h>.heic)
 
 Credentials (sync/.env): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET.
 """
@@ -33,7 +28,7 @@ import logging
 import os
 import struct
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger("media_delivery")
 
@@ -131,104 +126,6 @@ def r2_client():
         aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
         region_name="auto",
     )
-
-
-def fetch_remote_manifest(client, bucket: str) -> dict[str, Any]:
-    """Read the current media manifest from R2; a missing/unreadable manifest is treated as a first
-    run (empty), so the very first publish creates it."""
-    try:
-        obj = client.get_object(Bucket=bucket, Key=MANIFEST_KEY)
-        return json.loads(obj["Body"].read())
-    except Exception:  # noqa: BLE001 — missing/unreadable manifest -> first run
-        return {}
-
-
-def publish(
-    *,
-    owned_packs: dict[str, list[Member]],
-    owns: Callable[[str], bool],
-    client=None,
-    bucket: str | None = None,
-    force: bool = False,
-    dry_run: bool = False,
-) -> dict[str, Any]:
-    """Update THIS producer's packs in the one shared media manifest, namespace-aware.
-
-    Reads the current manifest, keeps every FOREIGN pack (one this producer does not own) exactly as
-    it is, replaces this producer's packs with freshly built ones, recomputes the merged version +
-    scopes, uploads only changed owned packs + the merged manifest, and deletes R2 objects for owned
-    packs that have disappeared. Because each producer touches only `owns(name)` packs, audio_sync and
-    image_sync can share one manifest without clobbering each other.
-
-    Args:
-      owned_packs: {pack_name: [(id, content_hash, data_bytes), ...]} — the packs this producer owns
-                   this run. Every name MUST satisfy `owns(name)`.
-      owns:        predicate identifying this producer's namespace (e.g. for images:
-                   `lambda n: n.startswith("image/")`; for audio: the inverse).
-    Returns the merged manifest dict.
-    """
-    # Guard: a producer must only publish packs it owns, or the merge would drop/duplicate packs.
-    stray = [n for n in owned_packs if not owns(n)]
-    if stray:
-        raise ValueError(f"publish() got packs outside this producer's namespace: {stray}")
-
-    # 1. Build bytes + metadata for the owned packs.
-    owned_meta: dict[str, dict[str, Any]] = {}
-    owned_bytes: dict[str, bytes] = {}
-    for name, members in owned_packs.items():
-        data = build_pack_bytes(members)
-        owned_bytes[name] = data
-        owned_meta[name] = pack_meta(members, data)
-
-    # 2. Merge: foreign packs from the remote manifest + our freshly-built owned packs.
-    remote = fetch_remote_manifest(client, bucket) if client is not None else {}
-    remote_packs: dict[str, dict[str, Any]] = remote.get("packs", {})
-    merged: dict[str, dict[str, Any]] = {n: m for n, m in remote_packs.items() if not owns(n)}
-    merged.update(owned_meta)
-    manifest = build_manifest(merged)
-
-    if dry_run:
-        total = sum(m["bytes"] for m in owned_meta.values())
-        logger.info(
-            "[DRY RUN] %d owned pack(s) (%.1f MB); merged manifest version would be %s (%d packs total).",
-            len(owned_meta), total / 1e6, manifest["version"], len(merged),
-        )
-        return manifest
-
-    assert client is not None and bucket is not None, "client + bucket required when not dry_run"
-
-    # 3. Upload only owned packs whose blob changed (compare `sha`), then prune obsolete owned packs.
-    uploaded = 0
-    for name, meta in owned_meta.items():
-        if not force and remote_packs.get(name, {}).get("sha") == meta["sha"]:
-            continue  # exact blob already in R2
-        client.put_object(
-            Bucket=bucket,
-            Key=f"{PACKS_PREFIX}/{name}.pack",
-            Body=owned_bytes[name],
-            ContentType="application/octet-stream",
-        )
-        uploaded += 1
-        logger.info("  uploaded %s (%d files, %.1f KB)", name, meta["count"], meta["bytes"] / 1e3)
-
-    removed = [n for n in remote_packs if owns(n) and n not in owned_meta]
-    for name in removed:
-        client.delete_object(Bucket=bucket, Key=f"{PACKS_PREFIX}/{name}.pack")
-    if removed:
-        logger.info("  removed %d obsolete pack object(s): %s", len(removed), ", ".join(sorted(removed)))
-
-    # 4. Write the merged manifest last (so it never references a pack we haven't uploaded).
-    client.put_object(
-        Bucket=bucket,
-        Key=MANIFEST_KEY,
-        Body=json.dumps(manifest).encode("utf-8"),
-        ContentType="application/json",
-    )
-    logger.info(
-        "Published %d changed pack(s) + merged manifest (version %s, %d packs total).",
-        uploaded, manifest["version"], len(merged),
-    )
-    return manifest
 
 
 # ---------------------------------------------------------------------------

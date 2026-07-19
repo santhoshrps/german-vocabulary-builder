@@ -381,9 +381,10 @@ Build the app in Xcode.
 
 ## Image pipeline (`image_sync.py`)
 
-Sources a **premium picture for every noun flagged** in the Image column (`x` or `y`) and publishes it
-as the **image** media category into the SAME media manifest as audio (via `media_delivery.publish`,
-namespace-aware — it never touches the audio packs). Funnel: stock/CC search → CLIP pre-rank →
+Sources a **premium picture for every noun flagged** in the Image column (`x` or `y`) into the
+decisions store + the durable R2 master mirror. Publishing the image packs/catalog is
+`media_publish.py`'s job (it reads the decisions store) — the old in-place manifest publish here
+was removed (audit H7). Funnel: stock/CC search → CLIP pre-rank →
 smart-crop → **HEIC** master (≤500 KB) → Content-Safety → GPT-4o verify → auto-approve or queue for
 review → DALL·E fallback. Idempotent + resumable: an **approved image never changes** unless the
 word's gloss/word/sentence changes (decisions live in `image_decisions.json`, which is committed).

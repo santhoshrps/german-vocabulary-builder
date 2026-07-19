@@ -295,21 +295,12 @@ def main() -> None:
 
 
 def _publish_on_exit() -> None:
-    """On shutdown, build the image packs + write the merged manifest from the approved decisions —
-    so approving in the browser is enough; no separate `image_sync.py --no-source` step is needed.
-    Runs only if an approval was made this session and R2 is configured."""
+    """On shutdown, reconcile the source sheet for the approvals made this session and remind the
+    operator to publish. Publishing packs/manifests is media_publish.py's job (it reads the
+    decisions store this reviewer just wrote) — this tool never touches R2 pack/manifest state.
+    Runs only if an approval was made this session."""
     if not _Handler.dirty:
         return
-    if _Handler.client is None:
-        logger.info("R2 not configured — packs/manifest not published. Run `image_sync.py --no-source` online.")
-        return
-    logger.info("Publishing image packs + manifest…")
-    try:
-        packs, images = image_sync.publish_images(_Handler.store, client=_Handler.client, bucket=_Handler.bucket)
-        logger.info("Published %d image pack(s) + manifest — %d image(s) total in R2, %d newly approved this session.",
-                    packs, images, _Handler.approved_count)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Publish failed (%s) — run `python image_sync.py --no-source` to retry.", exc)
 
     # Flag every approved word (incl. previously-unflagged ones just picked) as 'y' in nouns.xlsx, so
     # the app's image flag matches the shipped picture. Run `python sync.py` to push the flags to D1.
@@ -320,6 +311,10 @@ def _publish_on_exit() -> None:
                         "to propagate the image flag to D1.", newly)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not update nouns.xlsx image flags (%s).", exc)
+
+    logger.info("%d image(s) approved this session. Publish them with: "
+                "`python media_publish.py publish --env <env>` (then promote per MS2-FR-20).",
+                _Handler.approved_count)
 
 
 if __name__ == "__main__":
