@@ -156,12 +156,14 @@ def collect_images(old_to_new: dict[str, str], skip_missing: bool
     store = image_decisions.load()
 
     missing: list[str] = []
+    unaliased = 0   # L19: approved images whose noun is gone from the sheet / has no v2 id
     packs: dict[str, list[media_delivery.Member]] = {}
     entries: list[dict[str, Any]] = []
     for legacy_id, rec in image_decisions.approved(store).items():
         noun = by_id.get(legacy_id)
         new_id = relabel(legacy_id, old_to_new)
         if noun is None or new_id is None:
+            unaliased += 1
             continue
         h = rec["content_hash"]
         path = image_config.CACHE_DIR / f"{h}.{image_config.FILE_EXT}"
@@ -178,6 +180,11 @@ def collect_images(old_to_new: dict[str, str], skip_missing: bool
             "level": (noun.get("level") or "").strip().lower(),
             "free": int(noun.get("free") or 0), "hash": h, "bytes": len(data),
         })
+    if unaliased:
+        # L19: mirror collect_audio's signal — an approved image dropping out silently would
+        # otherwise leave the operator wondering why a picture vanished from the catalog.
+        logger.warning("images: %d approved image(s) belong to nouns without a v2 identity "
+                       "(removed from the sheet or unaliased) — left out", unaliased)
     if missing:
         msg = (f"images: {len(missing)} approved master(s) missing from the local cache "
                f"(first: {missing[:5]}) — run image_sync.py first")

@@ -159,7 +159,20 @@ export async function serveFile(
   if (hit) return hit;
 
   const obj = await env.MEDIA.get(objectKey);
-  if (!obj) throw new HttpError(404, "file not found");
+  if (!obj) {
+    // L18: a granted object that isn't in R2 means the catalog referenced a hash the
+    // pipeline never uploaded (M26/M27 now catch this at publish time — it should not
+    // occur). Serve a SHORT-lived cached 404 so a client that retries doesn't hammer R2
+    // on every playback, and log it for the operator. It stays a 404 (not 410, which is
+    // the grant-expiry self-heal signal): the file is genuinely absent, not stale.
+    console.log(JSON.stringify({ evt: "MEDIATRACE file-missing", kind, hash }));
+    const miss = new Response(JSON.stringify({ error: "file not found" }), {
+      status: 404,
+      headers: { "Content-Type": "application/json", "Cache-Control": "public, max-age=300" },
+    });
+    ctx.waitUntil(cache.put(cacheKey, miss.clone()));
+    return miss;
+  }
   const response = new Response(obj.body, {
     status: 200,
     headers: {
