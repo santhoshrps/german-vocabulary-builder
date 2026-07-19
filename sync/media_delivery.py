@@ -13,8 +13,8 @@ media_publish's output with name-keyed metas (audit 2026-07-19, H7). They were r
 producers no longer touch R2 pack/manifest state.
 
 R2 layout (the "audio/" root is historical — it is the media root for ALL kinds):
-  audio/manifest.json                  # v2-maintained legacy client manifest (media_publish only)
   audio/packs/<name>-<sha12>.pack      # immutable content-suffixed delivery bundles
+  (audio/manifest.json was retired 2026-07-19 — channels/live.json is the one pointer)
   <files_prefix>/<content_hash>.<ext>  # content-addressed masters (audio/files/<h>.m4a, image/files/<h>.heic)
 
 Credentials (sync/.env): R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET.
@@ -33,7 +33,6 @@ from typing import Any
 logger = logging.getLogger("media_delivery")
 
 # The single media manifest + shared pack object prefix (historical "audio" name).
-MANIFEST_KEY = "audio/manifest.json"
 PACKS_PREFIX = "audio/packs"
 # `.pack` header version — must match the iOS MediaStore.parse expectation.
 PACK_FORMAT_VERSION = 1

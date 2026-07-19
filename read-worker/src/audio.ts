@@ -1,13 +1,16 @@
-// Audio media: serve the pack manifest and the pack blobs from R2.
+// Audio/image packs: serve the scope-filtered pack manifest and the pack blobs from R2.
 //
-// The build pipeline (sync/audio_sync.py) writes everything to the MEDIA bucket:
-//   audio/manifest.json          — { version, packs:{name:{hash,bytes,count}}, scopes:{free,full} }
-//   audio/packs/<name>.pack      — custom container of that group's MP3s
+// The publisher (sync/media_publish.py) maintains ONE pointer set per channel:
+//   media/channels/live.json     — { version, packs:{name:{hash,sha,bytes,count,key}},
+//                                    scopes:{free,full}, catalogs, generation, … }
+//   audio/packs/<name>-<sha>.pack — immutable content-suffixed pack blobs
+// (The duplicated legacy audio/manifest.json object was retired 2026-07-19 —
+// this module now reads the same channel manifest the catalog routes serve.)
 //
 // This worker only READS. Scope enforcement reuses the manifest's own `scopes`
 // map: a free session may only see/fetch the "free" pack; a full session gets
 // the per-type/level packs. Nothing here queries D1 — the manifest is the source
-// of truth for what audio exists and who may download it.
+// of truth for what packs exist and who may download them.
 
 import { Env } from "./env";
 import { Scope } from "./entitlement";
@@ -15,21 +18,22 @@ import { HttpError } from "./http";
 
 export interface AudioManifest {
   version: string;
-  // `hash`: content-identity (id:audio_hash) for diffing. `sha`: digest of the actual
-  // .pack blob, for client-side integrity verification of the downloaded bytes.
+  // `hash`: content-identity for diffing. `sha`: digest of the actual .pack blob,
+  // for client-side integrity verification of the downloaded bytes.
   packs: Record<string, { hash: string; sha?: string; bytes: number; count: number; key?: string }>;
   scopes: Record<string, string[]>;
 }
 
-// Cache the parsed manifest per isolate keyed by version is unnecessary; R2
-// reads are cheap and the responses we build are edge-cached by version anyway.
+// Reads the live channel manifest (extra fields — catalogs, generation, minClient —
+// are simply ignored by the cast). R2 reads are cheap and the responses we build
+// are edge-cached by version anyway, so no per-isolate cache.
 export async function loadManifest(env: Env): Promise<AudioManifest> {
   if (!env.MEDIA) throw new HttpError(503, "media storage not configured");
-  const obj = await env.MEDIA.get("audio/manifest.json");
-  if (!obj) throw new HttpError(404, "audio manifest not found");
+  const obj = await env.MEDIA.get("media/channels/live.json");
+  if (!obj) throw new HttpError(404, "media channel manifest not found");
   const parsed = (await obj.json()) as Partial<AudioManifest>;
   if (!parsed.version || !parsed.packs || !parsed.scopes) {
-    throw new HttpError(500, "audio manifest malformed");
+    throw new HttpError(500, "media channel manifest malformed");
   }
   return parsed as AudioManifest;
 }
@@ -75,14 +79,14 @@ export function normalizePackName(raw: string): string {
   return name;
 }
 
-// Object key for a pack: v2 manifests carry an immutable content-suffixed `key`
-// (audio/packs/<name>-<sha12>.pack — promote/rollback are pointer swaps, objects
-// are never overwritten); legacy manifests fall back to the name-derived path.
-// Defense-in-depth: a manifest key must stay inside the packs prefix.
+// Object key for a pack: channel manifests always carry an immutable content-suffixed
+// `key` (audio/packs/<name>-<sha12>.pack — promote/rollback are pointer swaps, objects
+// are never overwritten). The legacy name-derived fallback path was retired 2026-07-19
+// with audio/manifest.json. Defense-in-depth: the key must stay inside the packs prefix.
 function packKey(manifest: AudioManifest, name: string): string {
   const key = manifest.packs[name]?.key;
   if (key && key.startsWith("audio/packs/")) return key;
-  return `audio/packs/${name}.pack`;
+  throw new HttpError(500, "pack has no valid object key");
 }
 
 // Returns the R2 object for a pack the caller is entitled to, or throws.

@@ -4,7 +4,7 @@ vocabulary word into the local cache + the durable R2 master mirror.
 
 PUBLISHING IS NOT DONE HERE. media_publish.py is the sole publisher — it reads this
 cache to build the immutable content-suffixed packs, the per-kind catalogs, the channel
-manifests, and the (v2-maintained) legacy audio/manifest.json. The old pack-publish path
+manifests. The old pack-publish path
 that lived here rewrote the shared manifest with name-keyed metas and could clobber
 media_publish's output (audit 2026-07-19, H7); it was removed.
 

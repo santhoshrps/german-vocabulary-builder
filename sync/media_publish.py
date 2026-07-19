@@ -12,9 +12,8 @@ WHAT IT PUBLISHES (to the target environment's media bucket, sync/envs.py):
                                       catalogs} — beta and live are two pointers
                                       into the same immutable object space
   media/channels/history/<...>.json   every previous live manifest (rollback, MS2-FR-20)
-  audio/manifest.json                 the legacy client manifest, written ONLY when a
-                                      channel becomes live (publish --channel live, or
-                                      promote) — today's app keeps working unchanged
+  (audio/manifest.json — the duplicated legacy client manifest — was retired
+  2026-07-19: the worker's pack routes read channels/live.json directly.)
 
 RE-LABEL (WD-ID-5): descriptors and image records are produced by the UNCHANGED
 legacy machinery (audio_sync collect + overrides; image_decisions store), keyed by
@@ -22,9 +21,8 @@ v1 ids — then re-labeled to v2 ids through the alias map from the spreadsheet
 dataset. Nothing is re-synthesized, no cache or decision file is mutated; audio
 bytes come from the local audio cache, image masters from the local image cache.
 
-PROMOTE / ROLLBACK: `promote` copies the beta pointer set to live (+ legacy
-manifest + history); `rollback` restores the previous live pointer set from
-history. Both are manifest-only operations — pack/catalog objects are immutable,
+PROMOTE / ROLLBACK: `promote` copies the beta pointer set to live (+ history
+archive); `rollback` restores the previous live pointer set from history. Both are manifest-only operations — pack/catalog objects are immutable,
 so a rolled-back manifest's references are always intact (GC of unreferenced
 objects is a later, grace-windowed step).
 
@@ -60,7 +58,6 @@ from registry import TABLES
 logger = logging.getLogger("media_publish")
 
 CHANNELS = ("live", "beta")
-LEGACY_MANIFEST_KEY = media_delivery.MANIFEST_KEY          # audio/manifest.json
 # L10 / MS2-FR-23: minimum client generation for TODAY's media format. Raise only on a
 # breaking media-format change (must match a bump the shipped app understands).
 MEDIA_MIN_CLIENT_GENERATION = 1
@@ -341,7 +338,9 @@ def publish(env: envs.Environment, channel: str, *, dry_run: bool, skip_missing:
 
 def _promote_pointers(client, bucket: str, channel_manifest: dict[str, Any]) -> None:
     """Make a pointer set live: history-archive the current live set, then write
-    channels/live.json AND the legacy client manifest (audio/manifest.json)."""
+    channels/live.json — the ONE pointer every consumer (catalog routes, pack routes,
+    grants) reads. The duplicated legacy client manifest (audio/manifest.json) was
+    retired 2026-07-19; with a single write, promote has no partial-crash state (M23)."""
     current = _get_json(client, bucket, f"{CHANNELS_PREFIX}/live.json")
     if current and current.get("version") != channel_manifest["version"]:
         hist_key = f"{CHANNELS_PREFIX}/history/{current.get('publishedAt', 'unknown')}-{current['version']}.json"
@@ -352,14 +351,7 @@ def _promote_pointers(client, bucket: str, channel_manifest: dict[str, Any]) -> 
     live = dict(channel_manifest, channel="live")
     _put_verified(client, bucket, f"{CHANNELS_PREFIX}/live.json",
                   json.dumps(live, separators=(",", ":")).encode(), "application/json")
-    legacy = {
-        "version": live["version"],
-        "packs": live["packs"],
-        "scopes": live["scopes"],
-    }
-    _put_verified(client, bucket, LEGACY_MANIFEST_KEY,
-                  json.dumps(legacy, separators=(",", ":")).encode(), "application/json")
-    logger.info("LIVE now at version %s (legacy manifest updated).", live["version"])
+    logger.info("LIVE now at version %s.", live["version"])
 
 
 def promote(env: envs.Environment) -> None:
@@ -369,15 +361,8 @@ def promote(env: envs.Environment) -> None:
     if not beta:
         raise PublishError("no beta channel manifest to promote")
     live = _get_json(client, bucket, f"{CHANNELS_PREFIX}/live.json")
-    legacy = _get_json(client, bucket, LEGACY_MANIFEST_KEY)
-    # M23: "already done" requires BOTH the live channel AND the legacy client manifest to
-    # match beta. A promote that crashed between the two writes left live == beta but the
-    # legacy manifest stale, and the old early-return-on-live-only made a re-run a no-op that
-    # could never repair it. `_promote_pointers` is idempotent (it re-writes both, and skips
-    # the history archive when live is already at beta's version), so re-running now self-heals.
-    if (live and live.get("version") == beta.get("version")
-            and legacy and legacy.get("version") == beta.get("version")):
-        logger.info("live + legacy already at beta's version %s — nothing to do", beta["version"])
+    if live and live.get("version") == beta.get("version"):
+        logger.info("live already at beta's version %s — nothing to do", beta["version"])
         return
     _promote_pointers(client, bucket, beta)
 
@@ -438,16 +423,7 @@ def audit(env: envs.Environment, deep: bool) -> None:
     checked = 0
 
     channels = {ch: _get_json(client, bucket, f"{CHANNELS_PREFIX}/{ch}.json") for ch in CHANNELS}
-    legacy = _get_json(client, bucket, LEGACY_MANIFEST_KEY)
     live = channels.get("live")
-
-    if live and legacy:
-        if legacy.get("version") != live.get("version"):
-            problems.append(f"legacy manifest version {legacy.get('version')} != live {live.get('version')}")
-        if set(legacy.get("packs", {})) != set(live.get("packs", {})):
-            problems.append("legacy manifest pack set differs from live channel")
-    elif live and not legacy:
-        problems.append("live channel exists but legacy manifest missing")
 
     catalog_ids: set[str] = set()
     live_entries: list[dict[str, Any]] = []   # live-channel catalog entries (deep cross-checks + masters)
@@ -764,10 +740,8 @@ def _collect_referenced(client, bucket: str) -> set[str]:
         _add_refs(_get_json(client, bucket, f"{CHANNELS_PREFIX}/{ch}.json"))
     for hist_key in _existing_keys(client, bucket, f"{CHANNELS_PREFIX}/history/"):
         _add_refs(_get_json(client, bucket, hist_key))
-    legacy = _get_json(client, bucket, LEGACY_MANIFEST_KEY)
-    if legacy:
-        for name, meta in legacy.get("packs", {}).items():
-            referenced.add(meta.get("key") or f"{PACKS_PREFIX}/{name}.pack")
+    # (audio/manifest.json — once a live serving pointer needing H8 protection — was
+    # retired 2026-07-19; the channel manifests above are the complete pointer set.)
     return referenced
 
 
@@ -823,8 +797,6 @@ def status(env: envs.Environment) -> None:
                   f"packs {len(m['packs'])}  publishedAt {m.get('publishedAt')}")
         else:
             print(f"{ch:5}: (none)")
-    legacy = _get_json(client, env.r2_bucket, LEGACY_MANIFEST_KEY)
-    print(f"legacy: version {legacy['version']}" if legacy else "legacy: (none)")
     # Retained history, oldest→newest, so `rollback --to <version>` has a menu.
     hist = [_get_json(client, env.r2_bucket, k)
             for k in sorted(_existing_keys(client, env.r2_bucket, f"{CHANNELS_PREFIX}/history/"))]
