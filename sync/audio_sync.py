@@ -55,7 +55,12 @@ logger = logging.getLogger("audio_sync")
 
 CACHE_DIR = Path(__file__).parent / "audio_cache"
 INDEX_PATH = CACHE_DIR / "index.json"          # {id: audio_hash}
-FILES_PREFIX = "audio/files"                    # R2 key prefix for this producer's content-addressed audio masters
+FILES_PREFIX = "audio/masters"                  # R2 prefix for the GENERATION safety net, keyed by the
+                                                # synthesis-RECIPE hash (audio_hash): "give me the canonical
+                                                # bytes for this recipe" so a fresh machine doesn't re-synthesize
+                                                # non-deterministically. DISTINCT from the content-addressed
+                                                # DELIVERY store audio/files/<content_hash>.m4a that
+                                                # media_publish mirrors + the app fetches per-file (H6).
 AUDIO_EXT = "m4a"                               # delivery format: HE-AAC mono (audio_engine.DELIVERY_KBPS)
 # The shared pack space + manifest + .pack format live in media_delivery.
 

@@ -61,6 +61,9 @@ logger = logging.getLogger("media_publish")
 
 CHANNELS = ("live", "beta")
 LEGACY_MANIFEST_KEY = media_delivery.MANIFEST_KEY          # audio/manifest.json
+# L10 / MS2-FR-23: minimum client generation for TODAY's media format. Raise only on a
+# breaking media-format change (must match a bump the shipped app understands).
+MEDIA_MIN_CLIENT_GENERATION = 1
 PACKS_PREFIX = media_delivery.PACKS_PREFIX                 # audio/packs
 CATALOG_PREFIX = "media/catalog"
 CHANNELS_PREFIX = "media/channels"
@@ -125,16 +128,22 @@ def collect_audio(old_to_new: dict[str, str], skip_missing: bool
             missing.append(legacy_id)
             continue
         data = path.read_bytes()
+        # H6: the catalog + pack identity is the CONTENT hash of the actual bytes, NOT the
+        # synthesis-recipe hash (`audio_hash`). The recipe hash only decides "re-synthesize?"
+        # (it can map to different bytes across a resynth); a content hash is what lets a
+        # client diff correctly, what the per-file delivery path is addressed by, and what a
+        # corrupt clip fails against. (Images were already content-hashed.)
+        content_hash = hashlib.sha256(data).hexdigest()
         w2 = dict(w, id=new_id)
         full_pack, free_pack = audio_sync._packs_for(w2)
-        member: media_delivery.Member = (new_id, w["audio_hash"], data)
+        member: media_delivery.Member = (new_id, content_hash, data)
         packs.setdefault(full_pack, []).append(member)
         if w["free"]:
             packs.setdefault(free_pack, []).append(member)
         entries.append({
             "id": new_id, "kind": w["variant"] if w["variant"] != "singular" else "word",
             "type": w["kind"], "level": w["level"], "free": int(w["free"]),
-            "hash": w["audio_hash"], "bytes": len(data),
+            "hash": content_hash, "bytes": len(data),
         })
     if unaliased:
         logger.warning("audio: %d clip(s) belong to rows without a v2 identity (skipped sheet rows) — left out", unaliased)
@@ -301,6 +310,10 @@ def publish(env: envs.Environment, channel: str, *, dry_run: bool, skip_missing:
         "version": version,
         "generation": generation,
         "channel": channel,
+        # L10 / MS2-FR-23: the media compat floor. The client pauses media sync (cached media
+        # keeps working) + shows "update the app" when its generation is below this. 1 = today's
+        # format, every shipped app reads it; raise it only on a breaking media-format change.
+        "minClient": MEDIA_MIN_CLIENT_GENERATION,
         "packs": pack_meta,
         "scopes": legacy_manifest["scopes"],
         "catalogs": catalogs,
@@ -473,15 +486,14 @@ def audit(env: envs.Environment, deep: bool) -> None:
                 problems.append(f"[{sk}] {len(only_pack)} pack member(s) not in any catalog (first: {sorted(only_pack)[:3]})")
 
     if live and live_entries:
-        # M27: the per-file masters are the rebuild safety net AND the per-file delivery
-        # source — audit them too. Existence for EVERY entry via LIST (fast, no per-object
-        # round-trips); with --deep also byte-verify a deterministic sample of image
-        # masters (image hashes ARE content hashes; audio hashes are synthesis-recipe
-        # hashes and cannot be byte-verified until H6 lands — existence-only there).
+        # M27: the per-file masters are the content-addressed delivery source — audit them.
+        # Existence for EVERY entry via LIST (fast, no per-object round-trips); with --deep
+        # byte-verify a deterministic sample of BOTH kinds against their content hash — audio
+        # is now content-hashed too (H6), so its masters are byte-verifiable like images.
         master_keys = (_existing_keys(client, bucket, "audio/files/")
                        | _existing_keys(client, bucket, "image/files/"))
         missing_masters: list[str] = []
-        image_hashes: list[str] = []
+        sample_by_kind: dict[str, list[str]] = {"audio": [], "image": []}
         seen_hashes: set[tuple[str, str]] = set()
         for e in live_entries:
             sk = "image" if e["kind"] == "image" else "audio"
@@ -492,18 +504,19 @@ def audit(env: envs.Environment, deep: bool) -> None:
             checked += 1
             if key not in master_keys:
                 missing_masters.append(key)
-            elif sk == "image":
-                image_hashes.append(e["hash"])
+            else:
+                sample_by_kind[sk].append(e["hash"])
         if missing_masters:
             problems.append(f"{len(missing_masters)} per-file master(s) missing (first: {missing_masters[:3]})")
-        if deep and image_hashes:
-            image_hashes.sort()
-            sample = image_hashes[:: max(1, len(image_hashes) // 50)][:50]
-            for h in sample:
-                body = client.get_object(Bucket=bucket, Key=f"image/files/{h}.heic")["Body"].read()
-                if hashlib.sha256(body).hexdigest() != h:
-                    problems.append(f"image master {h}: bytes do not match content hash")
-            checked += len(sample)
+        if deep:
+            for sk, ext in (("audio", "m4a"), ("image", "heic")):
+                hashes = sorted(sample_by_kind[sk])
+                sample = hashes[:: max(1, len(hashes) // 50)][:50] if hashes else []
+                for h in sample:
+                    body = client.get_object(Bucket=bucket, Key=f"{sk}/files/{h}.{ext}")["Body"].read()
+                    if hashlib.sha256(body).hexdigest() != h:
+                        problems.append(f"{sk} master {h}: bytes do not match content hash")
+                checked += len(sample)
 
     if problems:
         for pr in problems:
@@ -639,12 +652,17 @@ def mirror_masters(env: envs.Environment, dry_run: bool) -> None:
     client = media_delivery.r2_client()
     bucket = env.r2_bucket
     index = json.loads(audio_sync.INDEX_PATH.read_text()) if audio_sync.INDEX_PATH.exists() else {}
+    # H6: the DELIVERY masters are content-addressed (audio/files/<sha256(bytes)>.m4a) — the
+    # same identity the catalog/pack use and the per-file grant path serves. Key by the clip's
+    # content hash, not the recipe hash. (The recipe-keyed generation safety net is a separate
+    # store, audio/masters/, owned by audio_sync.)
     audio_by_hash: dict[str, Path] = {}
     audio_missing = 0
-    for legacy_id, h in index.items():
+    for legacy_id in index:
         path = audio_sync._cache_path(legacy_id)
         if path.exists():
-            audio_by_hash.setdefault(h, path)
+            content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+            audio_by_hash.setdefault(content_hash, path)
         else:
             audio_missing += 1
     store = image_decisions.load()
@@ -664,37 +682,36 @@ def mirror_masters(env: envs.Environment, dry_run: bool) -> None:
                        "the mirror will be incomplete (run audio_sync/image tooling to restore them).",
                        audio_missing, image_missing)
     have = _existing_keys(client, bucket, "audio/files/") | _existing_keys(client, bucket, "image/files/")
-    todo: list[tuple[str, Path, str]] = []
+    todo: list[tuple[str, str, Path, str]] = []   # (key, expected_content_hash, path, content_type)
     for h, path in audio_by_hash.items():
         key = f"audio/files/{h}.m4a"
         if key not in have:
-            todo.append((key, path, "audio/mp4"))
+            todo.append((key, h, path, "audio/mp4"))
     for h, path in image_by_hash.items():
         key = f"image/files/{h}.heic"
         if key not in have:
-            todo.append((key, path, "image/heic"))
-    total = sum(p.stat().st_size for _, p, _ in todo)
+            todo.append((key, h, path, "image/heic"))
+    total = sum(p.stat().st_size for _, _, p, _ in todo)
     logger.info("mirror-masters: %d audio + %d image master(s) local; %d to upload (%.1f MB)",
                 len(audio_by_hash), len(image_by_hash), len(todo), total / 1e6)
     if dry_run:
         return
     corrupt = 0
-    for i, (key, path, ctype) in enumerate(todo, 1):
+    for i, (key, expected_hash, path, ctype) in enumerate(todo, 1):
         data = path.read_bytes()
-        # Image hashes ARE content hashes — a cache file that no longer matches must never
-        # enter the immutable store (audio hashes are recipe hashes; not checkable — H6).
-        if ctype == "image/heic":
-            h = path.stem
-            if hashlib.sha256(data).hexdigest() != h:
-                logger.error("mirror-masters: SKIPPING corrupt image cache file %s (bytes != hash)", h[:12])
-                corrupt += 1
-                continue
+        # H6: both stores are content-addressed now — a cache file whose bytes don't match
+        # the content hash the key claims must NEVER enter the immutable store (it would
+        # serve corrupt bytes forever on the per-file path).
+        if hashlib.sha256(data).hexdigest() != expected_hash:
+            logger.error("mirror-masters: SKIPPING corrupt cache file for %s (bytes != content hash)", expected_hash[:12])
+            corrupt += 1
+            continue
         _put_verified(client, bucket, key, data, ctype)
         if i % 500 == 0:
             logger.info("  … %d/%d", i, len(todo))
     if corrupt:
         raise PublishError(f"mirror-masters: {corrupt} corrupt cache file(s) skipped — fix the local cache")
-    logger.info("mirror-masters: done (%d uploaded, write-verified).", len(todo))
+    logger.info("mirror-masters: done (%d uploaded, content + write-verified).", len(todo))
 
 
 def gc(env: envs.Environment, grace_days: int, apply: bool) -> None:
