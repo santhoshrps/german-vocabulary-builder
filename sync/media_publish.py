@@ -364,27 +364,56 @@ def _promote_pointers(client, bucket: str, channel_manifest: dict[str, Any]) -> 
 
 def promote(env: envs.Environment) -> None:
     client = media_delivery.r2_client()
-    beta = _get_json(client, env.r2_bucket, f"{CHANNELS_PREFIX}/beta.json")
+    bucket = env.r2_bucket
+    beta = _get_json(client, bucket, f"{CHANNELS_PREFIX}/beta.json")
     if not beta:
         raise PublishError("no beta channel manifest to promote")
-    live = _get_json(client, env.r2_bucket, f"{CHANNELS_PREFIX}/live.json")
-    if live and live.get("version") == beta.get("version"):
-        logger.info("live already at beta's version %s — nothing to do", beta["version"])
+    live = _get_json(client, bucket, f"{CHANNELS_PREFIX}/live.json")
+    legacy = _get_json(client, bucket, LEGACY_MANIFEST_KEY)
+    # M23: "already done" requires BOTH the live channel AND the legacy client manifest to
+    # match beta. A promote that crashed between the two writes left live == beta but the
+    # legacy manifest stale, and the old early-return-on-live-only made a re-run a no-op that
+    # could never repair it. `_promote_pointers` is idempotent (it re-writes both, and skips
+    # the history archive when live is already at beta's version), so re-running now self-heals.
+    if (live and live.get("version") == beta.get("version")
+            and legacy and legacy.get("version") == beta.get("version")):
+        logger.info("live + legacy already at beta's version %s — nothing to do", beta["version"])
         return
-    _promote_pointers(client, env.r2_bucket, beta)
+    _promote_pointers(client, bucket, beta)
 
 
-def rollback(env: envs.Environment) -> None:
+def rollback(env: envs.Environment, to_version: str | None = None) -> None:
+    """Restore a previous live pointer set from history. Default: a TRUE step back — the
+    newest version published BEFORE the current live (so repeated rollbacks keep going back,
+    never flip-flop). `--to <version>` restores a specific retained version unambiguously
+    (M24). Objects are immutable, so any retained version's references are always intact."""
     client = media_delivery.r2_client()
     bucket = env.r2_bucket
-    history = sorted(_existing_keys(client, bucket, f"{CHANNELS_PREFIX}/history/"))
-    if not history:
+    hist = [(k, _get_json(client, bucket, k))
+            for k in sorted(_existing_keys(client, bucket, f"{CHANNELS_PREFIX}/history/"))]
+    hist = [(k, m) for k, m in hist if m]   # readable only
+    if not hist:
         raise PublishError("no history to roll back to")
-    prev = _get_json(client, bucket, history[-1])
-    if not prev:
-        raise PublishError(f"could not read {history[-1]}")
-    logger.info("rolling back live → version %s (%s)", prev["version"], history[-1])
-    _promote_pointers(client, bucket, prev)
+
+    if to_version:
+        matches = [(k, m) for k, m in hist if m.get("version") == to_version]
+        if not matches:
+            available = ", ".join(sorted({m["version"] for _, m in hist}))
+            raise PublishError(f"no history entry for version {to_version} (have: {available})")
+        target_key, target = matches[-1]
+    else:
+        # Default: the newest version strictly OLDER (by publishedAt) than current live — a
+        # real step back. Comparing ISO-8601 UTC timestamps lexicographically is correct.
+        live = _get_json(client, bucket, f"{CHANNELS_PREFIX}/live.json")
+        live_pub = (live or {}).get("publishedAt") or ""
+        older = [(k, m) for k, m in hist if (m.get("publishedAt") or "") < live_pub]
+        if not older:
+            available = ", ".join(sorted({m["version"] for _, m in hist}))
+            raise PublishError(f"no earlier version to roll back to — use --to <version> (have: {available})")
+        target_key, target = older[-1]
+
+    logger.info("rolling back live → version %s (%s)", target["version"], target_key)
+    _promote_pointers(client, bucket, target)
 
 
 # ---------------------------------------------------------------------------
@@ -714,21 +743,17 @@ def mirror_masters(env: envs.Environment, dry_run: bool) -> None:
     logger.info("mirror-masters: done (%d uploaded, content + write-verified).", len(todo))
 
 
-def gc(env: envs.Environment, grace_days: int, apply: bool) -> None:
-    """Grace-windowed GC (MS2-FR-20): delete immutable pack/catalog objects that
-    NO channel (live, beta, or any history entry) references and that are older
-    than the grace window. Dry-run by default; --apply deletes."""
-    import datetime as dt
-    client = media_delivery.r2_client()
-    bucket = env.r2_bucket
+def _collect_referenced(client, bucket: str) -> set[str]:
+    """Every object key any pointer still references: live + beta + every history manifest,
+    PLUS the legacy client manifest (audio/manifest.json is a live serving pointer too — H8).
+    gc must never delete an object any of these point at."""
     referenced: set[str] = set()
 
     def _add_refs(manifest: dict | None) -> None:
         if not manifest:
             return
         for meta in manifest.get("packs", {}).values():
-            # Content-suffixed key (v2) OR the name-derived legacy path, whichever a manifest
-            # carries — so gc never deletes a pack any manifest still points at (H8).
+            # Content-suffixed key (v2) OR the name-derived legacy path, whichever a manifest carries.
             key = meta.get("key")
             if not key and isinstance(meta, dict):
                 continue
@@ -739,12 +764,21 @@ def gc(env: envs.Environment, grace_days: int, apply: bool) -> None:
         _add_refs(_get_json(client, bucket, f"{CHANNELS_PREFIX}/{ch}.json"))
     for hist_key in _existing_keys(client, bucket, f"{CHANNELS_PREFIX}/history/"):
         _add_refs(_get_json(client, bucket, hist_key))
-    # H8: the legacy client manifest (audio/manifest.json) is a live serving pointer too — protect
-    # every pack it references so gc can never delete a pack the shipped app still downloads.
     legacy = _get_json(client, bucket, LEGACY_MANIFEST_KEY)
     if legacy:
         for name, meta in legacy.get("packs", {}).items():
             referenced.add(meta.get("key") or f"{PACKS_PREFIX}/{name}.pack")
+    return referenced
+
+
+def gc(env: envs.Environment, grace_days: int, apply: bool) -> None:
+    """Grace-windowed GC (MS2-FR-20): delete immutable pack/catalog objects that
+    NO channel (live, beta, or any history entry) references and that are older
+    than the grace window. Dry-run by default; --apply deletes."""
+    import datetime as dt
+    client = media_delivery.r2_client()
+    bucket = env.r2_bucket
+    referenced = _collect_referenced(client, bucket)
 
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=grace_days)
     victims: list[str] = []
@@ -755,6 +789,18 @@ def gc(env: envs.Environment, grace_days: int, apply: bool) -> None:
                     continue
                 if obj["LastModified"] < cutoff:
                     victims.append(obj["Key"])
+
+    # M25: a publish that re-referenced an object could have landed AFTER the first
+    # manifest read but before/while listing — deleting it would break the live world.
+    # Re-read the pointers now and drop any candidate that became referenced since.
+    if victims:
+        referenced_after = _collect_referenced(client, bucket)
+        newly_protected = [k for k in victims if k in referenced_after]
+        if newly_protected:
+            logger.info("gc: %d candidate(s) became referenced during the scan — keeping them.",
+                        len(newly_protected))
+        victims = [k for k in victims if k not in referenced_after]
+
     logger.info("gc: %d referenced object(s); %d unreferenced older than %dd%s",
                 len(referenced), len(victims), grace_days, "" if apply else " (dry-run)")
     if apply:
@@ -779,6 +825,14 @@ def status(env: envs.Environment) -> None:
             print(f"{ch:5}: (none)")
     legacy = _get_json(client, env.r2_bucket, LEGACY_MANIFEST_KEY)
     print(f"legacy: version {legacy['version']}" if legacy else "legacy: (none)")
+    # Retained history, oldest→newest, so `rollback --to <version>` has a menu.
+    hist = [_get_json(client, env.r2_bucket, k)
+            for k in sorted(_existing_keys(client, env.r2_bucket, f"{CHANNELS_PREFIX}/history/"))]
+    hist = [m for m in hist if m]
+    if hist:
+        print("history (rollback --to <version>):")
+        for m in hist:
+            print(f"  {m.get('publishedAt', '?'):20}  version {m['version']}")
 
 
 def main() -> None:
@@ -795,6 +849,9 @@ def main() -> None:
                         help="audit: download and byte-verify every referenced object + cross-check pack members against catalogs.")
     parser.add_argument("--grace-days", type=int, default=7, help="gc: minimum object age to collect.")
     parser.add_argument("--apply", action="store_true", help="gc: actually delete (default dry-run).")
+    parser.add_argument("--to", metavar="VERSION",
+                        help="rollback: restore a specific retained version (see `status`); "
+                             "default rolls back one step to the previous live version.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stdout)
@@ -816,8 +873,9 @@ def main() -> None:
             envs.confirm_production(env, action="PROMOTE beta media to live")
             promote(env)
         elif args.command == "rollback":
-            envs.confirm_production(env, action="ROLL BACK live media")
-            rollback(env)
+            envs.confirm_production(env,
+                action=f"ROLL BACK live media{f' to {args.to}' if args.to else ' one step'}")
+            rollback(env, to_version=args.to)
         elif args.command == "audit":
             audit(env, deep=args.deep)
         elif args.command == "qa":
