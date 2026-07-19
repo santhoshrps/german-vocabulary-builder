@@ -259,7 +259,7 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
       throw new HttpError(403, "entitlement verification failed");
     });
     if (!entitlement) throw new HttpError(403, "no active entitlement");
-    subject = `storekit:${entitlement.label}`;
+    subject = `storekit:${entitlement.originalTransactionId ?? entitlement.label}`;
   } else {
     // ---- Production paid tier ----
     // The Apple-VERIFIED StoreKit purchase is the real gate (works on any network). App Attest is
@@ -275,7 +275,13 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
       await enforceTransactionDeviceCap(env, entitlement.originalTransactionId, attestedDeviceId);
       subject = attestedDeviceId;
     } else {
-      subject = `storekit:${entitlement.label}`;
+      // M17: key the subject on the PURCHASE, not the product. Every paid user shares one
+      // product label, so `storekit:<label>` made all unattested paid sessions one shared
+      // rate-limit bucket — one abuser could 429 every paid-but-unattested user's media
+      // sync. The Apple-verified originalTransactionId is unique per purchase (already
+      // used for the device cap above); label remains only as a last-resort fallback for
+      // a payload that carried no transaction identity.
+      subject = `storekit:${entitlement.originalTransactionId ?? entitlement.label}`;
     }
   }
 

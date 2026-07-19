@@ -401,6 +401,7 @@ def audit(env: envs.Environment, deep: bool) -> None:
         problems.append("live channel exists but legacy manifest missing")
 
     catalog_ids: set[str] = set()
+    live_entries: list[dict[str, Any]] = []   # live-channel catalog entries (deep cross-checks + masters)
     for ch, manifest in channels.items():
         if not manifest:
             continue
@@ -435,22 +436,67 @@ def audit(env: envs.Environment, deep: bool) -> None:
                     if len(entries) != meta["count"]:
                         problems.append(f"[{ch}] catalog {kind}: {len(entries)} entries != {meta['count']}")
                     if ch == "live":
+                        live_entries.extend(entries)
                         catalog_ids.update(e["id"] for e in entries)
 
     if deep and live and catalog_ids:
-        member_ids: set[str] = set()
+        # M21: cross-check PER STORAGE KIND. A word's image entry shares its bare id with
+        # its audio entry, so a pooled id set let a missing image member hide behind the
+        # same word's audio-pack membership.
+        def _storage_kind(catalog_kind: str) -> str:
+            return "image" if catalog_kind == "image" else "audio"
+
+        catalog_by_kind: dict[str, set[str]] = {"audio": set(), "image": set()}
+        for e in live_entries:
+            catalog_by_kind[_storage_kind(e["kind"])].add(e["id"])
+        member_by_kind: dict[str, set[str]] = {"audio": set(), "image": set()}
         import struct as _struct
         for name, meta in live["packs"].items():
             data = client.get_object(Bucket=bucket, Key=meta["key"])["Body"].read()
             hlen = _struct.unpack(">I", data[:4])[0]
+            pack_kind = "image" if name.startswith("image/") else "audio"
             for f in json.loads(data[4 : 4 + hlen])["files"]:
-                member_ids.add(f["id"])
-        only_cat = catalog_ids - member_ids
-        only_pack = member_ids - catalog_ids
-        if only_cat:
-            problems.append(f"{len(only_cat)} catalog entr(ies) not in any pack (first: {sorted(only_cat)[:3]})")
-        if only_pack:
-            problems.append(f"{len(only_pack)} pack member(s) not in any catalog (first: {sorted(only_pack)[:3]})")
+                member_by_kind[pack_kind].add(f["id"])
+        for sk in ("audio", "image"):
+            only_cat = catalog_by_kind[sk] - member_by_kind[sk]
+            only_pack = member_by_kind[sk] - catalog_by_kind[sk]
+            if only_cat:
+                problems.append(f"[{sk}] {len(only_cat)} catalog entr(ies) not in any pack (first: {sorted(only_cat)[:3]})")
+            if only_pack:
+                problems.append(f"[{sk}] {len(only_pack)} pack member(s) not in any catalog (first: {sorted(only_pack)[:3]})")
+
+    if live and live_entries:
+        # M27: the per-file masters are the rebuild safety net AND the per-file delivery
+        # source — audit them too. Existence for EVERY entry via LIST (fast, no per-object
+        # round-trips); with --deep also byte-verify a deterministic sample of image
+        # masters (image hashes ARE content hashes; audio hashes are synthesis-recipe
+        # hashes and cannot be byte-verified until H6 lands — existence-only there).
+        master_keys = (_existing_keys(client, bucket, "audio/files/")
+                       | _existing_keys(client, bucket, "image/files/"))
+        missing_masters: list[str] = []
+        image_hashes: list[str] = []
+        seen_hashes: set[tuple[str, str]] = set()
+        for e in live_entries:
+            sk = "image" if e["kind"] == "image" else "audio"
+            if (sk, e["hash"]) in seen_hashes:
+                continue
+            seen_hashes.add((sk, e["hash"]))
+            key = f"{sk}/files/{e['hash']}.{'heic' if sk == 'image' else 'm4a'}"
+            checked += 1
+            if key not in master_keys:
+                missing_masters.append(key)
+            elif sk == "image":
+                image_hashes.append(e["hash"])
+        if missing_masters:
+            problems.append(f"{len(missing_masters)} per-file master(s) missing (first: {missing_masters[:3]})")
+        if deep and image_hashes:
+            image_hashes.sort()
+            sample = image_hashes[:: max(1, len(image_hashes) // 50)][:50]
+            for h in sample:
+                body = client.get_object(Bucket=bucket, Key=f"image/files/{h}.heic")["Body"].read()
+                if hashlib.sha256(body).hexdigest() != h:
+                    problems.append(f"image master {h}: bytes do not match content hash")
+            checked += len(sample)
 
     if problems:
         for pr in problems:
@@ -526,6 +572,41 @@ def qa(env: envs.Environment) -> None:  # noqa: ARG001 — local corpus QA, env 
         mid = durations[len(durations) // 2]
         logger.info("audio QA: %d clip(s) scanned, median %.1fs, p95 %.1fs, max %.1fs",
                     scanned, mid, durations[int(len(durations) * 0.95)], durations[-1])
+
+    # M22: image gates — previously the docstring promised HEIC checks that did not exist,
+    # so a truncated/corrupt master could ship with a hash its bytes no longer matched.
+    # Every APPROVED image's cached master must exist, match its content hash exactly
+    # (the strongest structural check possible), be a plausible HEIC (ISO-BMFF ftyp with a
+    # HEIF brand), and sit inside sane size bounds (masters are produced at ≤500 KB).
+    heif_brands = {b"heic", b"heix", b"mif1", b"msf1", b"heim", b"heis", b"hevc"}
+    image_sizes: list[int] = []
+    images_scanned = 0
+    for rec in image_decisions.approved(image_decisions.load()).values():
+        h = rec["content_hash"]
+        path = image_config.CACHE_DIR / f"{h}.{image_config.FILE_EXT}"
+        if not path.exists():
+            continue   # missing masters are mirror-masters'/audit's finding, not a QA structural fail
+        data = path.read_bytes()
+        images_scanned += 1
+        if hashlib.sha256(data).hexdigest() != h:
+            problems.append(f"image {h[:12]}: bytes do not match content hash (corrupt cache)")
+            continue
+        if len(data) < 2_000:
+            problems.append(f"image {h[:12]}: implausibly small ({len(data)} B)")
+            continue
+        if data[4:8] != b"ftyp" or data[8:12] not in heif_brands:
+            problems.append(f"image {h[:12]}: not a HEIC container (brand {data[8:12]!r})")
+            continue
+        if len(data) > 700_000:
+            problems.append(f"image {h[:12]}: {len(data) / 1e3:.0f} KB exceeds the 500 KB master budget")
+            continue
+        image_sizes.append(len(data))
+    if image_sizes:
+        image_sizes.sort()
+        logger.info("image QA: %d master(s) scanned, median %.0f KB, p95 %.0f KB, max %.0f KB",
+                    images_scanned, image_sizes[len(image_sizes) // 2] / 1e3,
+                    image_sizes[int(len(image_sizes) * 0.95)] / 1e3, image_sizes[-1] / 1e3)
+
     for pr in problems[:20]:
         logger.warning("QA: %s", pr)
     if len(problems) > 20:
@@ -534,31 +615,47 @@ def qa(env: envs.Environment) -> None:  # noqa: ARG001 — local corpus QA, env 
         logger.warning("QA: ffmpeg not installed — loudness (EBU R128) measurement unavailable "
                        "(brew install ffmpeg to enable; tracked in deferred.md)")
     if problems:
-        raise PublishError(f"QA found {len(problems)} problem clip(s)")
-    logger.info("QA passed: no structural problems.")
+        raise PublishError(f"QA found {len(problems)} problem file(s)")
+    logger.info("QA passed: no structural problems (audio + image).")
 
 
 def mirror_masters(env: envs.Environment, dry_run: bool) -> None:
     """Mirror the content-addressed masters into this environment's bucket
     (audio/files/<hash>.m4a + image/files/<hash>.heic) — the new world's safety
-    net, required before the legacy bucket can be decommissioned. Upload-if-absent."""
+    net, required before the legacy bucket can be decommissioned. Upload-if-absent.
+
+    M26 hardening: uploads are write-verified (upload-if-absent means a corrupt
+    object would otherwise poison the content-addressed store PERMANENTLY); image
+    bytes are verified against their content hash BEFORE upload (locally checkable);
+    and masters that are referenced but missing locally are REPORTED — an incomplete
+    safety net must never look complete."""
     client = media_delivery.r2_client()
     bucket = env.r2_bucket
     index = json.loads(audio_sync.INDEX_PATH.read_text()) if audio_sync.INDEX_PATH.exists() else {}
     audio_by_hash: dict[str, Path] = {}
+    audio_missing = 0
     for legacy_id, h in index.items():
         path = audio_sync._cache_path(legacy_id)
         if path.exists():
             audio_by_hash.setdefault(h, path)
+        else:
+            audio_missing += 1
     store = image_decisions.load()
     image_hashes = {
         rec["content_hash"] for rec in image_decisions.approved(store).values()
     }
-    image_by_hash = {
-        h: image_config.CACHE_DIR / f"{h}.{image_config.FILE_EXT}"
-        for h in image_hashes
-        if (image_config.CACHE_DIR / f"{h}.{image_config.FILE_EXT}").exists()
-    }
+    image_by_hash: dict[str, Path] = {}
+    image_missing = 0
+    for h in image_hashes:
+        path = image_config.CACHE_DIR / f"{h}.{image_config.FILE_EXT}"
+        if path.exists():
+            image_by_hash[h] = path
+        else:
+            image_missing += 1
+    if audio_missing or image_missing:
+        logger.warning("mirror-masters: %d audio + %d image referenced master(s) MISSING locally — "
+                       "the mirror will be incomplete (run audio_sync/image tooling to restore them).",
+                       audio_missing, image_missing)
     have = _existing_keys(client, bucket, "audio/files/") | _existing_keys(client, bucket, "image/files/")
     todo: list[tuple[str, Path, str]] = []
     for h, path in audio_by_hash.items():
@@ -574,11 +671,23 @@ def mirror_masters(env: envs.Environment, dry_run: bool) -> None:
                 len(audio_by_hash), len(image_by_hash), len(todo), total / 1e6)
     if dry_run:
         return
+    corrupt = 0
     for i, (key, path, ctype) in enumerate(todo, 1):
-        client.put_object(Bucket=bucket, Key=key, Body=path.read_bytes(), ContentType=ctype)
+        data = path.read_bytes()
+        # Image hashes ARE content hashes — a cache file that no longer matches must never
+        # enter the immutable store (audio hashes are recipe hashes; not checkable — H6).
+        if ctype == "image/heic":
+            h = path.stem
+            if hashlib.sha256(data).hexdigest() != h:
+                logger.error("mirror-masters: SKIPPING corrupt image cache file %s (bytes != hash)", h[:12])
+                corrupt += 1
+                continue
+        _put_verified(client, bucket, key, data, ctype)
         if i % 500 == 0:
             logger.info("  … %d/%d", i, len(todo))
-    logger.info("mirror-masters: done (%d uploaded).", len(todo))
+    if corrupt:
+        raise PublishError(f"mirror-masters: {corrupt} corrupt cache file(s) skipped — fix the local cache")
+    logger.info("mirror-masters: done (%d uploaded, write-verified).", len(todo))
 
 
 def gc(env: envs.Environment, grace_days: int, apply: bool) -> None:
