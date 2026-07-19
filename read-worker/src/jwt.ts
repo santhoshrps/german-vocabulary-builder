@@ -72,7 +72,15 @@ export async function verifySession(
     return null;
   }
 
-  const provided = b64UrlToBytes(sig);
+  // M19: decode the signature INSIDE a guard — b64UrlToBytes → atob throws on malformed
+  // input, and unguarded it 500s (not 401) on every authenticated route. A bad signature
+  // segment is an invalid token, full stop.
+  let provided: Uint8Array;
+  try {
+    provided = b64UrlToBytes(sig);
+  } catch {
+    return null;
+  }
   let signatureValid = false;
   for (const secret of secrets) {
     if (!secret) continue;

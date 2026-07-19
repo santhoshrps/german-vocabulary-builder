@@ -916,11 +916,17 @@ export default {
           throw new HttpError(429, "rate limited");
         }
         const body = await request.json<{ ids?: unknown }>().catch(() => ({} as { ids?: unknown }));
-        const ids = Array.isArray(body.ids)
-          ? body.ids.filter((x): x is string => typeof x === "string").slice(0, GRANTS_MAX_IDS)
+        const allIds = Array.isArray(body.ids)
+          ? body.ids.filter((x): x is string => typeof x === "string")
           : [];
-        if (ids.length === 0) throw new HttpError(400, "no ids");
-        const result = await issueGrants(env, scopeOf(claims), ids, nowSeconds());
+        if (allIds.length === 0) throw new HttpError(400, "no ids");
+        // M16: resolve grants against the channel the caller is on (beta clients hold the
+        // beta catalog); same query param the channel/catalog routes use.
+        const grantChannel = url.searchParams.get("channel") === "beta" ? "beta" : "live";
+        // LOW L16: don't silently drop ids past the cap — reject so the client splits/retries
+        // instead of getting files that are neither granted nor denied.
+        if (allIds.length > GRANTS_MAX_IDS) throw new HttpError(400, `too many ids (max ${GRANTS_MAX_IDS})`);
+        const result = await issueGrants(env, scopeOf(claims), allIds, nowSeconds(), grantChannel);
         console.log(JSON.stringify({ evt: "MEDIATRACE grants", n: result.grants.length, denied: result.denied.length }));
         return json(result);
       }

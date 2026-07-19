@@ -61,7 +61,14 @@ export function scopedManifest(manifest: AudioManifest, scope: Scope): AudioMani
 // old character-class form; not exploitable — manifest allowlist + flat R2 keys —
 // but there is no reason to admit it).
 export function normalizePackName(raw: string): string {
-  const name = decodeURIComponent(raw).trim();
+  // L14: decodeURIComponent throws URIError on invalid percent-encoding ("%zz") — guard
+  // it so a malformed pack name is a clean 400, not an uncaught 500.
+  let name: string;
+  try {
+    name = decodeURIComponent(raw).trim();
+  } catch {
+    throw new HttpError(400, "invalid pack name");
+  }
   if (!/^[a-z0-9]+(\/[a-z0-9]+(\.[a-z0-9]+)*)?$/.test(name)) {
     throw new HttpError(400, "invalid pack name");
   }
@@ -147,6 +154,15 @@ export async function presignPackURL(env: Env, manifest: AudioManifest, name: st
   // Key segments are [a-z0-9.]+ (see normalizePackName), so encoding is identity —
   // but encode per-segment anyway so a future name rule can't silently break signing.
   const key = packKey(manifest, name);
+  // M20: never sign a URL to a non-existent object. A misconfigured bucket (wrong-but-
+  // present R2_MEDIA_BUCKET) or a manifest key naming a missing object would otherwise
+  // return a valid signature to nothing, and the client can't distinguish that from a
+  // working URL. Returning null here makes the caller fall back to the streamed route,
+  // which reads the same binding and 404s honestly. (env.MEDIA is the same bucket.)
+  if (env.MEDIA) {
+    const head = await env.MEDIA.head(key);
+    if (!head) return null;
+  }
   const canonicalUri = `/${bucket}/` + key.split("/").map(awsEncode).join("/");
 
   const now = new Date();

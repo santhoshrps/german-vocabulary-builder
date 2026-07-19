@@ -27,26 +27,34 @@ interface CatalogIndexEntry {
   bytes: number;
 }
 
-// Per-isolate catalog index, keyed by manifest version+generation. ~36k entries
-// build in one pass over the two catalog objects; rebuilt only when the world
-// version moves (or on isolate recycle).
-let indexCache: { key: string; index: Map<string, CatalogIndexEntry> } | null = null;
+// Per-isolate catalog index, keyed by channel + manifest version+generation. ~36k
+// entries build in one pass over the two catalog objects; rebuilt only when the world
+// version moves (or on isolate recycle). Keyed PER CHANNEL (M16): live and beta index
+// separately, so a beta client's grants resolve against the beta catalog it holds.
+const indexCacheByChannel: Record<string, { key: string; index: Map<string, CatalogIndexEntry> }> = {};
 
 async function loadJSON<T>(env: Env, key: string): Promise<T | null> {
   if (!env.MEDIA) return null;
   const obj = await env.MEDIA.get(key);
   if (!obj) return null;
-  return JSON.parse(await obj.text()) as T;
+  try {
+    return JSON.parse(await obj.text()) as T;
+  } catch {
+    // A truncated/corrupt catalog or channel object is a clean 5xx, not an uncaught
+    // 500 (LOW L17): callers surface a stable "media storage" error shape.
+    throw new HttpError(502, "corrupt media metadata");
+  }
 }
 
-export async function catalogIndex(env: Env): Promise<Map<string, CatalogIndexEntry>> {
+export async function catalogIndex(env: Env, channel: "live" | "beta" = "live"): Promise<Map<string, CatalogIndexEntry>> {
   const manifest = await loadJSON<{
     version: string; generation: string;
     catalogs?: Record<string, { key?: string }>;
-  }>(env, "media/channels/live.json");
-  if (!manifest) throw new HttpError(404, "no live media channel");
+  }>(env, `media/channels/${channel}.json`);
+  if (!manifest) throw new HttpError(404, `no ${channel} media channel`);
   const cacheKey = `${manifest.version}:${manifest.generation}`;
-  if (indexCache?.key === cacheKey) return indexCache.index;
+  const cached = indexCacheByChannel[channel];
+  if (cached?.key === cacheKey) return cached.index;
 
   const index = new Map<string, CatalogIndexEntry>();
   for (const shard of ["audio", "image"] as const) {
@@ -62,7 +70,7 @@ export async function catalogIndex(env: Env): Promise<Map<string, CatalogIndexEn
       index.set(`${shard}:${e.id}`, { kind: shard, hash: e.hash, free: e.free === 1, bytes: e.bytes });
     }
   }
-  indexCache = { key: cacheKey, index };
+  indexCacheByChannel[channel] = { key: cacheKey, index };
   return index;
 }
 
@@ -87,9 +95,10 @@ export interface Grant {
 }
 
 export async function issueGrants(
-  env: Env, scope: "free" | "full", ids: string[], now: number
+  env: Env, scope: "free" | "full", ids: string[], now: number,
+  channel: "live" | "beta" = "live"
 ): Promise<{ grants: Grant[]; denied: string[]; expiresSeconds: number }> {
-  const index = await catalogIndex(env);
+  const index = await catalogIndex(env, channel);
   const exp = now + GRANT_TTL_SECONDS;
   const grants: Grant[] = [];
   const denied: string[] = [];
@@ -112,21 +121,32 @@ export async function issueGrants(
 
 // ---- File serving -----------------------------------------------------------
 
-const FILE_EXT: Record<string, string> = { audio: "m4a", image: "heic" };
+// L15: a Map (not a plain object) so `kind` can't reach a prototype member
+// ("constructor"/"toString") and slip past the allowlist as a truthy `ext`.
+const FILE_EXT = new Map<string, string>([["audio", "m4a"], ["image", "heic"]]);
 const FILE_CONTENT_TYPE: Record<string, string> = { audio: "audio/mp4", image: "image/heic" };
 
 export async function serveFile(
   env: Env, ctx: ExecutionContext, kind: string, hash: string,
   expParam: string | null, macParam: string | null, now: number
 ): Promise<Response> {
-  const ext = FILE_EXT[kind];
+  const ext = FILE_EXT.get(kind);
   if (!ext || !/^[0-9a-f]{16,64}$/.test(hash)) throw new HttpError(400, "invalid file reference");
   const exp = parseInt(expParam ?? "", 10);
   if (!exp || !macParam) throw new HttpError(401, "missing grant");
   // 410 (not 401) for a stale-but-wellformed grant: the client's self-heal signal.
   if (exp <= now) throw new HttpError(410, "grant expired");
+  // M18: decode the client-supplied MAC inside a guard — b64UrlToBytes → atob throws on
+  // malformed input, which unguarded 500s instead of the documented 401 (and pollutes
+  // 5xx alerting with attacker-controllable noise).
+  let providedMac: Uint8Array;
+  try {
+    providedMac = b64UrlToBytes(macParam);
+  } catch {
+    throw new HttpError(401, "invalid grant");
+  }
   const expected = await grantMac(env, kind, hash, exp);
-  if (!timingSafeEqualBytes(b64UrlToBytes(macParam), b64UrlToBytes(expected))) {
+  if (!timingSafeEqualBytes(providedMac, b64UrlToBytes(expected))) {
     throw new HttpError(401, "invalid grant");
   }
   if (!env.MEDIA) throw new HttpError(503, "media storage not configured");
