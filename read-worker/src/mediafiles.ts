@@ -47,6 +47,10 @@ async function loadJSON<T>(env: Env, key: string): Promise<T | null> {
 }
 
 export async function catalogIndex(env: Env, channel: "live" | "beta" = "live"): Promise<Map<string, CatalogIndexEntry>> {
+  // L20: match the other media routes' shape — an unbound MEDIA binding is a 503
+  // "not configured", not a 404 "no channel" (a 404 wrongly reads as "this channel
+  // isn't published" when the real cause is missing storage config).
+  if (!env.MEDIA) throw new HttpError(503, "media storage not configured");
   const manifest = await loadJSON<{
     version: string; generation: string;
     catalogs?: Record<string, { key?: string }>;
