@@ -694,6 +694,59 @@ async function handleContentReport(
   return json({ status: "received" }, 201);
 }
 
+// Diagnostics reports (docs/diagnostics.md DG-FR-10/11): a user-initiated, gzipped,
+// privacy-clean report. Same write discipline as /reports — session-authenticated,
+// validated, rate-limited per subject. Body is the raw gzip; identity rides in headers
+// so indexing needs no decompression. Stored in R2 (metadata = the index); reports
+// self-expire: each upload opportunistically prunes objects older than 30 days.
+const DIAGNOSTICS_MAX_BYTES = 4 * 1024 * 1024;
+const DIAGNOSTICS_TTL_MS = 30 * 24 * 3600 * 1000;
+
+async function handleDiagnostics(
+  env: Env, request: Request, ctx: ExecutionContext, claims: SessionClaims
+): Promise<Response> {
+  if (!env.MEDIA) throw new HttpError(503, "storage not configured");
+  const reportId = (request.headers.get("X-Report-Id") || "").toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(reportId)) {
+    throw new HttpError(400, "invalid report id");
+  }
+  const build = /^[0-9A-Za-z.]{1,20}$/.test(request.headers.get("X-App-Build") || "")
+    ? (request.headers.get("X-App-Build") as string) : "unknown";
+
+  const key = rateSubjectKey(claims, clientIp(request));
+  // A few per day is plenty for a frustrated user and useless for abuse (DG-FR-10).
+  if (!(await rateLimit(env, `diagnostics:${key}`, 3, 86_400, nowSeconds()))) {
+    console.warn("diagnostics rate limited", { key });
+    throw new HttpError(429, "rate limited");
+  }
+
+  const body = new Uint8Array(await request.arrayBuffer());
+  if (body.byteLength > DIAGNOSTICS_MAX_BYTES) throw new HttpError(413, "report too large");
+  // Must actually BE gzip (RFC 1952 magic) — reject arbitrary blobs into storage.
+  if (body.byteLength < 20 || body[0] !== 0x1f || body[1] !== 0x8b) {
+    throw new HttpError(400, "not gzip");
+  }
+
+  const date = new Date().toISOString().slice(0, 10);
+  const objectKey = `diagnostics/${date}-${reportId}.json.gz`;
+  await env.MEDIA.put(objectKey, body, {
+    httpMetadata: { contentType: "application/gzip" },
+    customMetadata: { build, bytes: String(body.byteLength) },
+  });
+
+  // DG-FR-11: retention without operator action — prune >30d siblings after responding.
+  ctx.waitUntil((async () => {
+    const now = Date.now();
+    const list = await env.MEDIA!.list({ prefix: "diagnostics/" });
+    for (const obj of list.objects) {
+      if (now - obj.uploaded.getTime() > DIAGNOSTICS_TTL_MS) await env.MEDIA!.delete(obj.key);
+    }
+  })());
+
+  console.log(JSON.stringify({ evt: "DIAGNOSTICS", id: reportId.slice(0, 8), bytes: body.byteLength, build }));
+  return json({ status: "received", id: reportId }, 201);
+}
+
 // "Not enjoying" review feedback from the app (reviews.md RV-FR-FDBK). A write path like
 // /submissions: session-authenticated, per-field validated, rate-limited per subject, stored
 // as 'new' for manual operator review. D1 only — deliberately no e-mail/notification leg.
@@ -905,6 +958,11 @@ export default {
       if (request.method === "POST" && route === "reports") {
         const claims = await requireSession(env, request);
         return await handleContentReport(env, request, claims);
+      }
+      // Diagnostics reports (docs/diagnostics.md DG-FR-10): user-initiated log bundles.
+      if (request.method === "POST" && route === "diagnostics") {
+        const claims = await requireSession(env, request);
+        return await handleDiagnostics(env, request, ctx, claims);
       }
       // Per-file delivery (MS2-FR-6): the grant token IS the authorization — no
       // session needed here (grants are minted only to authenticated, entitled
