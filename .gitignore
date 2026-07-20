@@ -15,3 +15,6 @@ __pycache__/
 .DS_Store
 .DS_Store
 backups/
+.codex_work/
+outputs/
+*.xlsx
