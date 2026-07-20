@@ -348,6 +348,21 @@ If there is any uncertainty about a Chinese word, phrase, grammar point, or stan
 
 External references may be used to resolve linguistic uncertainty.
 
+### 10.1 Look things up autonomously — never pause to ask
+
+If you need to search the internet or consult an online dictionary to verify a word, character, phrase, or standard usage, **just do it**.
+
+* **Do not ask for permission or approval to search the web.**
+* **Do not stop and wait for a confirmation, an answer, or any further input.**
+* **Do not ask clarifying questions mid-run** and then idle waiting for a reply.
+* Do not report back that you *would* look something up — perform the lookup and continue.
+
+Web lookups for linguistic verification are **pre-approved**. Run them silently as part of your normal workflow and keep going until the whole task is finished.
+
+If a lookup fails or a source is unreachable, do not stop: fall back to another reputable reference, resolve the item with your Chinese-expert agents, and note any genuinely unresolved doubt in your final summary — **after** completing the work, never as a mid-run blocking question.
+
+**The task must run start to finish without interruption.** Deliver the completed file; do not hand back a partial result while waiting on approval.
+
 However, the **German source remains the primary semantic authority** whenever the English meaning conflicts with the German meaning.
 
 ---
@@ -367,6 +382,8 @@ Use a **multi-agent expert translation and verification workflow**.
 Only provide correct Chinese translations and necessary Chinese remarks.
 
 **The `Level` column is the authoritative source for the target learner level of each individual row. Do not assume a fixed level for the entire file.**
+
+**Use the internet freely to cross-check words — web lookups are pre-approved. Never ask for approval and never pause waiting for a reply; run the task start to finish without interruption (Section 10.1).**
 
 **Existing `Chinese_Remarks` must be actively reviewed as a historical error log so that previously identified mistakes and recurring translation errors are not repeated.**
 

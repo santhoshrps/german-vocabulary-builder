@@ -428,6 +428,30 @@ ones) → commit `image_decisions.json`. **No worker deploy needed** — images 
 
 ---
 
+## Approved image audit (`image_audit.py`)
+
+`image_audit.py` is a read-only audit tool for the complete set of approved noun images. It never
+changes `nouns.xlsx`, `image_decisions.json` or `image_cache/`. Its generated contact sheets and
+full-resolution JPEG inspection copies default to `sync/image_review/audit/` and remain untracked.
+
+```bash
+# From sync/ and using the project virtual environment:
+.venv/bin/python image_audit.py prepare --verify-hashes
+.venv/bin/python image_audit.py inspect 71 Posaune af09fe7d7a9f1958
+# Complete findings.csv, then render a checked Markdown report:
+.venv/bin/python image_audit.py report
+# Try to identify approvals orphaned by earlier workbook changes:
+.venv/bin/python image_audit.py recover-history
+```
+
+`prepare` validates the approved decision store against the current noun workbook, decodes every
+approved HEIC, optionally verifies each content hash, and creates a numbered manifest plus contact
+sheets. `inspect` accepts an audit number, noun ID, complete image hash or German noun. `report`
+rejects duplicate or invalid findings before joining them to the manifest. `recover-history` can
+only recover orphan identities when earlier workbook versions were committed to Git.
+
+---
+
 ## Targeted media replacement (`media_replace.py`)
 
 Redo the audio and/or image for SPECIFIC words, driven by a backlog sheet:

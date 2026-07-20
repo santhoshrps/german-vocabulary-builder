@@ -126,6 +126,16 @@ class TestValidation:
         assert len(ds.core) == 2
         assert len({r["id"] for r in ds.core}) == 2
 
+    def test_every_homonym_row_requires_a_distinct_nonempty_sense(self, data_dir):
+        """Product purpose: one blank Sense beside a tagged homonym is still ambiguous to reviewers."""
+        headers = NOUN_HEADERS + ["Sense"]
+        make_sheet(data_dir, "nouns.xlsx", headers, [
+            noun_row(German_Word="Bank", German_Article="die", English_Word="bench", Sense=""),
+            noun_row(German_Word="Bank", German_Article="die", English_Word="bank", Sense="institution"),
+        ])
+        with pytest.raises(ValidationError, match="Sense"):
+            read_dataset("nouns")
+
     def test_same_word_two_levels_collides(self, data_dir):
         # Level-free identity: the same word at two levels is ONE identity now.
         make_sheet(data_dir, "nouns.xlsx", NOUN_HEADERS, [

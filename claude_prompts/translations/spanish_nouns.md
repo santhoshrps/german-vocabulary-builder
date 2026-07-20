@@ -885,6 +885,21 @@ If there is any uncertainty about a Spanish word, gender, plural, phrase, gramma
 
 External references may be used to resolve linguistic uncertainty, and should be consulted whenever gender, plural, or regional distribution is not certain.
 
+### 15.1 Look things up autonomously — never pause to ask
+
+If you need to search the internet or consult an online dictionary to verify a word, gender, plural, or regional usage, **just do it**.
+
+* **Do not ask for permission or approval to search the web.**
+* **Do not stop and wait for a confirmation, an answer, or any further input.**
+* **Do not ask clarifying questions mid-run** and then idle waiting for a reply.
+* Do not report back that you *would* look something up — perform the lookup and continue.
+
+Web lookups for linguistic verification are **pre-approved**. Run them silently as part of your normal workflow and keep going until the whole task is finished.
+
+If a lookup fails or a source is unreachable, do not stop: fall back to another reputable reference, resolve the item with your Spanish-expert agents, and note any genuinely unresolved doubt in your final summary — **after** completing the work, never as a mid-run blocking question.
+
+**The task must run start to finish without interruption.** Deliver the completed file; do not hand back a partial result while waiting on approval.
+
 However, the **German source remains the primary semantic authority** whenever the English meaning conflicts with the German meaning.
 
 ---
@@ -914,5 +929,7 @@ Only provide correct Spanish translations in the fifteen permitted columns, and 
 **The output file MUST retain the original formatting. The only permitted formatting change is the light gray `D9D9D9` highlight defined in Section 9.2 (Section 3.3).**
 
 **The meaning of `German_Sentence` and of each Spanish sentence MUST be identical.**
+
+**Use the internet freely to cross-check words — web lookups are pre-approved. Never ask for approval and never pause waiting for a reply; run the task start to finish without interruption (Section 15.1).**
 
 **The final output must be independently verified by multiple agents, including Spanish-language experts specifically responsible for neutral Latin American, Mexican, and Peninsular Spanish translation and linguistic verification.**

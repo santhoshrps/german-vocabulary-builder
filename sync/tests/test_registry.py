@@ -93,6 +93,17 @@ class TestLanguageRegistry:
         for lang in LANGUAGES.values():
             assert "word" in lang.columns
 
+    def test_complete_fallback_graph_matches_app_worker_contract(self):
+        """Product purpose: app, publisher, and read worker resolve the same six language codes."""
+        assert {code: lang.base for code, lang in LANGUAGES.items()} == {
+            "en": None,
+            "en-US": "en",
+            "es-419": None,
+            "es-MX": "es-419",
+            "es-ES": "es-419",
+            "zh": None,
+        }
+
 
 class TestTableRegistry:
     def test_word_header_actual_name(self):
