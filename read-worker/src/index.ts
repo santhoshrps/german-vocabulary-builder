@@ -1020,6 +1020,32 @@ export default {
           throw new HttpError(429, "rate limited");
         }
         if (!env.MEDIA) throw new HttpError(503, "media storage not configured");
+        // Immutable fetch-by-key (MS2-FR-3, audit MEDIA-004): the client pins the catalog
+        // world it read in ITS manifest by asking for that exact content-addressed object —
+        // a publish landing mid-refresh can no longer swap the bytes under it. The key stays
+        // inside the catalog prefix (no traversal, no probing other prefixes).
+        if ((parts[3] || "") === "object") {
+          const suffix = parts.slice(4).join("/");
+          if (!suffix || suffix.includes("..") || !/^[A-Za-z0-9._/-]{1,200}$/.test(suffix)) {
+            throw new HttpError(400, "invalid catalog key");
+          }
+          const key = `media/catalog/${suffix}`;
+          const cacheKey = new Request(`https://read-cache.internal/${key}`, { method: "GET" });
+          const cache = caches.default;
+          const hit = await cache.match(cacheKey);
+          if (hit) return hit;
+          const obj = await env.MEDIA.get(key);
+          if (!obj) throw new HttpError(404, "no such catalog object");
+          const response = new Response(await obj.text(), {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+              "Cache-Control": "public, max-age=86400, immutable",
+            },
+          });
+          ctx.waitUntil(cache.put(cacheKey, response.clone()));
+          return response;
+        }
         const kind = (parts[3] || "").toLowerCase();
         if (!/^[a-z0-9]{1,20}$/.test(kind)) throw new HttpError(400, "invalid kind");
         const channel = url.searchParams.get("channel") === "beta" ? "beta" : "live";

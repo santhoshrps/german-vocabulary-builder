@@ -513,3 +513,16 @@ keys. Rows that fail validation (unknown word, ambiguous level, image on a non-n
 variant/voice, duplicate row) get their error in `Status` and never block other rows; the run
 exits non-zero. State files: `sync/audio_overrides.json` (committed — approved takes),
 `data/media_preview/state.json` (local — preview takes + progress markers).
+
+## World commands + the test-world harness (MS2-FR-30/32 — delivered 2026-07-21)
+
+- `python3 world.py seed --env dev|test [--dry-run] [--skip-media]` — bootstrap a world's
+  DATA in one command: all word tables (sync.py), then media (media_publish publish → live),
+  then a /health identity check. Prod is refused by design (staging doctrine: dev → beta →
+  promote). Idempotent — re-running after a failure is safe.
+- `python3 world.py drift [--from dev] [--to prod]` — read-only: per-table word ids and the
+  live-channel media delta the TO world hasn't received. Run before every prod publish.
+- `WORLD_TESTS=1 .venv/bin/python3 -m pytest tests/test_world_integration.py` — the MS2-FR-32
+  harness against the real `test` world: worker /health identities, the signed /state
+  contract, auth rejection, and (with WORLD_TEST_PROMO seeded) session mint + the real
+  D1 rate-limit counter. Offline runs skip the whole module.
