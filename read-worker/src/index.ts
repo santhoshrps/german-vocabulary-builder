@@ -617,6 +617,40 @@ interface FeedbackBody {
   app_version?: string;
   cefr_level?: string;
   locale?: string;
+  kind?: string;
+  contact_email?: string;
+}
+
+// The channels feedback can arrive from (settings.md ST-FR-FDBK-2). Anything else is stored
+// as 'other' rather than rejected — a mislabelled message is still a message worth reading.
+const FEEDBACK_KINDS = ["review", "feature", "bug", "content", "other"] as const;
+
+// How long an OPTIONAL reply address survives (ST-FR-FDBK-5). The feedback text is kept;
+// only the address expires, so the archive stays useful and stops being personal data.
+const FEEDBACK_CONTACT_TTL_DAYS = 30;
+
+// A deliberately conservative address check: this is a reply-to hint, not an identity. Long
+// or exotic input is dropped (stored as NULL) rather than rejected — losing an address must
+// never cost us the feedback itself.
+const FEEDBACK_EMAIL_MAX = 254;
+function sanitizeContactEmail(s: string | undefined): string | null {
+  const trimmed = (s || "").trim();
+  if (!trimmed || trimmed.length > FEEDBACK_EMAIL_MAX) return null;
+  return /^[^\s@,;:<>()[\]\\]+@[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$/
+    .test(trimmed) ? trimmed : null;
+}
+
+/// Erases reply addresses past their expiry, everywhere (ST-FR-FDBK-5). Idempotent and
+/// indexed, so it is cheap to run often — it is called opportunistically after each write
+/// AND from the daily cron, because a promise to delete cannot depend on someone happening
+/// to send more feedback.
+async function purgeExpiredFeedbackContacts(env: Env): Promise<number> {
+  const result = await opsQuery(env,
+    `UPDATE feedback SET contact_email = NULL, contact_expires_at = NULL
+      WHERE contact_email IS NOT NULL
+        AND (contact_expires_at IS NULL OR contact_expires_at <= datetime('now'))`
+  ).run();
+  return result.meta?.changes ?? 0;
 }
 
 // Feedback text: same charset as sentence fields plus newlines, capped at 500 (the app's
@@ -751,7 +785,7 @@ async function handleDiagnostics(
 // /submissions: session-authenticated, per-field validated, rate-limited per subject, stored
 // as 'new' for manual operator review. D1 only — deliberately no e-mail/notification leg.
 async function handleFeedback(
-  env: Env, request: Request, claims: SessionClaims
+  env: Env, request: Request, ctx: ExecutionContext, claims: SessionClaims
 ): Promise<Response> {
   const body = (await request.json().catch(() => null)) as FeedbackBody | null;
   const ip = clientIp(request);
@@ -766,6 +800,10 @@ async function handleFeedback(
     ? (body!.cefr_level as string).toUpperCase() : "unknown";
   const locale = /^[A-Za-z0-9_-]{2,20}$/.test(body?.locale || "")
     ? (body!.locale as string) : "unknown";
+  // Unknown channels become 'other' — never a rejection (see FEEDBACK_KINDS).
+  const kind = FEEDBACK_KINDS.includes(body?.kind as typeof FEEDBACK_KINDS[number])
+    ? (body!.kind as string) : "other";
+  const contactEmail = sanitizeContactEmail(body?.contact_email);
 
   const key = rateSubjectKey(claims, ip);
 
@@ -775,20 +813,39 @@ async function handleFeedback(
     throw new HttpError(429, "rate limited");
   }
 
-  // Daily cap: bound sustained flooding from one client (RV-FR-FDBK-6).
-  const recent = await opsQuery(env, 
+  // Daily cap: bound sustained flooding from one client (RV-FR-FDBK-6). Ten, not three
+  // (owner 2026-07-22): the Settings form is opened DELIBERATELY, and someone with several
+  // ideas in one day must not be silently swallowed. The 10-minute burst guard above is what
+  // actually stops flooding.
+  const recent = await opsQuery(env,
     "SELECT COUNT(*) AS c FROM feedback WHERE subject = ? AND created_at > datetime('now', '-1 day')"
   ).bind(key).first<{ c: number }>();
-  if ((recent?.c ?? 0) >= 3) {
+  if ((recent?.c ?? 0) >= 10) {
     console.warn("feedback daily cap reached", { key });
     throw new HttpError(429, "daily feedback limit reached");
   }
 
-  await opsQuery(env, 
-    `INSERT INTO feedback (id, subject, text, app_version, cefr_level, locale, status)
-     VALUES (?, ?, ?, ?, ?, ?, 'new')`
-  ).bind(crypto.randomUUID(), key, text, appVersion, cefrLevel, locale).run();
+  // Expiry computed here and bound plainly — the deletion deadline is data, and data belongs
+  // in a parameter, not spliced into SQL. Same "YYYY-MM-DD HH:MM:SS" UTC shape D1's
+  // datetime('now') writes, so the sweep's comparison is a plain string compare.
+  const contactExpires = contactEmail
+    ? new Date(Date.now() + FEEDBACK_CONTACT_TTL_DAYS * 86_400_000)
+        .toISOString().replace("T", " ").slice(0, 19)
+    : null;
 
+  await opsQuery(env,
+    `INSERT INTO feedback
+       (id, subject, text, app_version, cefr_level, locale, status, kind,
+        contact_email, contact_expires_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?, ?)`
+  ).bind(crypto.randomUUID(), key, text, appVersion, cefrLevel, locale, kind,
+         contactEmail, contactExpires).run();
+
+  // Retention without operator action (ST-FR-FDBK-5), same opportunistic shape as the
+  // diagnostics prune (DG-FR-11) — the daily cron is the guarantee, this is the fast path.
+  ctx.waitUntil(purgeExpiredFeedbackContacts(env).catch(() => 0));
+
+  console.log(JSON.stringify({ evt: "FEEDBACK", kind, reply: contactEmail !== null }));
   return json({ status: "received" }, 201);
 }
 
@@ -952,7 +1009,7 @@ export default {
       }
       if (request.method === "POST" && route === "feedback") {
         const claims = await requireSession(env, request);
-        return await handleFeedback(env, request, claims);
+        return await handleFeedback(env, request, ctx, claims);
       }
       // Content reports (words.md WD-REP-5): pending rows for manual curator review.
       if (request.method === "POST" && route === "reports") {
@@ -1127,5 +1184,19 @@ export default {
       console.error("unhandled error", { err: String(err) });
       return json({ error: "internal error" }, 500);
     }
+  },
+
+  // Daily retention sweep (settings.md ST-FR-FDBK-5). The write-path prune is the fast case;
+  // THIS is the guarantee. "Deleted within 30 days" must not depend on another user happening
+  // to send feedback — a quiet month would otherwise keep an address alive indefinitely.
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil((async () => {
+      try {
+        const erased = await purgeExpiredFeedbackContacts(env);
+        if (erased > 0) console.log(JSON.stringify({ evt: "FEEDBACK_CONTACT_PURGE", erased }));
+      } catch (err) {
+        console.error("feedback contact purge failed", { err: String(err) });
+      }
+    })());
   },
 };

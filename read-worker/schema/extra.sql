@@ -70,10 +70,35 @@ CREATE TABLE IF NOT EXISTS feedback (
   cefr_level  TEXT NOT NULL,                          -- e.g. 'A1.1'
   locale      TEXT NOT NULL,                          -- e.g. 'en_DE'
   status      TEXT NOT NULL DEFAULT 'new',            -- 'new' | 'read'
-  created_at  TEXT NOT NULL DEFAULT (datetime('now')) -- UTC
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),-- UTC
+  -- Which channel this came from (settings.md ST-FR-FDBK-2). 'review' is the original
+  -- "not enjoying" path; the rest come from Settings → Help → Send feedback. Defaulted so
+  -- every pre-existing row stays valid and the column can be added to a live table.
+  kind        TEXT NOT NULL DEFAULT 'review',         -- 'review'|'feature'|'bug'|'content'|'other'
+  -- OPTIONAL reply address (ST-FR-FDBK-4). The ONLY personal data in this database, given
+  -- deliberately by a user who wants an answer — and erased automatically after 30 days
+  -- (ST-FR-FDBK-5). The feedback TEXT is never erased; only the address expires.
+  contact_email       TEXT,
+  contact_expires_at  TEXT                            -- UTC; NULL when no address was given
 );
 
 CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback (status, created_at);
+-- The operator's real inbox query: unread, newest first, by channel.
+CREATE INDEX IF NOT EXISTS idx_feedback_kind ON feedback (kind, status, created_at);
+-- Drives the retention sweep cheaply — only rows that still hold an address.
+CREATE INDEX IF NOT EXISTS idx_feedback_contact_expiry
+  ON feedback (contact_expires_at) WHERE contact_email IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- MIGRATION for databases created before the feedback channel/contact columns
+-- existed. SQLite has no "ADD COLUMN IF NOT EXISTS", so these are expected to
+-- fail harmlessly ("duplicate column name") on an already-migrated database —
+-- run them once per environment and ignore that specific error.
+--
+--   ALTER TABLE feedback ADD COLUMN kind TEXT NOT NULL DEFAULT 'review';
+--   ALTER TABLE feedback ADD COLUMN contact_email TEXT;
+--   ALTER TABLE feedback ADD COLUMN contact_expires_at TEXT;
+-- ---------------------------------------------------------------------------
 
 -- Per-device count of search REQUESTS a free user has made. A free (attested) device
 -- may run up to a fixed cap of searches before being asked to upgrade; within the cap,

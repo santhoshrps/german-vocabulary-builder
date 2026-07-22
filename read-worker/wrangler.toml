@@ -42,6 +42,13 @@ database_id = "e9a72e23-d8dd-4b3b-b550-4940728b15fc"
 binding = "MEDIA"
 bucket_name = "german-media-prod"
 
+# Daily retention sweep (app repo settings.md ST-FR-FDBK-5): erases expired feedback reply
+# addresses. The write path prunes opportunistically too, but a promise to delete personal
+# data within 30 days cannot depend on another user happening to send feedback — this is the
+# guarantee. Named environments do NOT inherit triggers, so every environment declares its own.
+[triggers]
+crons = ["17 3 * * *"]
+
 [observability]
 enabled = true
 
@@ -104,6 +111,9 @@ database_id = "ef5fc11a-a46e-415d-8b3a-99d670cea562"
 binding = "MEDIA"
 bucket_name = "german-media-dev"
 
+[env.dev.triggers]
+crons = ["17 3 * * *"]
+
 [env.dev.observability]
 enabled = true
 
@@ -146,6 +156,9 @@ database_id = "7c2dd3ae-4ce1-4eb3-ba7c-7adbb835ed19"
 [[env.test.r2_buckets]]
 binding = "MEDIA"
 bucket_name = "german-media-test"
+
+[env.test.triggers]
+crons = ["17 3 * * *"]
 
 [env.test.observability]
 enabled = true
