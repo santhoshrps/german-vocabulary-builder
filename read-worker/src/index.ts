@@ -822,17 +822,16 @@ async function handleDiagnostics(
     throw new HttpError(429, "rate limited");
   }
 
-  // Preflight the DECLARED size before buffering (audit DIAG-002): the old order read the
-  // complete body into memory first and only then compared against the cap, so an oversized
-  // upload cost the worker its full allocation before the 413. Declared length is required
-  // (fail closed — URLSession always sends it) and the buffered recheck below stays the
-  // authoritative gate against a lying header.
+  // Preflight the DECLARED size (audit DIAG-002): reject an honestly-oversized upload for
+  // free, and require a length at all (fail closed — URLSession always sends one).
   const declared = parseInt(request.headers.get("Content-Length") || "", 10);
   if (!Number.isFinite(declared) || declared <= 0) throw new HttpError(411, "length required");
   if (declared > DIAGNOSTICS_MAX_BYTES) throw new HttpError(413, "report too large");
 
-  const body = new Uint8Array(await request.arrayBuffer());
-  if (body.byteLength > DIAGNOSTICS_MAX_BYTES) throw new HttpError(413, "report too large");
+  // STREAM the body with an early abort (audit DIAG-002 residual): a DISHONEST length must
+  // not buffer the whole payload before the 413 — the read stops the moment the cap is
+  // crossed, so peak memory is bounded by cap + one chunk regardless of the header.
+  const body = await readBodyCapped(request, DIAGNOSTICS_MAX_BYTES);
   // Must actually BE gzip (RFC 1952 magic) — reject arbitrary blobs into storage.
   if (body.byteLength < 20 || body[0] !== 0x1f || body[1] !== 0x8b) {
     throw new HttpError(400, "not gzip");
@@ -852,6 +851,33 @@ async function handleDiagnostics(
 
   console.log(JSON.stringify({ evt: "DIAGNOSTICS", id: reportId.slice(0, 8), bytes: body.byteLength, build }));
   return json({ status: "received", id: reportId }, 201);
+}
+
+/// Streams a request body into memory with a hard byte cap (audit DIAG-002): crossing the
+/// cap cancels the read and rejects with 413 immediately — the whole payload is never
+/// resident, whatever Content-Length claimed.
+async function readBodyCapped(request: Request, cap: number): Promise<Uint8Array> {
+  const reader = request.body?.getReader();
+  if (!reader) return new Uint8Array();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > cap) {
+      await reader.cancel("over cap");
+      throw new HttpError(413, "report too large");
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 /// Deletes diagnostics objects older than the 30-day TTL — ALL of them, following the list
