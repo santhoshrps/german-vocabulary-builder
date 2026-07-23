@@ -11,7 +11,10 @@ import { healthReport } from "./health";
 import { serveCachedByVersion } from "./cache";
 import { resolveChain, chainKey, isKnownLang } from "./languages";
 import { verifyAttestation, verifyAssertion, attestationRequired } from "./appattest";
-import { verifyPromoCode, verifyStoreKitTransaction, storeKitXcodeMode, claimPromoDevice, Entitlement, Scope } from "./entitlement";
+import {
+  verifyPromoCode, verifyStoreKitTransaction, verifyAppleSignedPayload,
+  recordTransactionRevocation, storeKitXcodeMode, claimPromoDevice, Entitlement, Scope,
+} from "./entitlement";
 import {
   getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP, searchWord,
   getAliases,
@@ -31,15 +34,16 @@ function scopeOf(claims: SessionClaims): Scope {
   return claims.scope === "full" ? "full" : "free";
 }
 
-// Per-client rate-limit key. Device-backed (StoreKit) sessions are keyed by their device id;
-// promo (free) sessions share ONE subject across ALL free users, so they fall back to the
-// client IP (per network) — otherwise the limit would be collective for everyone on free.
+// Per-client rate-limit key. Device-backed (StoreKit) sessions are keyed by their device id.
+// CLIENT-CLAIMED subjects fall back to the client IP for RATE limiting: an "install:" id
+// (audit SEC-007) is honest-client state — trivially rotatable by an abuser, so it must not
+// buy a fresh rate bucket — and legacy "promo:*" subjects are shared across all free users.
+// (The LIFETIME search cap is different: it keys on claims.sub directly, where the
+// per-install subject is exactly the fix — see handleSession/handleSearch.)
 function rateSubjectKey(claims: SessionClaims, ip: string): string {
-  // Prefer the device subject when present (attested sessions, INCLUDING the production
-  // free tier, whose sub is the device id). Dev/self-test promo sessions share a
-  // "promo:*" subject across all free users, so they fall back to the client IP.
   const sub = claims.sub || "";
-  return sub && !sub.startsWith("promo:") ? `dev:${sub}` : `ip:${ip}`;
+  return sub && !sub.startsWith("promo:") && !sub.startsWith("install:")
+    ? `dev:${sub}` : `ip:${ip}`;
 }
 
 // Keep only letters (incl. German ä/ö/ü/ß) and spaces; strips junk AND SQL LIKE wildcards
@@ -101,6 +105,11 @@ interface SessionBody {
   challenge?: string;
   // StoreKit path (full access): a signed transaction to verify the purchase.
   signedTransaction?: string;
+  // Pseudonymous Keychain-backed installation id (audit SEC-007): scopes the free-tier
+  // search allowance to ONE installation when App Attest can't complete, instead of the
+  // whole free tier sharing a single "promo:<label>" allowance. Client-claimed, so it
+  // never substitutes for attestation anywhere else (rate limits still key on IP).
+  installId?: string;
 }
 
 // Verify an App Attest assertion for a registered device and return its device id.
@@ -193,23 +202,77 @@ async function enforceTransactionDeviceCap(
   env: Env, originalTransactionId: string | undefined, deviceId: string
 ): Promise<void> {
   if (!originalTransactionId) return; // payload carried no identity — nothing to bind on
-  const known = await opsQuery(env, 
-    "SELECT 1 FROM transaction_devices WHERE original_transaction_id = ? AND device_id = ?"
+  // Single atomic claim (audit SEC-006 — same pattern as claimPromoDevice): the INSERT takes
+  // a slot only while one is free, and D1 serializes writes, so two NEW devices racing for
+  // the last slot can't both slip past a separate count check (the old known → count →
+  // insert sequence was exactly that TOCTOU). Re-claiming one's own slot is a no-op.
+  await opsQuery(env,
+    `INSERT INTO transaction_devices (original_transaction_id, device_id)
+     SELECT ?1, ?2
+     WHERE (SELECT COUNT(*) FROM transaction_devices WHERE original_transaction_id = ?1) < ?3
+     ON CONFLICT (original_transaction_id, device_id) DO NOTHING`
+  ).bind(originalTransactionId, deviceId, TRANSACTION_DEVICE_CAP).run();
+  const mine = await opsQuery(env,
+    "SELECT 1 FROM transaction_devices WHERE original_transaction_id = ?1 AND device_id = ?2"
   ).bind(originalTransactionId, deviceId).first();
-  if (known) return; // an already-bound device always keeps working
-
-  const row = await opsQuery(env, 
-    "SELECT COUNT(*) AS c FROM transaction_devices WHERE original_transaction_id = ?"
-  ).bind(originalTransactionId).first<{ c: number }>();
-  if ((row?.c ?? 0) >= TRANSACTION_DEVICE_CAP) {
+  if (!mine) {
     console.warn("transaction device cap reached", { originalTransactionId });
     throw new HttpError(403, "device limit reached for this purchase");
   }
+}
 
-  await opsQuery(env, 
-    `INSERT INTO transaction_devices (original_transaction_id, device_id)
-     VALUES (?, ?) ON CONFLICT(original_transaction_id, device_id) DO NOTHING`
-  ).bind(originalTransactionId, deviceId).run();
+// ---- App Store Server Notifications V2 (audit SEC-004) ----------------------
+// Apple posts a signed JWS whenever a purchase's state changes (refund, revocation).
+// The signature chain to the pinned Apple root IS the authentication — no session.
+// Recording the revocation makes the server's current state dominate any cached
+// pre-refund transaction JWS at the next session mint (see verifyStoreKitTransaction).
+// NOTE: fires only once the notification URL is configured in App Store Connect —
+// until then the endpoint is live but silent (activation tracked with the paid account).
+
+interface NotificationPayload {
+  notificationType?: string;
+  subtype?: string;
+  data?: { signedTransactionInfo?: string };
+}
+
+interface NotificationTransactionInfo {
+  originalTransactionId?: string;
+  revocationDate?: number;
+}
+
+const REVOKING_NOTIFICATION_TYPES = new Set(["REFUND", "REVOKE", "REFUND_DECLINED_REVERSED"]);
+
+async function handleAppStoreNotification(env: Env, request: Request): Promise<Response> {
+  const body = (await request.json().catch(() => null)) as { signedPayload?: string } | null;
+  if (!body?.signedPayload) throw new HttpError(400, "missing signedPayload");
+
+  const payload = await verifyAppleSignedPayload(env, body.signedPayload, "assn")
+    .catch((e) => {
+      console.warn("assn: signature rejected", { err: String(e) });
+      throw new HttpError(401, "invalid notification signature");
+    }) as NotificationPayload;
+
+  const type = payload.notificationType || "";
+  if (type === "TEST") return json({ status: "ok" });
+  if (!REVOKING_NOTIFICATION_TYPES.has(type)) {
+    // Not a revocation event — acknowledged so Apple stops retrying; nothing to record.
+    return json({ status: "ignored", type });
+  }
+
+  // The transaction identity rides in an INNER signed JWS — verified with the same chain
+  // policy, never merely decoded (the outer signature does not cover a tampered inner one).
+  const inner = payload.data?.signedTransactionInfo;
+  if (!inner) throw new HttpError(400, "missing signedTransactionInfo");
+  const txn = await verifyAppleSignedPayload(env, inner, "assn-txn")
+    .catch((e) => {
+      console.warn("assn: transaction signature rejected", { err: String(e) });
+      throw new HttpError(401, "invalid transaction signature");
+    }) as NotificationTransactionInfo;
+  if (!txn.originalTransactionId) throw new HttpError(400, "missing originalTransactionId");
+
+  await recordTransactionRevocation(env, txn.originalTransactionId, type);
+  console.log(JSON.stringify({ evt: "ASSN_REVOKE", type }));
+  return json({ status: "recorded" });
 }
 
 async function handleSession(env: Env, request: Request): Promise<Response> {
@@ -250,8 +313,13 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
         throw new HttpError(503, "device check required - try again shortly");
       }
     }
-    // Device-scoped when attested (pins the free search cap to hardware); label-scoped otherwise.
-    subject = attestedDeviceId ?? `promo:${entitlement.label}`;
+    // Device-scoped when attested (pins the free search cap to hardware). Unattested:
+    // the Keychain-backed installation id (audit SEC-007) — WITHOUT it every free user
+    // shared one "promo:<label>" subject, i.e. one collective 100-search lifetime
+    // allowance. Strict UUID shape; anything else falls back to the legacy label subject.
+    const installId = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
+      .test((body.installId || "").toLowerCase()) ? (body.installId as string).toLowerCase() : null;
+    subject = attestedDeviceId ?? (installId ? `install:${installId}` : `promo:${entitlement.label}`);
   } else if (storeKitXcodeMode(env) && body.signedTransaction && !body.assertion) {
     // ---- Local Xcode testing: StoreKit transaction only, no App Attest (dev only) ----
     entitlement = await verifyStoreKitTransaction(env, body.signedTransaction).catch((e) => {
@@ -754,6 +822,15 @@ async function handleDiagnostics(
     throw new HttpError(429, "rate limited");
   }
 
+  // Preflight the DECLARED size before buffering (audit DIAG-002): the old order read the
+  // complete body into memory first and only then compared against the cap, so an oversized
+  // upload cost the worker its full allocation before the 413. Declared length is required
+  // (fail closed — URLSession always sends it) and the buffered recheck below stays the
+  // authoritative gate against a lying header.
+  const declared = parseInt(request.headers.get("Content-Length") || "", 10);
+  if (!Number.isFinite(declared) || declared <= 0) throw new HttpError(411, "length required");
+  if (declared > DIAGNOSTICS_MAX_BYTES) throw new HttpError(413, "report too large");
+
   const body = new Uint8Array(await request.arrayBuffer());
   if (body.byteLength > DIAGNOSTICS_MAX_BYTES) throw new HttpError(413, "report too large");
   // Must actually BE gzip (RFC 1952 magic) — reject arbitrary blobs into storage.
@@ -768,17 +845,35 @@ async function handleDiagnostics(
     customMetadata: { build, bytes: String(body.byteLength) },
   });
 
-  // DG-FR-11: retention without operator action — prune >30d siblings after responding.
-  ctx.waitUntil((async () => {
-    const now = Date.now();
-    const list = await env.MEDIA!.list({ prefix: "diagnostics/" });
-    for (const obj of list.objects) {
-      if (now - obj.uploaded.getTime() > DIAGNOSTICS_TTL_MS) await env.MEDIA!.delete(obj.key);
-    }
-  })());
+  // DG-FR-11: retention without operator action — prune expired siblings after responding.
+  // ALSO runs on the daily cron (audit DIAG-001): upload-piggybacked pruning alone stops
+  // the moment uploads stop, which is exactly when stale reports would otherwise sit forever.
+  ctx.waitUntil(pruneExpiredDiagnostics(env).catch(() => 0));
 
   console.log(JSON.stringify({ evt: "DIAGNOSTICS", id: reportId.slice(0, 8), bytes: body.byteLength, build }));
   return json({ status: "received", id: reportId }, 201);
+}
+
+/// Deletes diagnostics objects older than the 30-day TTL — ALL of them, following the list
+/// cursor across pages (audit DIAG-001: the old prune read a single page, so anything past
+/// the first 1,000 objects was invisible to retention). Shared by the upload piggyback and
+/// the daily cron. Returns the number removed, for the cron's log line.
+async function pruneExpiredDiagnostics(env: Env): Promise<number> {
+  if (!env.MEDIA) return 0;
+  const now = Date.now();
+  let removed = 0;
+  let cursor: string | undefined;
+  do {
+    const page: R2Objects = await env.MEDIA.list({ prefix: "diagnostics/", cursor });
+    for (const obj of page.objects) {
+      if (now - obj.uploaded.getTime() > DIAGNOSTICS_TTL_MS) {
+        await env.MEDIA.delete(obj.key);
+        removed += 1;
+      }
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return removed;
 }
 
 // "Not enjoying" review feedback from the app (reviews.md RV-FR-FDBK). A write path like
@@ -969,6 +1064,14 @@ export default {
       }
       if (request.method === "POST" && route === "session") {
         return await handleSession(env, request);
+      }
+      // App Store Server Notifications V2 (audit SEC-004): Apple-signed JWS, no session —
+      // the pinned-root chain verification IS the authentication. Bounded per IP.
+      if (request.method === "POST" && route === "appstore" && sub === "notifications") {
+        if (!(await rateLimit(env, `assn:${ip}`, 60, 60, nowSeconds()))) {
+          return json({ error: "rate limited" }, 429);
+        }
+        return await handleAppStoreNotification(env, request);
       }
 
       // Everything below requires a valid session. The session's scope decides
@@ -1196,6 +1299,15 @@ export default {
         if (erased > 0) console.log(JSON.stringify({ evt: "FEEDBACK_CONTACT_PURGE", erased }));
       } catch (err) {
         console.error("feedback contact purge failed", { err: String(err) });
+      }
+      // Diagnostics retention (audit DIAG-001): the cron is the guarantee — the upload
+      // piggyback stops pruning exactly when uploads stop, which is when stale reports
+      // would otherwise outlive their 30-day promise.
+      try {
+        const removed = await pruneExpiredDiagnostics(env);
+        if (removed > 0) console.log(JSON.stringify({ evt: "DIAGNOSTICS_PRUNE", removed }));
+      } catch (err) {
+        console.error("diagnostics prune failed", { err: String(err) });
       }
     })());
   },

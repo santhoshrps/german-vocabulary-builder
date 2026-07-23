@@ -156,6 +156,15 @@ export function extractAppAttestNonce(certDer: Uint8Array): Uint8Array {
   return certDer.slice(nonceOctet.contentStart, nonceOctet.contentEnd);
 }
 
+// Whether the cert carries an extension with this OID (hex-encoded content bytes) at all —
+// the certificate-PURPOSE check (audit SEC-001): Apple marks each certificate class with a
+// proprietary marker extension (e.g. 1.2.840.113635.100.6.11.1 on StoreKit receipt-signing
+// leaves), so requiring the marker pins a chain to its intended purpose — a compatible
+// Apple-issued cert of a DIFFERENT class can no longer stand in.
+export function hasExtension(certDer: Uint8Array, oidHexString: string): boolean {
+  return findExtension(certDer, oidHexString) !== null;
+}
+
 // Whether the cert is a CA per basicConstraints (2.5.29.19):
 // extnValue wraps SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }.
 // No extension / empty SEQUENCE both mean cA = FALSE.

@@ -12,7 +12,16 @@ import { Env } from "./env";
 import { opsQuery } from "./db";
 import { utf8, sha256, bytesToHex, b64UrlToBytes, b64ToBytes } from "./bytes";
 import { extractSPKI } from "./crypto/der";
-import { verifyChainToAppleRoot } from "./crypto/x509";
+import { verifyChainToAppleRoot, ChainPurposePolicy } from "./crypto/x509";
+
+/// StoreKit certificate-purpose policy (audit SEC-001), matching Apple's official
+/// app-store-server-library verifier: the receipt/transaction-signing leaf carries
+/// 1.2.840.113635.100.6.11.1 and the Apple intermediate carries 1.2.840.113635.100.6.2.1.
+/// OIDs are hex-encoded DER content bytes (see der.ts conventions).
+export const STOREKIT_CHAIN_PURPOSE: ChainPurposePolicy = {
+  leafMarkerOID: "2a864886f76364060b01",          // 1.2.840.113635.100.6.11.1
+  intermediateMarkerOID: "2a864886f76364060201",  // 1.2.840.113635.100.6.2.1
+};
 
 /// Access scope an entitlement grants. "free" = the curated 100-word preview
 /// (rows with free = 1); "full" = the entire dataset.
@@ -106,6 +115,22 @@ interface TransactionPayload {
   originalTransactionId?: string; // stable purchase identity (device-cap binding)
   expiresDate?: number;     // ms epoch (subscriptions)
   revocationDate?: number;  // ms epoch
+  environment?: string;     // "Production" | "Sandbox" | "Xcode" (audit SEC-003)
+}
+
+/// The signing environments this deployment accepts (audit SEC-003). Secure by default:
+/// a production deployment accepts ONLY "Production" — Sandbox/TestFlight-sandbox evidence
+/// (mintable for free with an Apple sandbox account) must never unlock production
+/// entitlements. Dev deployments accept every environment. The override var exists for ONE
+/// conscious case: enabling "Production,Sandbox" on prod while TestFlight testers exercise
+/// IAP (TestFlight purchases sign as Sandbox) — set it, test, remove it.
+function acceptedEnvironments(env: Env): Set<string> {
+  const configured = (env.STOREKIT_ACCEPTED_ENVIRONMENTS || "")
+    .split(",").map((s) => s.trim()).filter(Boolean);
+  if (configured.length > 0) return new Set(configured);
+  return env.APP_ATTEST_ENV === "production"
+    ? new Set(["Production"])
+    : new Set(["Production", "Sandbox", "Xcode"]);
 }
 
 /// Whether StoreKit "xcode" test mode is active for this deployment.
@@ -136,34 +161,28 @@ export function storeKitXcodeMode(env: Env): boolean {
   return true;
 }
 
-export async function verifyStoreKitTransaction(
-  env: Env,
-  signedTransaction: string
-): Promise<Entitlement | null> {
-  const parts = signedTransaction.split(".");
-  if (parts.length !== 3) throw new Error("storekit: malformed JWS");
+/// Verifies an Apple StoreKit-signed JWS — the x5c chain to the pinned Apple Root CA - G3
+/// under the StoreKit certificate-purpose policy (audit SEC-001), then the ES256 signature
+/// with the leaf key — and returns the decoded payload. Shared by transaction verification
+/// and App Store Server Notifications (audit SEC-004), so the trust rules can never drift.
+export async function verifyAppleSignedPayload(
+  env: Env, jws: string, label: string
+): Promise<unknown> {
+  const parts = jws.split(".");
+  if (parts.length !== 3) throw new Error(`${label}: malformed JWS`);
   const [headerB64, payloadB64, sigB64] = parts;
 
-  // ---- Local Xcode testing path -------------------------------------------
-  // StoreKit Configuration File transactions are signed by Xcode's local test
-  // certificate, not Apple's CA, so they can't be verified against the Apple
-  // root. In "xcode" mode we DECODE the payload and validate its claims only —
-  // no signature/chain check. This is insecure by design and MUST be off
-  // ("production") for any real build.
-  if (storeKitXcodeMode(env)) {
-    const payload = JSON.parse(new TextDecoder().decode(b64UrlToBytes(payloadB64))) as TransactionPayload;
-    return validateTransactionClaims(env, payload);
-  }
-
   const header = JSON.parse(new TextDecoder().decode(b64UrlToBytes(headerB64))) as JwsHeader;
-  if (header.alg !== "ES256" || !header.x5c?.length) throw new Error("storekit: bad header");
+  if (header.alg !== "ES256" || !header.x5c?.length) throw new Error(`${label}: bad header`);
 
   // x5c certs are standard base64 DER.
   const chain = header.x5c.map((c) => b64ToBytes(c));
 
-  // 1. Verify the chain terminates at the pinned Apple Root CA - G3 (shared x509.ts:
-  //    per-cert curve/hash detection, validity windows, CA basicConstraints).
-  await verifyChainToAppleRoot(chain, env.APPLE_STOREKIT_ROOT_CA, "storekit");
+  // 1. Chain to the pinned Apple Root CA - G3 (shared x509.ts: per-cert curve/hash
+  //    detection, validity windows, CA basicConstraints) UNDER the StoreKit purpose
+  //    policy (audit SEC-001): leaf + intermediate must carry Apple's StoreKit markers,
+  //    so a compatible Apple-issued NON-StoreKit chain can no longer sign claims.
+  await verifyChainToAppleRoot(chain, env.APPLE_STOREKIT_ROOT_CA, label, STOREKIT_CHAIN_PURPOSE);
 
   // 2. Verify the JWS signature with the leaf cert's public key (ES256 = raw r||s).
   const leafKey = await crypto.subtle.importKey(
@@ -179,17 +198,79 @@ export async function verifyStoreKitTransaction(
     b64UrlToBytes(sigB64),
     utf8(`${headerB64}.${payloadB64}`)
   );
-  if (!ok) throw new Error("storekit: bad signature");
+  if (!ok) throw new Error(`${label}: bad signature`);
 
-  // 3. Validate the payload claims.
-  const payload = JSON.parse(new TextDecoder().decode(b64UrlToBytes(payloadB64))) as TransactionPayload;
-  return validateTransactionClaims(env, payload);
+  return JSON.parse(new TextDecoder().decode(b64UrlToBytes(payloadB64)));
 }
 
-// Shared claim checks: bundle id, allowed product, not expired/revoked. A valid
-// StoreKit purchase always grants full access.
+export async function verifyStoreKitTransaction(
+  env: Env,
+  signedTransaction: string
+): Promise<Entitlement | null> {
+  // ---- Local Xcode testing path -------------------------------------------
+  // StoreKit Configuration File transactions are signed by Xcode's local test
+  // certificate, not Apple's CA, so they can't be verified against the Apple
+  // root. In "xcode" mode we DECODE the payload and validate its claims only —
+  // no signature/chain check. This is insecure by design and MUST be off
+  // ("production") for any real build.
+  if (storeKitXcodeMode(env)) {
+    const parts = signedTransaction.split(".");
+    if (parts.length !== 3) throw new Error("storekit: malformed JWS");
+    const payload = JSON.parse(new TextDecoder().decode(b64UrlToBytes(parts[1]))) as TransactionPayload;
+    const entitlement = validateTransactionClaims(env, payload);
+    return entitlement && (await isTransactionRevoked(env, entitlement.originalTransactionId))
+      ? null : entitlement;
+  }
+
+  const payload = await verifyAppleSignedPayload(env, signedTransaction, "storekit") as TransactionPayload;
+  const entitlement = validateTransactionClaims(env, payload);
+  // Revocation precedence (audit SEC-004): the CURRENT server state dominates any signed
+  // payload — a lifetime purchase's JWS never expires, so a cached pre-refund transaction
+  // would otherwise re-mint sessions forever.
+  if (entitlement && (await isTransactionRevoked(env, entitlement.originalTransactionId))) {
+    console.warn("storekit: revoked transaction rejected", {
+      originalTransactionId: entitlement.originalTransactionId,
+    });
+    return null;
+  }
+  return entitlement;
+}
+
+/// Whether this purchase has a recorded refund/revocation (transaction_revocations,
+/// written by the App Store Server Notifications endpoint — audit SEC-004).
+async function isTransactionRevoked(env: Env, originalTransactionId?: string): Promise<boolean> {
+  if (!originalTransactionId) return false;
+  const row = await opsQuery(env,
+    "SELECT 1 FROM transaction_revocations WHERE original_transaction_id = ?"
+  ).bind(originalTransactionId).first();
+  return !!row;
+}
+
+/// Records a refund/revocation (idempotent upsert). Called by the notifications endpoint.
+export async function recordTransactionRevocation(
+  env: Env, originalTransactionId: string, reason: string
+): Promise<void> {
+  await opsQuery(env,
+    `INSERT INTO transaction_revocations (original_transaction_id, reason, recorded_at)
+     VALUES (?, ?, datetime('now'))
+     ON CONFLICT(original_transaction_id) DO UPDATE SET
+       reason = excluded.reason, recorded_at = excluded.recorded_at`
+  ).bind(originalTransactionId, reason).run();
+}
+
+// Shared claim checks: bundle id, allowed product, environment, not expired/revoked.
+// A valid StoreKit purchase always grants full access.
 function validateTransactionClaims(env: Env, payload: TransactionPayload): Entitlement | null {
   if (payload.bundleId !== env.APP_BUNDLE_ID) throw new Error("storekit: bundleId mismatch");
+
+  // Environment binding (audit SEC-003): a production deployment must not accept Sandbox
+  // (or Xcode) evidence — a sandbox purchase is mintable for free with an Apple sandbox
+  // account. Fail closed on a MISSING field too: every StoreKit 2 signed transaction
+  // carries `environment`, so its absence means the payload is not what it claims to be.
+  const environment = payload.environment || "";
+  if (!acceptedEnvironments(env).has(environment)) {
+    throw new Error(`storekit: environment '${environment || "missing"}' not accepted by this deployment`);
+  }
 
   const allowed = env.ENTITLEMENT_PRODUCT_IDS.split(",").map((s) => s.trim()).filter(Boolean);
   if (!allowed.includes(payload.productId)) return null;

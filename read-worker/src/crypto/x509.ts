@@ -14,17 +14,44 @@
 
 import {
   extractSPKI, tbsBytes, signatureDer, ecdsaDerToRaw,
-  spkiNamedCurve, signatureHash, validity, isCA, CURVE_COMPONENT_SIZE,
+  spkiNamedCurve, signatureHash, validity, isCA, hasExtension, CURVE_COMPONENT_SIZE,
 } from "./der";
 import { b64ToBytes } from "../bytes";
+
+/// Certificate-purpose policy (audit SEC-001): the Apple marker extensions that pin a chain
+/// to its intended class. Without this, ANY Apple-rooted EC chain of the right shape could
+/// sign attacker-selected claims — chain-of-trust alone proves issuance, not purpose.
+/// (App Attest binds purpose differently: its distinct pinned root plus the required nonce
+/// extension — 1.2.840.113635.100.8.2 — that `extractAppAttestNonce` fails closed on.)
+export interface ChainPurposePolicy {
+  /// Marker extension OID (hex content bytes) REQUIRED on the leaf certificate.
+  leafMarkerOID: string;
+  /// Marker extension OID (hex content bytes) REQUIRED on the intermediate CA.
+  intermediateMarkerOID: string;
+}
 
 export async function verifyChainToAppleRoot(
   x5c: Uint8Array[],
   rootB64: string | undefined,
-  label: string
+  label: string,
+  purpose?: ChainPurposePolicy
 ): Promise<void> {
   if (!rootB64) throw new Error(`${label}: pinned Apple root CA not configured`);
   const now = Date.now();
+
+  // Certificate purpose (audit SEC-001): enforced BEFORE any signature work. Under a purpose
+  // policy the sender's chain must be exactly [leaf, intermediate, root] (Apple's published
+  // shape — a longer or shorter chain is not a StoreKit signing chain), the leaf must carry
+  // the class marker, and the intermediate must carry the Apple-intermediate marker.
+  if (purpose) {
+    if (x5c.length !== 3) throw new Error(`${label}: expected a 3-cert chain, got ${x5c.length}`);
+    if (!hasExtension(x5c[0], purpose.leafMarkerOID)) {
+      throw new Error(`${label}: leaf certificate lacks the required purpose marker`);
+    }
+    if (!hasExtension(x5c[1], purpose.intermediateMarkerOID)) {
+      throw new Error(`${label}: intermediate certificate lacks the required purpose marker`);
+    }
+  }
 
   // Build the full chain: leaf, intermediate(s), then the pinned root as the trust anchor.
   // (If the sender already included the root, the final link is the root's self-signature

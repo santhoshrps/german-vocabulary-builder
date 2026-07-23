@@ -37,6 +37,11 @@ export interface Env {
   // ONLY when APP_ATTEST_ENV !== "production" (see storeKitXcodeMode in
   // entitlement.ts), so it can never take effect on a production deployment.
   STOREKIT_ENV?: string;
+  // Signed-transaction environments this deployment accepts (audit SEC-003), comma-
+  // separated. UNSET is the secure default: production accepts only "Production";
+  // dev accepts everything. Set "Production,Sandbox" on prod ONLY while TestFlight
+  // testers exercise IAP (TestFlight signs as Sandbox), then remove it.
+  STOREKIT_ACCEPTED_ENVIRONMENTS?: string;
 
   // Direct-from-storage pack delivery (MS-NFR-PERF-3): the worker authorizes and mints a
   // short-lived presigned R2 URL; the client downloads the bytes straight from R2 so the

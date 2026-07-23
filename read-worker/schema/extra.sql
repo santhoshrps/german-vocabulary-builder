@@ -163,3 +163,15 @@ CREATE TABLE IF NOT EXISTS promo_claims (
   claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (code_hash, device_id)
 );
+
+-- Refund/revocation state per StoreKit purchase (audit SEC-004): written by the App Store
+-- Server Notifications V2 endpoint (/v1/appstore/notifications), consulted on EVERY signed-
+-- transaction verification, so the server's CURRENT state dominates a cached pre-refund JWS
+-- (a lifetime purchase's transaction never expires on its own). Idempotent upsert per
+-- original transaction. NOTE: rows only start arriving once the notification URL is
+-- configured in App Store Connect (needs the paid developer account).
+CREATE TABLE IF NOT EXISTS transaction_revocations (
+  original_transaction_id TEXT PRIMARY KEY,
+  reason                  TEXT NOT NULL,               -- notificationType (REFUND / REVOKE / ...)
+  recorded_at             TEXT NOT NULL DEFAULT (datetime('now'))
+);
