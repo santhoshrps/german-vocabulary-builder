@@ -6,7 +6,8 @@
     "dev": "wrangler dev --env dev",
     "deploy": "wrangler deploy",
     "deploy:dev": "wrangler deploy --env dev",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:certs": "node test/cert-policy.test.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.0.0",

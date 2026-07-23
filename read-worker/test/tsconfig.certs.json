@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "lib": ["ES2022", "DOM"],
+    "strict": false,
+    "skipLibCheck": true,
+    "noCheck": true,
+    "moduleResolution": "node",
+    "noEmit": false,
+    "outDir": "../.test-dist",
+    "rootDir": "../src"
+  },
+  "include": ["../src/crypto/x509.ts", "../src/crypto/der.ts", "../src/bytes.ts"]
+}
