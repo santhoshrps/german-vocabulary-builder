@@ -46,17 +46,37 @@ async function loadJSON<T>(env: Env, key: string): Promise<T | null> {
   }
 }
 
-export async function catalogIndex(env: Env, channel: "live" | "beta" = "live"): Promise<Map<string, CatalogIndexEntry>> {
+interface ChannelManifestLite {
+  version: string;
+  generation: string;
+  world?: string;
+  catalogs?: Record<string, { key?: string }>;
+}
+
+/// The channel's WORLD identity (audit MEDIA-001): the publisher's canonical digest when
+/// present; version:generation for pre-migration worlds.
+export function worldOf(manifest: ChannelManifestLite): string {
+  return manifest.world ?? `${manifest.version}:${manifest.generation}`;
+}
+
+async function loadChannel(env: Env, channel: "live" | "beta"): Promise<ChannelManifestLite> {
   // L20: match the other media routes' shape — an unbound MEDIA binding is a 503
   // "not configured", not a 404 "no channel" (a 404 wrongly reads as "this channel
   // isn't published" when the real cause is missing storage config).
   if (!env.MEDIA) throw new HttpError(503, "media storage not configured");
-  const manifest = await loadJSON<{
-    version: string; generation: string;
-    catalogs?: Record<string, { key?: string }>;
-  }>(env, `media/channels/${channel}.json`);
+  const manifest = await loadJSON<ChannelManifestLite>(env, `media/channels/${channel}.json`);
   if (!manifest) throw new HttpError(404, `no ${channel} media channel`);
-  const cacheKey = `${manifest.version}:${manifest.generation}`;
+  return manifest;
+}
+
+export async function catalogIndex(
+  env: Env, channel: "live" | "beta" = "live", preloaded?: ChannelManifestLite
+): Promise<Map<string, CatalogIndexEntry>> {
+  const manifest = preloaded ?? (await loadChannel(env, channel));
+  // Cache keyed by the FULL world identity (audit MEDIA-001): a catalog-only or
+  // floor-only publish changes the world digest, so the isolate cache can no longer
+  // serve a stale index for an unchanged pack-derived version.
+  const cacheKey = worldOf(manifest);
   const cached = indexCacheByChannel[channel];
   if (cached?.key === cacheKey) return cached.index;
 
@@ -100,9 +120,16 @@ export interface Grant {
 
 export async function issueGrants(
   env: Env, scope: "free" | "full", ids: string[], now: number,
-  channel: "live" | "beta" = "live"
+  channel: "live" | "beta" = "live", expectedWorld?: string
 ): Promise<{ grants: Grant[]; denied: string[]; expiresSeconds: number }> {
-  const index = await catalogIndex(env, channel);
+  const manifest = await loadChannel(env, channel);
+  // World precondition (audit MEDIA-001/002): when the caller states which world its
+  // catalog truth came from, a moved pointer answers 409 stale_world — never a silent
+  // resolution of the same ids against a NEWER catalog the caller has not seen.
+  if (expectedWorld && expectedWorld !== worldOf(manifest)) {
+    throw new HttpError(409, "stale_world");
+  }
+  const index = await catalogIndex(env, channel, manifest);
   const exp = now + GRANT_TTL_SECONDS;
   const grants: Grant[] = [];
   const denied: string[] = [];

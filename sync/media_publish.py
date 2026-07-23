@@ -302,10 +302,25 @@ def publish(env: envs.Environment, channel: str, *, dry_run: bool, skip_missing:
         if meta["key"] not in have:
             _put_verified(client, bucket, meta["key"], catalog_bytes[kind], "application/json")
 
+    # Canonical WORLD digest (audit MEDIA-001): ONE identity over the generation, the
+    # compatibility floor, the scope map, and every pack and catalog fingerprint — so a
+    # catalog-only or floor-only change is a DIFFERENT world even when the pack-derived
+    # version is unchanged. Promotion equality, worker caches, grant preconditions and
+    # client persistence all key on this.
+    world_parts = [f"g={generation}", f"f={MEDIA_MIN_CLIENT_GENERATION}"]
+    for scope_name in sorted(legacy_manifest["scopes"]):
+        world_parts.append(f"s:{scope_name}=" + ",".join(legacy_manifest["scopes"][scope_name]))
+    for pack_name in sorted(pack_meta):
+        world_parts.append(f"p:{pack_name}={pack_meta[pack_name]['sha']}")
+    for cat_kind in sorted(catalogs):
+        world_parts.append(f"c:{cat_kind}={catalogs[cat_kind]['key']}")
+    world = hashlib.sha256("|".join(world_parts).encode()).hexdigest()[:32]
+
     channel_manifest = {
         "v": 1,
         "version": version,
         "generation": generation,
+        "world": world,
         "channel": channel,
         # L10 / MS2-FR-23: the media compat floor. The client pauses media sync (cached media
         # keeps working) + shows "update the app" when its generation is below this. 1 = today's
@@ -342,7 +357,7 @@ def _promote_pointers(client, bucket: str, channel_manifest: dict[str, Any]) -> 
     grants) reads. The duplicated legacy client manifest (audio/manifest.json) was
     retired 2026-07-19; with a single write, promote has no partial-crash state (M23)."""
     current = _get_json(client, bucket, f"{CHANNELS_PREFIX}/live.json")
-    if current and current.get("version") != channel_manifest["version"]:
+    if current and (current.get("world") or current.get("version")) != (channel_manifest.get("world") or channel_manifest["version"]):
         hist_key = f"{CHANNELS_PREFIX}/history/{current.get('publishedAt', 'unknown')}-{current['version']}.json"
         _put_verified(client, bucket, hist_key,
                       json.dumps(current, separators=(",", ":")).encode(), "application/json")
@@ -361,8 +376,12 @@ def promote(env: envs.Environment) -> None:
     if not beta:
         raise PublishError("no beta channel manifest to promote")
     live = _get_json(client, bucket, f"{CHANNELS_PREFIX}/live.json")
-    if live and live.get("version") == beta.get("version"):
-        logger.info("live already at beta's version %s — nothing to do", beta["version"])
+    # WORLD equality, not pack-version equality (audit MEDIA-001): a catalog-only or
+    # floor-only beta change must still promote. Pre-world manifests fall back to version.
+    def identity(m):
+        return m.get("world") or m.get("version")
+    if live and identity(live) == identity(beta):
+        logger.info("live already at beta's world %s — nothing to do", identity(beta))
         return
     _promote_pointers(client, bucket, beta)
 

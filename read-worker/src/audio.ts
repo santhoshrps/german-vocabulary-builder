@@ -22,6 +22,11 @@ export interface AudioManifest {
   // for client-side integrity verification of the downloaded bytes.
   packs: Record<string, { hash: string; sha?: string; bytes: number; count: number; key?: string }>;
   scopes: Record<string, string[]>;
+  // Canonical WORLD digest (audit MEDIA-001): one identity over generation + floor +
+  // scopes + every pack and catalog fingerprint. Absent on pre-migration worlds.
+  world?: string;
+  generation?: string;
+  minClient?: number;
 }
 
 // Reads the live channel manifest (extra fields — catalogs, generation, minClient —
@@ -55,6 +60,11 @@ export function scopedManifest(manifest: AudioManifest, scope: Scope): AudioMani
     version: `${manifest.version}:${scope}`,
     packs,
     scopes: { [scope]: [...allowed] },
+    // World identity + floor travel WITH the transfer manifest (audit MEDIA-001), so
+    // the client can bind repair/zero-work/grants to the exact world it planned from.
+    world: manifest.world,
+    generation: manifest.generation,
+    minClient: manifest.minClient,
   };
 }
 
