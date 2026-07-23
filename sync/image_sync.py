@@ -41,13 +41,14 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+import envs  # environment registry (audit MEDIA-022): the ONLY way to pick a bucket
 import image_config as cfg
 import image_decisions
 import image_engine
 import media_delivery
 import sync  # read_excel / TABLE_CONFIG / logging setup / ValidationError
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).parent / ".env")   # image-API secrets only — bucket comes from envs
 
 logger = logging.getLogger("image_sync")
 
@@ -524,10 +525,18 @@ def main() -> None:
     parser.add_argument("--prune-files", action="store_true",
                         help="After publishing, delete image/files masters in R2 no longer referenced.")
     parser.add_argument("--delete-all", action="store_true",
-                        help="Reset images to a clean slate: delete ALL images from R2 (packs + masters, "
-                             "rewriting the shared manifest without them — audio untouched) and remove the "
-                             "local cache, review queue, prompt notes and decisions. Prompts to confirm.")
-    parser.add_argument("--yes", action="store_true", help="Skip the --delete-all confirmation prompt.")
+                        help="Reset the image PIPELINE to a clean slate: delete per-file image masters "
+                             "from R2 and remove the local cache, review queue, prompt notes and "
+                             "decisions. Published packs and the live channel pointer are NOT touched "
+                             "until a later publish. Prompts to confirm; production additionally "
+                             "requires the typed 'prod' gate.")
+    parser.add_argument("--yes", action="store_true",
+                        help="Skip the generic --delete-all confirmation prompt. NEVER bypasses the "
+                             "typed production gate (audit MEDIA-022).")
+    parser.add_argument("--env", choices=envs.environment_names(), default=None,
+                        help="Target environment (default dev). Audit MEDIA-022: every R2-mutating "
+                             "command resolves its bucket through the environment registry — never "
+                             "through whatever the shared .env happens to name.")
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true")
     verbosity.add_argument("-q", "--quiet", action="store_true")
@@ -536,8 +545,23 @@ def main() -> None:
     sync._setup_logging(args.verbose, args.quiet)
     args.workers = max(1, min(args.workers, 8))   # clamp to a sane range
 
+    # Environment registry (audit MEDIA-022): validated bucket/worker pairing, dev default,
+    # and the NON-bypassable typed gate for any production mutation — even with --yes.
+    try:
+        env = envs.load_environment(args.env)
+        if not args.dry_run and env.is_prod:
+            if args.delete_all:
+                envs.confirm_production(env, action="DELETE ALL image masters from the PRODUCTION bucket")
+            elif args.prune_files:
+                envs.confirm_production(env, action="PRUNE unreferenced image masters from the PRODUCTION bucket")
+            else:
+                envs.confirm_production(env, action="upload image masters into the PRODUCTION bucket")
+    except envs.EnvironmentError_ as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+
     if not args.dry_run:
-        required = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"]
+        required = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
         missing = [k for k in required if not os.environ.get(k)]
         if missing:
             logger.error("Missing environment variables: %s", ", ".join(missing))
@@ -545,7 +569,7 @@ def main() -> None:
             sys.exit(1)
 
     client = None
-    bucket = os.environ.get("R2_BUCKET")
+    bucket = env.r2_bucket
     if not args.dry_run:
         client = media_delivery.r2_client()
 

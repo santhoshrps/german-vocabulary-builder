@@ -46,10 +46,11 @@ from dotenv import load_dotenv
 
 import audio_engine
 import audio_overrides
+import envs  # environment registry (audit MEDIA-022): the ONLY way to pick a bucket
 import media_delivery  # shared .pack/manifest/R2 layer (also used by image_sync.py)
 import sync  # reuse read_excel / TABLE_CONFIG / logging setup from the text pipeline
 
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(Path(__file__).parent / ".env")   # Azure/TTS secrets only — bucket comes from envs
 
 logger = logging.getLogger("audio_sync")
 
@@ -321,6 +322,10 @@ def main() -> None:
                         help="Force fresh TTS for every word, ignoring the local cache AND R2 (then re-mirror).")
     parser.add_argument("--prune-files", action="store_true",
                         help="After synthesis, delete audio/files/ masters in R2 no longer referenced (orphans).")
+    parser.add_argument("--env", choices=envs.environment_names(), default=None,
+                        help="Target environment (default dev). Audit MEDIA-022: every R2-mutating "
+                             "command resolves its bucket through the environment registry — never "
+                             "through whatever the shared .env happens to name.")
     verbosity = parser.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true")
     verbosity.add_argument("-q", "--quiet", action="store_true")
@@ -328,8 +333,20 @@ def main() -> None:
 
     sync._setup_logging(args.verbose, args.quiet)
 
+    # Environment registry (audit MEDIA-022): validates bucket/worker pairing and defaults
+    # to dev; a prod bucket name in the shared .env can no longer be written by accident.
+    try:
+        env = envs.load_environment(args.env)
+        if not args.dry_run and env.is_prod:
+            action = "PRUNE unreferenced audio masters from the PRODUCTION bucket" if args.prune_files \
+                else "upload audio masters into the PRODUCTION bucket"
+            envs.confirm_production(env, action=action)
+    except envs.EnvironmentError_ as exc:
+        logger.error("%s", exc)
+        sys.exit(1)
+
     if not args.dry_run:
-        required = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY", "R2_BUCKET"]
+        required = ["R2_ACCOUNT_ID", "R2_ACCESS_KEY_ID", "R2_SECRET_ACCESS_KEY"]
         missing = [k for k in required if not os.environ.get(k)]
         # Synthesis (any run that may call TTS) needs Azure Speech credentials too.
         if not args.no_synth:
@@ -344,7 +361,7 @@ def main() -> None:
 
     # One R2 client, shared by the durable audio-master mirror and the pack upload.
     client = None
-    bucket = os.environ.get("R2_BUCKET")
+    bucket = env.r2_bucket
     if not args.dry_run:
         client = media_delivery.r2_client()
 

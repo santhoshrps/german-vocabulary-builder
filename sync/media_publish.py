@@ -853,6 +853,10 @@ def main() -> None:
         elif args.command == "qa":
             qa(env)
         elif args.command == "mirror-masters":
+            # MEDIA-022: mirror-masters WRITES master objects — the typed prod gate applies
+            # exactly like every other production mutation (dry-run stays free).
+            if not args.dry_run:
+                envs.confirm_production(env, action="mirror media masters into the PRODUCTION bucket")
             mirror_masters(env, dry_run=args.dry_run)
         elif args.command == "gc":
             if args.apply:
