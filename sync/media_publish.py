@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import sys
@@ -720,19 +721,34 @@ def mirror_masters(env: envs.Environment, dry_run: bool) -> None:
                 len(audio_by_hash), len(image_by_hash), len(todo), total / 1e6)
     if dry_run:
         return
-    corrupt = 0
-    for i, (key, expected_hash, path, ctype) in enumerate(todo, 1):
+
+    # Bounded PARALLEL upload (owner request 2026-07-23: the 30k-object production
+    # backfill took hours at one PUT+verify round trip per object). Safe because
+    # every object is independent, the store is content-addressed upload-if-absent,
+    # each upload keeps its own hash check + write verification, and boto3 clients
+    # are thread-safe. Results are consumed IN ORDER on the main thread (pool.map),
+    # so the counters need no lock and the corrupt gate below is unchanged.
+    def mirror_one(item: tuple[str, str, Path, str]) -> bool:
+        key, expected_hash, path, ctype = item
         data = path.read_bytes()
         # H6: both stores are content-addressed now — a cache file whose bytes don't match
         # the content hash the key claims must NEVER enter the immutable store (it would
         # serve corrupt bytes forever on the per-file path).
         if hashlib.sha256(data).hexdigest() != expected_hash:
             logger.error("mirror-masters: SKIPPING corrupt cache file for %s (bytes != content hash)", expected_hash[:12])
-            corrupt += 1
-            continue
+            return False
         _put_verified(client, bucket, key, data, ctype)
-        if i % 500 == 0:
-            logger.info("  … %d/%d", i, len(todo))
+        return True
+
+    corrupt = 0
+    done = 0
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        for ok in pool.map(mirror_one, todo):
+            done += 1
+            if not ok:
+                corrupt += 1
+            if done % 500 == 0:
+                logger.info("  … %d/%d", done, len(todo))
     if corrupt:
         raise PublishError(f"mirror-masters: {corrupt} corrupt cache file(s) skipped — fix the local cache")
     logger.info("mirror-masters: done (%d uploaded, content + write-verified).", len(todo))
