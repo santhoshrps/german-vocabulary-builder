@@ -121,3 +121,27 @@ CREATE TABLE IF NOT EXISTS promo_claims (
   claimed_at TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (code_hash, device_id)
 );
+
+-- Broadcast messages (analytics.md AN-FR-PUSH-10/13/15, owner-scoped 2026-07-23 to
+-- broadcasts). `broadcasts` is the manifest source (PUSH-15): current unexpired
+-- envelopes, identical JSON to the push payload — no per-user rows anywhere.
+CREATE TABLE IF NOT EXISTS broadcasts (
+  id         TEXT PRIMARY KEY,                        -- envelope id (unpredictable)
+  envelope   TEXT NOT NULL,                           -- the exact JSON the app validates
+  expires_at INTEGER NOT NULL,                        -- unix seconds (manifest prune)
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_broadcasts_expiry ON broadcasts (expires_at);
+
+-- Immutable send audit (AN-FR-PUSH-13): every attempt — dry-run, refused, sent —
+-- one row, never updated or deleted. The per-day cap counts SENT rows.
+CREATE TABLE IF NOT EXISTS broadcast_audit (
+  seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+  id         TEXT NOT NULL,                           -- envelope id
+  template   TEXT NOT NULL,
+  outcome    TEXT NOT NULL,                           -- dry_run | refused_cap | refused_confirm | sent | fcm_error
+  detail     TEXT,                                    -- bounded operator note / FCM status
+  actor      TEXT NOT NULL,                           -- token fingerprint prefix, never the token
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);

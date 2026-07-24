@@ -24,6 +24,7 @@ import {
   presignPackURL, PACK_URL_TTL_SECONDS,
 } from "./audio";
 import { sha256, utf8 } from "./bytes";
+import { handleAdminBroadcast, handleMessagesManifest } from "./messages";
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -1102,6 +1103,21 @@ export default {
 
       // Everything below requires a valid session. The session's scope decides
       // whether free (100-word preview) or the full dataset is served.
+      // Broadcast messages (analytics.md §4.4, owner scope: broadcasts only).
+      // The manifest is the PUSH-15 catch-up path: session-authenticated like every
+      // content read, generic for everyone, no per-user record. The admin door is
+      // the ONE sender (PUSH-10/13) — its own secret, its own tight rate budget.
+      if (request.method === "GET" && route === "messages") {
+        await requireSession(env, request);
+        return await handleMessagesManifest(env);
+      }
+      if (request.method === "POST" && route === "admin" && sub === "broadcast") {
+        if (!(await rateLimit(env, `broadcast:${ip}`, 10, 600, nowSeconds()))) {
+          return json({ error: "rate limited" }, 429);
+        }
+        return await handleAdminBroadcast(env, request);
+      }
+
       if (request.method === "GET" && route === "version") {
         const claims = await requireSession(env, request);
         return await handleVersion(env, scopeOf(claims));

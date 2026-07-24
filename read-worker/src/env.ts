@@ -65,4 +65,13 @@ export interface Env {
   SESSION_JWT_SECRET_PREVIOUS?: string;
   APPLE_APPATTEST_ROOT_CA?: string; // base64 DER
   APPLE_STOREKIT_ROOT_CA?: string;  // base64 DER
+
+  // Broadcast sender (analytics.md AN-FR-PUSH-10, owner scope: broadcasts only).
+  // ADMIN_BROADCAST_TOKEN authenticates the ONE sending door (≥ 32 chars, held by
+  // the owner, rotated per AN-OPS-13's runbook); FCM_SERVICE_ACCOUNT is the full
+  // service-account JSON for this environment's Firebase project, least-privilege
+  // (Messaging send only). Both absent → sending simply doesn't exist; the
+  // manifest still serves.
+  ADMIN_BROADCAST_TOKEN?: string;
+  FCM_SERVICE_ACCOUNT?: string;
 }

@@ -28,7 +28,7 @@ fi
 # absence is a documented degraded mode, also visible on /health).
 read_required=(SESSION_JWT_SECRET)
 read_required_prod=(SESSION_JWT_SECRET APPLE_APPATTEST_ROOT_CA APPLE_STOREKIT_ROOT_CA)
-read_warn=(R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY)
+read_warn=(R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY ADMIN_BROADCAST_TOKEN FCM_SERVICE_ACCOUNT)
 write_required=(API_KEY)
 
 env_flag() { # "" for prod (top-level config), "--env <name>" otherwise
