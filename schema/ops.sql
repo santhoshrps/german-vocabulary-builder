@@ -156,7 +156,9 @@ CREATE TABLE IF NOT EXISTS canary_devices (
 );
 
 -- Scheduled sends (AN-FR-PUSH-22): the PINNED descriptor; the cron materializes
--- the delivery envelope at execution time.
+-- the delivery envelope at the FIRST execution attempt and stores it in
+-- `envelope` so every retry reuses ONE stable logical id (PM-SPEC-011 — client
+-- dedup then absorbs any ambiguous-provider double delivery).
 CREATE TABLE IF NOT EXISTS pending_sends (
   id              TEXT PRIMARY KEY,
   descriptor      TEXT NOT NULL,
@@ -165,6 +167,7 @@ CREATE TABLE IF NOT EXISTS pending_sends (
   send_at         INTEGER NOT NULL,
   status          TEXT NOT NULL DEFAULT 'pending',  -- pending | done | failed | cancelled
   attempts        INTEGER NOT NULL DEFAULT 0,
+  envelope        TEXT,                             -- stable materialized envelope (first attempt)
   created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -174,3 +177,7 @@ CREATE INDEX IF NOT EXISTS idx_pending_sends_due ON pending_sends (status, send_
 -- every send-path row. (ALTER for existing databases.)
 -- ALTER TABLE broadcast_audit ADD COLUMN descriptor_hash TEXT;
 -- ALTER TABLE broadcast_audit ADD COLUMN envelope_hash TEXT;
+
+-- PM-SPEC-011 (owner 2026-07-24): stable retry envelope for scheduled sends.
+-- (ALTER for existing databases.)
+-- ALTER TABLE pending_sends ADD COLUMN envelope TEXT;

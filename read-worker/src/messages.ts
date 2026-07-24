@@ -1,15 +1,19 @@
 // Broadcast messages v2 (docs/push-messaging.md §6/§8, review-hardened).
 //
 // Doors:
-//   GET  /v1/messages           — PUSH-15 manifest: current envelopes AND active
-//                                 revoke tombstones, plus server_time (max-age 60,
-//                                 inside the client's declared uncertainty).
+//   GET  /v1/messages           — PUSH-15 manifest: ≤20 current message envelopes
+//                                 PLUS ≤20 active revoke controls (PM-SPEC-005),
+//                                 and server_time (max-age 60, inside the
+//                                 client's declared uncertainty).
 //   POST /v1/admin/broadcast    — the ONE sender: descriptor-hash pinning
 //                                 (PUSH-20), mandatory same-UTC-day dry-run,
-//                                 canary-before-all in prod (PUSH-14 resolved),
-//                                 UTC-epoch caps with an enumerated count list
-//                                 (PUSH-13), revoke ops (PUSH-19), scheduling
-//                                 (PUSH-22), full-payload size gate (PUSH-28).
+//                                 CONFIRMED canary before all in prod
+//                                 (PM-SPEC-007/012: op "confirm_canary", valid
+//                                 the confirm UTC day and the next), UTC-epoch
+//                                 caps counting DISTINCT published campaigns
+//                                 (PM-SPEC-011), revoke ops (PUSH-19),
+//                                 scheduling (PUSH-22) with stable retry
+//                                 envelopes, full-payload size gate (PUSH-28).
 //   POST /v1/admin/canary       — register/list owner canary device tokens
 //                                 (PUSH-21: token-directed, never a topic).
 //
@@ -37,19 +41,28 @@ const MAX_PROVIDER_BYTES = 4000; // wrapper margin under the 4096 platform ceili
 const MAX_ADMIN_BODY = 8192;
 const MAX_SCHEDULE_DAYS = 30;
 const MAX_SCHEDULE_ATTEMPTS = 5;
+const MAX_SCHEDULE_QUEUE = 64;   // PM-SPEC-005 (owner-ratified): ≤ 64 waiting
 
 // ---- manifest ---------------------------------------------------------------
 
 export async function handleMessagesManifest(env: Env): Promise<Response> {
   const now = Math.floor(Date.now() / 1000);
+  // PM-SPEC-005 (owner-ratified): messages and revoke CONTROLS are bounded
+  // SEPARATELY (≤20 each, oldest-issued first) — a message flood can never
+  // crowd a retraction out of the manifest.
   const rows = await env.OPS_DB
-    .prepare("SELECT envelope FROM broadcasts WHERE expires_at > ?1 ORDER BY created_at ASC LIMIT 20")
+    .prepare("SELECT envelope FROM broadcasts WHERE expires_at > ?1 AND json_extract(envelope, '$.op') IS NULL ORDER BY created_at ASC LIMIT 20")
+    .bind(now)
+    .all<{ envelope: string }>();
+  const revokeRows = await env.OPS_DB
+    .prepare("SELECT envelope FROM broadcasts WHERE expires_at > ?1 AND json_extract(envelope, '$.op') = 'revoke' ORDER BY created_at ASC LIMIT 20")
     .bind(now)
     .all<{ envelope: string }>();
   const envelopes = (rows.results ?? []).map((r) => JSON.parse(r.envelope));
+  const revokes = (revokeRows.results ?? []).map((r) => JSON.parse(r.envelope));
   // server_time inside the body: with max-age 60 its staleness stays within the
   // client's declared +60 s uncertainty (AN-FR-PUSH-23).
-  return json({ messages: envelopes, server_time: now }, 200,
+  return json({ messages: envelopes, revokes, server_time: now }, 200,
               { "cache-control": "public, max-age=60" });
 }
 
@@ -78,7 +91,7 @@ export async function handleAdminCanary(env: Env, request: Request): Promise<Res
 // ---- admin: broadcast (send / revoke / schedule / cancel) ------------------
 
 interface BroadcastRequest {
-  op?: string;                 // absent/"send" | "revoke" | "cancel_scheduled"
+  op?: string;                 // absent/"send" | "revoke" | "cancel_scheduled" | "confirm_canary"
   template?: string;
   ttl_hours?: number;
   title?: Record<string, string>;
@@ -121,10 +134,33 @@ export async function handleAdminBroadcast(env: Env, request: Request): Promise<
     return json({ outcome: cancelled ? "cancelled" : "not_pending" }, cancelled ? 200 : 404);
   }
 
+  if (body.op === "confirm_canary") {
+    // PM-SPEC-007 (owner 2026-07-24): "sent" is not "looked at". After the
+    // canary lands on an owner device, this explicit confirm writes the audited
+    // I-SAW-IT row the all-audience gate requires. PM-SPEC-012: the
+    // confirmation is valid on its own UTC day AND the next — an evening
+    // canary covers a next-morning scheduled send, never anything older.
+    const hash = body.preview ?? "";
+    if (!/^[0-9a-f]{64}$/.test(hash)) {
+      return json({ error: "preview (descriptor hash from dry-run) required" }, 400);
+    }
+    const canarySentToday = await countAuditForHash(env, ["canary_sent"], day, hash);
+    if (canarySentToday === 0) {
+      await audit(env, "-", "-", "confirm_refused", "no canary sent today for this descriptor",
+                  auth.actor, hash, null);
+      return json({ error: "send audience=canary for this descriptor first (same UTC day)" }, 428);
+    }
+    await audit(env, "-", "-", "canary_confirmed", body.note ?? "", auth.actor, hash, null);
+    return json({ outcome: "canary_confirmed", descriptor_hash: hash,
+                  valid: "this UTC day and the next" });
+  }
+
   if (body.op === "revoke") {
     // Cap-exempt control message (PUSH-19): manifest row + topic push.
     const target = (body.target_collapse ?? "").trim();
-    if (!target || target.length > 64) return json({ error: "bad target_collapse" }, 400);
+    // PM-SPEC-005: campaign names are ^[a-z0-9_]{1,32}$ — the client refuses
+    // anything else, so the sender must too.
+    if (!/^[a-z0-9_]{1,32}$/.test(target)) return json({ error: "bad target_collapse" }, 400);
     const revoke = {
       v: 2, op: "revoke", id: crypto.randomUUID(),
       target_collapse: target, revoked_through: now,
@@ -189,6 +225,12 @@ export async function handleAdminBroadcast(env: Env, request: Request): Promise<
     if (body.send_at < now || body.send_at > now + MAX_SCHEDULE_DAYS * 86_400) {
       return json({ error: "send_at out of range (≤ 30 days ahead)" }, 400);
     }
+    const waiting = await env.OPS_DB
+      .prepare("SELECT COUNT(*) AS n FROM pending_sends WHERE status = 'pending'")
+      .first<{ n: number }>();
+    if ((waiting?.n ?? 0) >= MAX_SCHEDULE_QUEUE) {
+      return json({ error: `scheduled queue full (${MAX_SCHEDULE_QUEUE} waiting)` }, 429);
+    }
     const id = crypto.randomUUID();
     await env.OPS_DB
       .prepare("INSERT INTO pending_sends (id, descriptor, descriptor_hash, audience, send_at, status, attempts) VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0)")
@@ -204,31 +246,57 @@ export async function handleAdminBroadcast(env: Env, request: Request): Promise<
                            body.note ?? "", auth.actor);
 }
 
-// One send path for immediate AND scheduled execution (PUSH-22).
+// One send path for immediate AND scheduled execution (PUSH-22). A retry of
+// one logical scheduled send passes its stored envelope back in as `retryOf`
+// (PM-SPEC-011: one stable id across retries, so client dedup makes any
+// provider ambiguity harmless).
 async function executeSend(env: Env, descriptor: Descriptor, hash: string,
                            audience: "canary" | "all", note: string,
-                           actor: string): Promise<Response> {
+                           actor: string,
+                           retryOf?: MaterializedEnvelope): Promise<Response> {
   const now = Math.floor(Date.now() / 1000);
   const day = utcDay(now);
-  if (audience === "all") {
-    // Prod ritual (PUSH-14 resolved): a same-day CANARY delivery precedes all.
+  const envelope = retryOf ?? materialize(descriptor, now);
+  const envelopeHash = await sha256hex(canonical(envelope));
+  // A retry whose campaign is ALREADY published (manifest row exists) skips
+  // every gate — the campaign happened; only the push delivery is retried.
+  const alreadyPublished = audience === "all" && retryOf !== undefined
+    ? (await env.OPS_DB.prepare("SELECT 1 AS one FROM broadcasts WHERE id = ?1")
+        .bind(envelope.id).first<{ one: number }>()) !== null
+    : false;
+  if (audience === "all" && !alreadyPublished) {
+    // Prod ritual (PM-SPEC-007/012 resolved): a CONFIRMED canary of THIS
+    // descriptor, confirmed on the execution UTC day or the immediately
+    // preceding one, precedes every all-audience send — scheduled or not.
     if (env.ENV_NAME === "prod") {
-      const canaryToday = await countAudit(env, ["canary_sent"], day, descriptor.template);
-      if (canaryToday === 0) {
+      const windowStart = utcDay(now - 86_400);
+      const confirmed = await countAuditForHash(env, ["canary_confirmed"], windowStart, hash);
+      if (confirmed === 0) {
         await audit(env, "-", descriptor.template, "refused_no_canary", note, actor, hash, null);
-        return json({ error: "canary first: send audience=canary and SEE it, same UTC day" }, 428);
+        return json({ error: "confirmed canary first: dry-run → audience=canary → SEE it → op=confirm_canary (valid that UTC day and the next)" }, 428);
       }
     }
-    // PUSH-13: only all-audience sends count against the epoch cap.
-    const sentToday = await countAudit(env, ["sent", "sent_scheduled"], day, null);
-    if (sentToday >= SENDS_PER_DAY_CAP) {
+    // PM-SPEC-011: one logical campaign per descriptor per UTC day — after an
+    // ambiguous provider outcome the campaign is already riding the manifest,
+    // so a same-day re-send of the identical descriptor refuses instead of
+    // publishing a second card.
+    const publishedSameDescriptor = await countAuditForHash(
+      env, ["sent", "manifest_only"], day, hash);
+    if (publishedSameDescriptor > 0) {
+      await audit(env, "-", descriptor.template, "refused_already_sent",
+                  "identical descriptor already published today", actor, hash, null);
+      return json({ error: "this exact campaign already went out today — the manifest is delivering it; revoke to retract" }, 409);
+    }
+    // PUSH-13 + PM-SPEC-011: the cap counts DISTINCT PUBLISHED campaigns
+    // (outcomes sent/manifest_only by envelope id) — retries and ambiguous
+    // provider outcomes can neither double-charge nor reopen the epoch.
+    const publishedToday = await countPublishedCampaigns(env, day);
+    if (publishedToday >= SENDS_PER_DAY_CAP) {
       await audit(env, "-", descriptor.template, "refused_cap", `cap ${SENDS_PER_DAY_CAP}/day`,
                   actor, hash, null);
       return json({ error: "daily campaign cap reached (UTC day)" }, 429);
     }
   }
-  const envelope = materialize(descriptor, now);
-  const envelopeHash = await sha256hex(canonical(envelope));
   if (audience === "canary") {
     const tokens = await env.OPS_DB
       .prepare("SELECT token FROM canary_devices").all<{ token: string }>();
@@ -254,13 +322,17 @@ async function executeSend(env: Env, descriptor: Descriptor, hash: string,
     return json({ outcome, delivered, devices: list.length, envelope }, delivered > 0 ? 200 : 502);
   }
   // All-audience: manifest FIRST (sync always carries it), then the topic push.
+  // OR IGNORE keeps publication idempotent for a retried logical send.
   await env.OPS_DB
-    .prepare("INSERT INTO broadcasts (id, envelope, expires_at) VALUES (?1, ?2, ?3)")
+    .prepare("INSERT OR IGNORE INTO broadcasts (id, envelope, expires_at) VALUES (?1, ?2, ?3)")
     .bind(envelope.id, JSON.stringify(envelope), envelope.expires_at).run();
   try {
     await fcmSend(env, { topic: topicFor(env) }, envelope);
   } catch (error) {
-    await audit(env, envelope.id, descriptor.template, "fcm_error", String(error),
+    // PM-SPEC-011: the provider outcome is UNKNOWN/failed but the campaign IS
+    // published (manifest). The row counts the publication exactly once (by
+    // id); the push may be retried with the SAME envelope, never re-published.
+    await audit(env, envelope.id, descriptor.template, "manifest_only", String(error),
                 actor, hash, envelopeHash);
     return json({ outcome: "manifest_only", error: String(error), envelope }, 502);
   }
@@ -274,25 +346,42 @@ async function executeSend(env: Env, descriptor: Descriptor, hash: string,
 export async function processScheduledSends(env: Env): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
   const due = await env.OPS_DB
-    .prepare("SELECT id, descriptor, descriptor_hash, audience, attempts FROM pending_sends WHERE status = 'pending' AND send_at <= ?1 LIMIT 5")
+    .prepare("SELECT id, descriptor, descriptor_hash, audience, attempts, envelope FROM pending_sends WHERE status = 'pending' AND send_at <= ?1 LIMIT 5")
     .bind(now)
-    .all<{ id: string; descriptor: string; descriptor_hash: string; audience: string; attempts: number }>();
+    .all<{ id: string; descriptor: string; descriptor_hash: string; audience: string;
+           attempts: number; envelope: string | null }>();
   for (const row of due.results ?? []) {
     const descriptor = JSON.parse(row.descriptor) as Descriptor;
+    // PM-SPEC-011: ONE stable logical envelope per scheduled send — materialized
+    // on the first attempt and stored DURABLY before any provider call, so every
+    // retry reuses the same id and client dedup absorbs any double delivery.
+    let stored = row.envelope ? JSON.parse(row.envelope) as MaterializedEnvelope : null;
+    if (!stored) {
+      stored = materialize(descriptor, now);
+      await env.OPS_DB
+        .prepare("UPDATE pending_sends SET envelope = ?2 WHERE id = ?1")
+        .bind(row.id, JSON.stringify(stored)).run();
+    }
     const response = await executeSend(env, descriptor, row.descriptor_hash,
                                        row.audience === "canary" ? "canary" : "all",
-                                       `scheduled ${row.id}`, "cron");
+                                       `scheduled ${row.id}`, "cron", stored);
     const outcome = (await response.json<{ outcome?: string }>()).outcome ?? "error";
     if (outcome === "sent" || outcome === "canary_sent") {
       await env.OPS_DB.prepare("UPDATE pending_sends SET status = 'done' WHERE id = ?1")
         .bind(row.id).run();
+      // Traceability row for the schedule itself; the CAP counts the
+      // executeSend "sent" row by envelope id, never this one (PM-SPEC-011).
       await audit(env, row.id, descriptor.template, "sent_scheduled", "", "cron",
                   row.descriptor_hash, null);
     } else if (row.attempts + 1 >= MAX_SCHEDULE_ATTEMPTS) {
+      // PM-SPEC-011/012 terminal row: the schedule is dead — either the canary
+      // window never opened or the provider stayed unknown/failed through every
+      // bounded attempt. If the campaign reached the manifest it stays
+      // published (revoke to retract); it never fires again.
       await env.OPS_DB.prepare("UPDATE pending_sends SET status = 'failed' WHERE id = ?1")
         .bind(row.id).run();
       await audit(env, row.id, descriptor.template, "scheduled_gave_up",
-                  `after ${MAX_SCHEDULE_ATTEMPTS}`, "cron", row.descriptor_hash, null);
+                  `after ${MAX_SCHEDULE_ATTEMPTS}: ${outcome}`, "cron", row.descriptor_hash, null);
     } else {
       await env.OPS_DB.prepare("UPDATE pending_sends SET attempts = attempts + 1 WHERE id = ?1")
         .bind(row.id).run();
@@ -322,6 +411,12 @@ function normalizeDescriptor(body: BroadcastRequest): { value: Descriptor } | { 
   if (!(ttl >= 1 && ttl <= MAX_TTL_HOURS)) return { error: "bad ttl" };
   if (body.dismiss !== undefined && !DISMISS.has(body.dismiss)) return { error: "bad dismiss" };
   if (body.route !== undefined && !ROUTES.has(body.route)) return { error: "bad route" };
+  // PM-SPEC-005 (owner-ratified): min_build is a whole number 1…999,999,999.
+  if (body.min_build !== undefined
+      && (!Number.isInteger(body.min_build)
+          || body.min_build < 1 || body.min_build > 999_999_999)) {
+    return { error: "bad min_build (1…999999999)" };
+  }
   const isGreeting = GREETINGS.has(template);
   if (isGreeting && (body.title || body.body)) return { error: "greetings never carry text" };
   if (isGreeting && body.route && body.route !== "none") return { error: "greetings never route" };
@@ -361,6 +456,8 @@ function isPlainText(text: string, maxChars: number): boolean {
   if (/[a-z0-9-]+\.[a-z]{2,}/.test(lowered)) return false;
   return true;
 }
+
+type MaterializedEnvelope = ReturnType<typeof materialize>;
 
 function materialize(descriptor: Descriptor, now: number) {
   return {
@@ -445,6 +542,30 @@ async function audit(env: Env, id: string, template: string, outcome: string,
     .bind(id, template, outcome, detail.slice(0, 200), actor,
           descriptorHash ?? null, envelopeHash ?? null)
     .run();
+}
+
+/// Audit rows for a specific pinned descriptor since a UTC day boundary —
+/// drives the canary-confirmation window (PM-SPEC-007/012) and the
+/// one-campaign-per-descriptor-per-day idempotency guard (PM-SPEC-011).
+async function countAuditForHash(env: Env, outcomes: string[], sinceDay: string,
+                                 descriptorHash: string): Promise<number> {
+  const placeholders = outcomes.map((_, i) => `?${i + 2}`).join(",");
+  const row = await env.OPS_DB
+    .prepare(`SELECT COUNT(*) AS n FROM broadcast_audit WHERE created_at >= ?1 AND outcome IN (${placeholders}) AND descriptor_hash = ?${outcomes.length + 2}`)
+    .bind(`${sinceDay} 00:00:00`, ...outcomes, descriptorHash)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+/// PM-SPEC-011: the daily cap counts DISTINCT PUBLISHED campaigns — by
+/// envelope id, over outcomes sent/manifest_only — so a retried logical send
+/// and its eventual success count once, and ambiguity never double-charges.
+async function countPublishedCampaigns(env: Env, day: string): Promise<number> {
+  const row = await env.OPS_DB
+    .prepare("SELECT COUNT(DISTINCT id) AS n FROM broadcast_audit WHERE created_at >= ?1 AND outcome IN ('sent','manifest_only')")
+    .bind(`${day} 00:00:00`)
+    .first<{ n: number }>();
+  return row?.n ?? 0;
 }
 
 async function countAudit(env: Env, outcomes: string[], day: string,
