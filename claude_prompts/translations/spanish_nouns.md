@@ -169,7 +169,7 @@ This explicitly includes — these are **strictly off-limits**:
 
 * `Spanish_Remarks`, `Spanish_Remarks_Scheme_B` — **read-only reference only** (see Section 2.2).
 * All German columns: `German_Article`, `German_Word`, `German_Plural`, `German_Sentence`.
-* All English columns: `English_Word`, `English_Word_US`, `English_Sentence`, `English_Sentence_US`.
+* All English columns: `English_Word`, `English_Word_US`, `English_Sentence`, `English_Sentence_US`. **Their text is read-only**, but a light gray fill is applied where the UK and US values differ (Section 9.3).
 * All metadata/control columns: `row_id`, `Level`, `Type`, `Instructions for AI`.
 
 Do not:
@@ -217,7 +217,7 @@ Return the file with its **original structure and formatting fully intact**:
 
 Do not add, delete, reorder, rename, hide, merge, or resize any column or row.
 
-**The only formatting change you are permitted to make is the light gray `D9D9D9` fill on the variant cells of rows you translate, exactly as specified in Section 9.2.** No other fill, font, border, alignment, width, or style change anywhere in the file.
+**The only formatting change you are permitted to make is the light gray `D9D9D9` fill on differing variant cells of rows you translate — the three Spanish variants (Section 9.2) and the English UK/US pair (Section 9.3).** No other fill, font, border, alignment, width, or style change anywhere in the file.
 
 ---
 
@@ -446,7 +446,7 @@ At the same time, do not paraphrase so freely that the meaning changes.
 
 ---
 
-## 9. Variant vocabulary and highlighting
+## 9. Variant vocabulary and highlighting (Spanish and English)
 
 ### 9.1 Common differences
 
@@ -529,6 +529,33 @@ Further rules:
 
 * **Do not** highlight a field whose three values are identical.
 * Do not apply any other formatting, font, colour, border, or width change anywhere in the file.
+
+### 9.3 The same rule applies to the English UK / US pair
+
+The English columns hold two variants of the same content:
+
+| Field | British English (UK) | American English (US) |
+|---|---|---|
+| word | `English_Word` | `English_Word_US` |
+| sentence | `English_Sentence` | `English_Sentence_US` |
+
+**Apply exactly the same light gray `D9D9D9` rule to each English pair:**
+
+> For each English field, compare its two values.
+> **If they are not identical, highlight BOTH cells of that field.**
+> If they are identical, highlight nothing.
+
+| Case | Example (word field) | Highlight |
+|---|---|---|
+| Identical | `answer` / `answer` | **nothing** |
+| Different | `colour` / `color` | **both word cells** |
+| Different | `flat` / `apartment` | **both word cells** |
+
+The **word pair and the sentence pair are evaluated separately** — it is normal for the sentence pair to differ while the word pair does not, or the reverse.
+
+**This is highlighting only.** The English columns remain **read-only** for content: never change the text in `English_Word`, `English_Word_US`, `English_Sentence` or `English_Sentence_US` (Section 3.1). You are only adding a fill so that genuine UK/US differences are visible at a glance.
+
+**Scope:** apply this to the rows you translate. Consistent with Section 3.2, do **not** add, remove or alter highlighting on rows that were already translated before you started.
 
 ---
 
@@ -825,13 +852,14 @@ For every row, the multi-agent workflow must verify all of the following:
 22. Spanish punctuation is correct, including `¿ ?` and `¡ !`.
 23. Capitalization follows Spanish rules (lowercase days, months, languages, nationalities).
 24. Accents, `ñ`, `ü`, and Unicode encoding are correct.
-25. Highlighting follows Section 9.2: for each of the five fields, if its three values are not all identical, **all three cells of that field** are highlighted `D9D9D9`; if identical, none are.
-26. No unnecessary meaning or information was added.
-27. No meaning or information from the German sentence was omitted.
-28. No unauthorized file content was changed — in particular, no German, English, remarks, or metadata column was touched.
-29. The row was **not already translated** — already-translated rows were left completely untouched (Section 3.2).
-30. The original file formatting was preserved; the only formatting change is the `D9D9D9` highlight on translated rows (Section 3.3).
-31. **The row was checked against every known recurring mistake in Section 12**, specifically:
+25. Highlighting follows Section 9.2: for each of the five Spanish fields, if its three values are not all identical, **all three cells of that field** are highlighted `D9D9D9`; if identical, none are.
+26. Highlighting follows Section 9.3: for each English field (word, sentence), if the UK and US values differ, **both cells** are highlighted `D9D9D9`; if identical, neither is.
+27. No unnecessary meaning or information was added.
+28. No meaning or information from the German sentence was omitted.
+29. No unauthorized file content was changed — in particular, no German, English, remarks, or metadata column was touched.
+30. The row was **not already translated** — already-translated rows were left completely untouched (Section 3.2).
+31. The original file formatting was preserved; the only formatting change is the `D9D9D9` highlight on translated rows (Section 3.3).
+32. **The row was checked against every known recurring mistake in Section 12**, specifically:
     * Gender was decided from Spanish usage, not copied from German (12.1 A–C).
     * Where variants have different genders, the article columns differ **and** all three article cells are highlighted (12.1 D).
     * Uncountable nouns have **empty** plural and plural-article cells (12.2).
@@ -864,7 +892,7 @@ After all translations have been completed, review the **entire file again, word
 11. Re-check the row-specific `Level` value.
 12. Re-check `Instructions for AI` handling.
 13. Re-check the existing remarks for previously identified mistakes and confirm none has been repeated.
-14. Re-check highlighting field by field: any field whose three values differ has **all three** of its cells filled `D9D9D9`; identical fields have none.
+14. Re-check highlighting field by field: any Spanish field whose three values differ has **all three** of its cells filled `D9D9D9`, and any English field whose UK and US values differ has **both** cells filled; identical fields have none.
 15. Perform a final file integrity check confirming no unauthorized column, row, or cell was modified.
 
 The final verification must include **Spanish-language expert LLM agents specifically focused on Spanish translation and linguistic correctness, separately for neutral Latin American, Mexican, and Peninsular Spanish**.
@@ -912,7 +940,7 @@ Use a **multi-agent expert translation and verification workflow**, including se
 
 **Do not change any existing content outside the fifteen permitted Spanish columns listed in Section 3.**
 
-Only provide correct Spanish translations in the fifteen permitted columns, and apply light gray highlighting per Section 9.2 — **whenever a field's three values are not all identical, highlight all three cells of that field**.
+Only provide correct Spanish translations in the fifteen permitted columns, and apply light gray highlighting — **whenever a Spanish field's three values are not all identical, highlight all three cells of that field (Section 9.2); whenever the English UK and US values of a field differ, highlight both cells (Section 9.3)**.
 
 **Mexican Spanish is a full third variant. It must be filled on every row and judged independently — it does not always agree with Latin America (Section 4.6).**
 
@@ -926,7 +954,7 @@ Only provide correct Spanish translations in the fifteen permitted columns, and 
 
 **Translate ONLY rows that are not yet translated. Already-translated rows are reference material — especially their `Spanish_Remarks` — and must be left completely unchanged (Section 3.2).**
 
-**The output file MUST retain the original formatting. The only permitted formatting change is the light gray `D9D9D9` highlight defined in Section 9.2 (Section 3.3).**
+**The output file MUST retain the original formatting. The only permitted formatting change is the light gray `D9D9D9` highlight defined in Sections 9.2 (Spanish variants) and 9.3 (English UK/US) (Section 3.3).**
 
 **The meaning of `German_Sentence` and of each Spanish sentence MUST be identical.**
 
