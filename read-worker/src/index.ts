@@ -24,7 +24,7 @@ import {
   presignPackURL, PACK_URL_TTL_SECONDS,
 } from "./audio";
 import { sha256, utf8 } from "./bytes";
-import { handleAdminBroadcast, handleMessagesManifest } from "./messages";
+import { handleAdminBroadcast, handleAdminCanary, handleMessagesManifest, processScheduledSends } from "./messages";
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -1111,6 +1111,12 @@ export default {
         await requireSession(env, request);
         return await handleMessagesManifest(env);
       }
+      if (request.method === "POST" && route === "admin" && sub === "canary") {
+        if (!(await rateLimit(env, `broadcast:${ip}`, 10, 600, nowSeconds()))) {
+          return json({ error: "rate limited" }, 429);
+        }
+        return await handleAdminCanary(env, request);
+      }
       if (request.method === "POST" && route === "admin" && sub === "broadcast") {
         if (!(await rateLimit(env, `broadcast:${ip}`, 10, 600, nowSeconds()))) {
           return json({ error: "rate limited" }, 429);
@@ -1341,6 +1347,13 @@ export default {
   // to send feedback — a quiet month would otherwise keep an address alive indefinitely.
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
     ctx.waitUntil((async () => {
+      // Scheduled broadcast sends (AN-FR-PUSH-22): due descriptors fire through
+      // the identical validated path — same caps, same audit, pinned hashes.
+      try {
+        await processScheduledSends(env);
+      } catch (err) {
+        console.error("scheduled broadcast pass failed", { err: String(err) });
+      }
       try {
         const erased = await purgeExpiredFeedbackContacts(env);
         if (erased > 0) console.log(JSON.stringify({ evt: "FEEDBACK_CONTACT_PURGE", erased }));

@@ -145,3 +145,32 @@ CREATE TABLE IF NOT EXISTS broadcast_audit (
   actor      TEXT NOT NULL,                           -- token fingerprint prefix, never the token
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- v2 broadcast operations (docs/push-messaging.md §8, 2026-07-24).
+-- Owner canary devices (AN-FR-PUSH-21): token-directed canary sends — owner-ops
+-- data, never learner data.
+CREATE TABLE IF NOT EXISTS canary_devices (
+  token      TEXT PRIMARY KEY,
+  label      TEXT NOT NULL DEFAULT 'owner',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Scheduled sends (AN-FR-PUSH-22): the PINNED descriptor; the cron materializes
+-- the delivery envelope at execution time.
+CREATE TABLE IF NOT EXISTS pending_sends (
+  id              TEXT PRIMARY KEY,
+  descriptor      TEXT NOT NULL,
+  descriptor_hash TEXT NOT NULL,
+  audience        TEXT NOT NULL DEFAULT 'all',
+  send_at         INTEGER NOT NULL,
+  status          TEXT NOT NULL DEFAULT 'pending',  -- pending | done | failed | cancelled
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_sends_due ON pending_sends (status, send_at);
+
+-- Audit hash columns (AN-FR-PUSH-20): descriptor + final-envelope hashes ride
+-- every send-path row. (ALTER for existing databases.)
+-- ALTER TABLE broadcast_audit ADD COLUMN descriptor_hash TEXT;
+-- ALTER TABLE broadcast_audit ADD COLUMN envelope_hash TEXT;

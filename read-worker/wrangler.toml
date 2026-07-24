@@ -47,7 +47,7 @@ bucket_name = "german-media-prod"
 # data within 30 days cannot depend on another user happening to send feedback — this is the
 # guarantee. Named environments do NOT inherit triggers, so every environment declares its own.
 [triggers]
-crons = ["17 3 * * *"]
+crons = ["17 3 * * *", "*/15 * * * *"]   # daily purge + broadcast scheduler (AN-FR-PUSH-22)
 
 [observability]
 enabled = true
@@ -112,7 +112,7 @@ binding = "MEDIA"
 bucket_name = "german-media-dev"
 
 [env.dev.triggers]
-crons = ["17 3 * * *"]
+crons = ["17 3 * * *", "*/15 * * * *"]
 
 [env.dev.observability]
 enabled = true
