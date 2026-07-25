@@ -105,12 +105,12 @@ export async function handleInviteCreate(request: Request, env: Env, ctx: Sessio
   await env.SOCIAL_DB.prepare(
     "INSERT INTO invites (token_hash, inviter, state, created_at, expires_at) VALUES (?1, ?2, 'pending', ?3, ?4)")
     .bind(hash, ctx.playerId, t, t + INVITE_TTL_MS).run();
-  // Dev link base: the worker's own origin (interim ruling 2026-07-25); the prod
-  // domain replaces this when the owner names it. Fragment-carried, never logged.
-  const origin = new URL(request.url).origin;
+  // Prod: learn-languages.app/german/join (owner decision 2026-07-25); dev rides
+  // the worker's own origin. Fragment-carried, never logged (FRIEND-1b).
+  const base = env.INVITE_LINK_BASE || `${new URL(request.url).origin}/german/join`;
   return {
     code: "OK",
-    data: { inviteId: hash.slice(0, 16), link: `${origin}/german/invite#${token}`, expiresAt: t + INVITE_TTL_MS },
+    data: { inviteId: hash.slice(0, 16), link: `${base}#${token}`, expiresAt: t + INVITE_TTL_MS },
   };
 }
 

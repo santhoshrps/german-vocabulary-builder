@@ -38,6 +38,8 @@ export interface Env {
   /** Optional capability overrides (NFR-10b). */
   CAPABILITY_STATE?: string; // healthy | maintenance | disabled
   MIN_BUILD?: string;
+  /** Prod: https://learn-languages.app/german/join (owner 2026-07-25); dev: "" → worker origin. */
+  INVITE_LINK_BASE?: string;
 }
 
 type Handler = (request: Request, env: Env, requestId: string, ctx: SessionContext | null) => Promise<Response>;
@@ -166,6 +168,29 @@ const HANDLERS: Partial<Record<string, Handler>> = {
   R11: async (request, env, requestId) => fromResult(requestId, await handleDeleteStatus(request, env)),
 };
 
+/** The invite landing page (FRIEND-1b): no-referrer, strict CSP, zero external
+ *  resources; the fragment token stays in the browser — this page never reads it. */
+function landingPage(): Response {
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Join your friend on German Vocabulary</title>
+<style>body{font-family:-apple-system,system-ui,sans-serif;max-width:26rem;margin:15vh auto;padding:0 1.5rem;color:#222;line-height:1.5}h1{font-size:1.4rem}p{color:#555}</style>
+</head><body>
+<h1>A friend invited you to learn German together</h1>
+<p>Get the <strong>German Vocabulary</strong> app on your iPhone or iPad, then tap your
+invite link again — it will open in the app and connect you two.</p>
+<p>Invite links work once and expire after 30 days.</p>
+</body></html>`;
+  return new Response(html, {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "referrer-policy": "no-referrer",
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
+      "x-content-type-options": "nosniff",
+    },
+  });
+}
+
 /** Idempotency-wrapped mutation: body read once, canonical text keys the record. */
 function mutation(
   route: string,
@@ -226,6 +251,21 @@ export default {
       // read worker); the same handler also answers at the contract's R2 path.
       if (url.pathname === "/health" && request.method === "GET") {
         return health(request, env, requestId, null);
+      }
+      // Invite web surface (owner 2026-07-25: learn-languages.app/german/join#<token>):
+      // the landing page for the not-yet-installed case and the Universal Links
+      // association file. Static, no third-party bytes, token never leaves the
+      // fragment (FRIEND-1b). Served on every env; prod reaches it via the zone route.
+      if (request.method === "GET" && url.pathname === "/german/join") {
+        return landingPage();
+      }
+      if (request.method === "GET" && url.pathname === "/.well-known/apple-app-site-association") {
+        return new Response(JSON.stringify({
+          applinks: { apps: [], details: [{
+            appIDs: [`${env.APP_TEAM_ID ?? "3VF33Y593F"}.${env.APP_BUNDLE_ID}`],
+            components: [{ "/": "/german/join", comment: "leaderboard invite" }],
+          }] },
+        }), { headers: { "content-type": "application/json" } });
       }
       if (!url.pathname.startsWith(BASE)) return envelope(requestId, "NOT_FOUND");
       const route = ROUTES.find((r) => r.path === url.pathname && r.method === request.method);

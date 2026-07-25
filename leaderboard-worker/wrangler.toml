@@ -55,6 +55,8 @@ enabled = true
 [vars]
 ENV_NAME = "prod"
 APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
+# Invite links (owner decision 2026-07-25): learn-languages.app/german/join#<token>
+INVITE_LINK_BASE = "https://learn-languages.app/german/join"
 
 # ---------------------------------------------------------------------------
 # DEV
@@ -87,3 +89,5 @@ enabled = true
 [env.dev.vars]
 ENV_NAME = "dev"
 APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
+# Dev invite links ride the workers.dev origin (interim ruling 2026-07-25).
+INVITE_LINK_BASE = ""
