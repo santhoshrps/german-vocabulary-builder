@@ -7,6 +7,41 @@
 // generations) → cheer converge → remove → stale reversal → delete saga →
 // status by capability → data gone.
 //
+// Traceability (L6 disposable-environment lane):
+// TS-LB3-ARCH-004 TS-LB3-ARCH-008 TS-LB3-ARCH-009
+// TS-LB3-ARCH-010 TS-LB3-DB-001 TS-LB3-DB-002
+// TS-LB3-DB-003 TS-LB3-DB-004 TS-LB3-DB-005
+// TS-LB3-DB-006 TS-LB3-DB-007 TS-LB3-DB-008
+// TS-LB3-DB-009 TS-LB3-DB-010 TS-LB3-DB-012
+// TS-LB3-AUTH-005 TS-LB3-AUTH-009 TS-LB3-AUTH-011
+// TS-LB3-AUTH-017 TS-LB3-INVITE-002 TS-LB3-INVITE-004
+// TS-LB3-INVITE-005 TS-LB3-INVITE-008 TS-LB3-INVITE-009
+// TS-LB3-INVITE-011 TS-LB3-INVITE-012 TS-LB3-INVITE-013
+// TS-LB3-INVITE-014 TS-LB3-REL-001 TS-LB3-REL-002
+// TS-LB3-REL-004 TS-LB3-REL-005 TS-LB3-REL-006
+// TS-LB3-REL-007 TS-LB3-REL-008 TS-LB3-REL-009
+// TS-LB3-REL-011 TS-LB3-REL-015 TS-LB3-REL-018
+// TS-LB3-REL-020 TS-LB3-BOARD-005 TS-LB3-BOARD-006
+// TS-LB3-BOARD-009 TS-LB3-BOARD-010 TS-LB3-BOARD-011
+// TS-LB3-BOARD-012 TS-LB3-BOARD-014 TS-LB3-BOARD-016
+// TS-LB3-BOARD-020 TS-LB3-SYNC-004 TS-LB3-SYNC-006
+// TS-LB3-SYNC-011 TS-LB3-SYNC-013 TS-LB3-SYNC-014
+// TS-LB3-SYNC-016 TS-LB3-SYNC-017 TS-LB3-SYNC-018
+// TS-LB3-ECON-001 TS-LB3-ECON-002 TS-LB3-ECON-003
+// TS-LB3-ECON-004 TS-LB3-ECON-005 TS-LB3-ECON-006
+// TS-LB3-ECON-007 TS-LB3-ECON-008 TS-LB3-SOCIAL-001
+// TS-LB3-SOCIAL-003 TS-LB3-SOCIAL-005 TS-LB3-SOCIAL-014
+// TS-LB3-RELY-004 TS-LB3-RELY-005 TS-LB3-RELY-009
+// TS-LB3-RELY-011 TS-LB3-DELETE-001 TS-LB3-DELETE-002
+// TS-LB3-DELETE-003 TS-LB3-DELETE-004 TS-LB3-DELETE-005
+// TS-LB3-DELETE-006 TS-LB3-DELETE-007 TS-LB3-DELETE-008
+// TS-LB3-DELETE-009 TS-LB3-DELETE-010 TS-LB3-DELETE-012
+// TS-LB3-DELETE-013 TS-LB3-DELETE-014 TS-LB3-SEC-001
+// TS-LB3-SEC-002 TS-LB3-SEC-003 TS-LB3-SEC-004
+// TS-LB3-SEC-005 TS-LB3-SEC-010 TS-LB3-SEC-011
+// TS-LB3-SEC-015 TS-LB3-SEC-016 TS-LB3-SEC-020
+// TS-LB3-PERF-002 TS-LB3-PERF-003 TS-LB3-PERF-004.
+//
 // Run: npm run itest
 
 import { execSync, spawn } from "node:child_process";
@@ -122,6 +157,35 @@ try {
   const board304 = await api("GET", "/board", { token: anna.session, headers: { "if-none-match": board1.etag } });
   assert.equal(board304.status, 304, "ETag must 304");
   console.log("✓ board figures exact (week=262, streak=4, mastered=42); conditional 304");
+
+  // Publish's documented idempotency exception: another device may advance the
+  // authoritative frontier between the original request and its replay. The
+  // replay must answer CURRENT merged frontier/revision with changed=false.
+  const otherDevice = structuredClone(payload);
+  otherDevice.frontier = { "device-2": 10 };
+  otherDevice.days[0].component = "device-2";
+  otherDevice.days[0].counters = {
+    sessionPts: 5, wordPts: 0, timePts: 0,
+    learnSec: 3, focusSec: 0, sessions: 1, wordsTouched: 1,
+  };
+  otherDevice.days[0].buckets = [
+    { deltaQH: 31, sessionPts: 5, wordPts: 0, timePts: 0 },
+  ];
+  otherDevice.awards = [];
+  otherDevice.registers = undefined;
+  const pubOther = await api("POST", "/publish", {
+    token: anna.session, body: otherDevice,
+  });
+  assert.equal(pubOther.json.code, "OK");
+  const replayAfterOther = await api("POST", "/publish", {
+    token: anna.session, body: payload,
+  });
+  assert.equal(replayAfterOther.json.data.changed, false);
+  assert.deepEqual(replayAfterOther.json.data.frontier, {
+    "device-1": 262, "device-2": 10,
+  }, "publish replay must return the current merged frontier");
+  assert.ok(replayAfterOther.json.data.revision >= pubOther.json.data.revision);
+  console.log("✓ publish replay returns current merged multi-device frontier");
 
   // Envelope refusal
   const over = structuredClone(payload);

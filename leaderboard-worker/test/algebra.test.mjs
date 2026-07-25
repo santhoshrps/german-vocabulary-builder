@@ -1,7 +1,15 @@
 #!/usr/bin/env node
-// W3 property tests over the pure algebra core (P-plan subset runnable at L1):
-// codec roundtrip fuzz, measure monotonicity, F7 consistency, register join
-// ACI + convergence, bitmap OR, viewer-boundary exactness in awkward zones.
+// W3 property tests over the pure algebra core (L1): codec roundtrip,
+// measure monotonicity, F7 consistency, register join ACI + convergence,
+// bitmap OR, viewer-boundary exactness and the generated envelope.
+//
+// Traceability:
+// TS-LB3-BOARD-009 TS-LB3-BOARD-010 TS-LB3-BOARD-011
+// TS-LB3-BOARD-012 TS-LB3-BOARD-014 TS-LB3-SYNC-005
+// TS-LB3-SYNC-006 TS-LB3-SYNC-007 TS-LB3-SYNC-008
+// TS-LB3-SYNC-009 TS-LB3-SYNC-011 TS-LB3-SYNC-013
+// TS-LB3-SYNC-014 TS-LB3-SYNC-016 TS-LB3-SYNC-019
+// TS-LB3-ECON-004 TS-LB3-ECON-007 TS-LB3-ECON-008.
 import { execSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -20,8 +28,9 @@ try {
   let s = SEED;
   const rnd = (n) => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s % n; };
 
-  // P: codec roundtrip fuzz (500 components)
-  for (let i = 0; i < 500; i++) {
+  // P: the specification requires at least 10,000 retained-seed histories.
+  const HISTORIES = 10_000;
+  for (let i = 0; i < HISTORIES; i++) {
     const buckets = Array.from({ length: rnd(20) }, () => ({
       deltaQH: rnd(104), sessionPts: rnd(200), wordPts: rnd(50), timePts: rnd(3),
     }));
@@ -60,8 +69,16 @@ try {
   }));
   const foldAll = (order) => order.reduce((acc, r) => A.joinRegisters(acc, r), A.EMPTY_REGISTERS);
   const base = JSON.stringify(foldAll(regs));
-  for (let trial = 0; trial < 30; trial++) {
-    const shuffled = [...regs].sort(() => rnd(3) - 1);
+  const shuffledCopy = (values) => {
+    const copy = [...values];
+    for (let i = copy.length - 1; i > 0; i--) {
+      const j = rnd(i + 1);
+      [copy[i], copy[j]] = [copy[j], copy[i]];
+    }
+    return copy;
+  };
+  for (let trial = 0; trial < 10_000; trial++) {
+    const shuffled = shuffledCopy(regs);
     const withDupes = [...shuffled, shuffled[rnd(shuffled.length)]];
     assert.equal(JSON.stringify(foldAll(withDupes)), base, "join order/duplication changed result");
   }
@@ -103,17 +120,36 @@ try {
     }
   }
 
-  // DST sanity: Berlin spring-forward week (2026-03-30 is the Monday after) has a
-  // 6-day..? — assert week length is 7*24h ± 1h exactly
-  const dst = A.viewerRanges("Europe/Berlin", new Date("2026-03-31T12:00:00Z"));
-  const weekHours = (dst.week.endMs - dst.week.startMs) / 3600000;
-  assert.ok(weekHours === 167 || weekHours === 168 || weekHours === 169, `dst week ${weekHours}h`);
+  // DST weeks are exact, not merely "near seven days".
+  const berlinSpring = A.viewerRanges("Europe/Berlin", new Date("2026-03-25T12:00:00Z"));
+  assert.equal((berlinSpring.week.endMs - berlinSpring.week.startMs) / 3600000, 167);
+  const berlinFall = A.viewerRanges("Europe/Berlin", new Date("2026-10-21T12:00:00Z"));
+  assert.equal((berlinFall.week.endMs - berlinFall.week.startMs) / 3600000, 169);
+  const kathmandu = A.viewerRanges("Asia/Kathmandu", new Date("2026-07-22T12:00:00Z"));
+  assert.equal(kathmandu.week.startMs % A.QH_MS, 0);
+  const chatham = A.viewerRanges("Pacific/Chatham", new Date("2026-07-22T12:00:00Z"));
+  assert.equal(chatham.month.startMs % A.QH_MS, 0);
 
-  // Envelope
-  assert.ok(!A.envelopeViolation({ counters: { sessionPts: 6000, wordPts: 7000, timePts: 12, learnSec: 0, focusSec: 0, sessions: 50, wordsTouched: 1 }, zone: { ianaZone: "UTC", offsetMin: 0 }, buckets: [] }));
-  assert.ok(A.envelopeViolation({ counters: { sessionPts: 6001, wordPts: 0, timePts: 0, learnSec: 0, focusSec: 0, sessions: 1, wordsTouched: 1 }, zone: { ianaZone: "UTC", offsetMin: 0 }, buckets: [] }));
+  // Exact legal boundary accepts; one over every bounded class rejects.
+  const legalMaximum = {
+    counters: {
+      sessionPts: A.ENVELOPE_V1.sessionClassPerDay,
+      wordPts: A.ENVELOPE_V1.wordClassPerDay,
+      timePts: A.ENVELOPE_V1.timePerDay,
+      learnSec: 20 * 3600, focusSec: 20 * 3600,
+      sessions: 20, wordsTouched: 2_000,
+    },
+    zone: { ianaZone: "UTC", offsetMin: 0 },
+    buckets: [],
+  };
+  assert.equal(A.envelopeViolation(legalMaximum), false);
+  for (const field of ["sessionPts", "wordPts", "timePts"]) {
+    const hostile = structuredClone(legalMaximum);
+    hostile.counters[field] += 1;
+    assert.equal(A.envelopeViolation(hostile), true, `${field} one-over accepted`);
+  }
 
-  console.log(`algebra.test OK (seed ${SEED}) — codec fuzz, join ACI/convergence, bitmap, boundary exactness, DST, envelope`);
+  console.log(`algebra.test OK (seed ${SEED}, ${HISTORIES} histories) — codec, ACI/convergence, bitmap, boundaries, DST, envelope`);
 } finally {
   rmSync(out, { recursive: true, force: true });
 }

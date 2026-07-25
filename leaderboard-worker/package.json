@@ -3,8 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node test/routes.test.mjs && node test/policy.test.mjs && node test/algebra.test.mjs",
+    "test": "node test/run-unit.mjs",
     "typecheck": "npx --prefix ../read-worker tsc --noEmit -p tsconfig.json",
-    "itest": "node test/integration.mjs"
+    "itest": "node test/integration.mjs",
+    "test:all": "npm test && npm run itest"
   }
 }

@@ -40,6 +40,16 @@ export async function handleBoard(
   const ids = [me, ...friendIds];
   const marks = ids.map(() => "?").join(",");
 
+  // Per-pair relationship generation for each friend (RELY-9; audit LB3A-005):
+  // the client records it on any queued safety action so a stale offline mutation
+  // can never target a newer relationship. The friendship row's generation is the
+  // authoritative current value.
+  const generationByFriend = new Map<string, number>();
+  for (const e of edges.results ?? []) {
+    const friend = (e.a === me ? e.b : e.a) as string;
+    generationByFriend.set(friend, Number(e.generation ?? 1));
+  }
+
   const playerRows = await env.SOCIAL_DB.prepare(
     `SELECT player_id, nickname, board_revision FROM players WHERE player_id IN (${marks})`)
     .bind(...ids).all();
@@ -182,6 +192,7 @@ export async function handleBoard(
         ...figures.get(id)!,
         duoDays: undefined, // duo detail is self-only; friends expose figures only
         cheeredToday: cheeredToday.has(id),
+        generation: generationByFriend.get(id) ?? 1,   // RELY-9 (audit LB3A-005)
       })),
     },
   };

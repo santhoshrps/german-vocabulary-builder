@@ -1,7 +1,13 @@
 #!/usr/bin/env node
-// Route-enumeration test (LB3-NFR-4f, TS-LB3 route-table obligation): the deployed
+// Route-enumeration test (LB3-NFR-4f): the deployed
 // route table must equal the contract's declaration, and the public allowlist must
 // be EXACTLY the contract's — an unauthenticated route cannot ship by accident.
+//
+// Traceability:
+// TS-LB3-ARCH-008 TS-LB3-ARCH-009 TS-LB3-ARCH-011
+// TS-LB3-AUTH-005 TS-LB3-DB-015 TS-LB3-SEC-001
+// TS-LB3-SEC-002 TS-LB3-SEC-004 TS-LB3-SEC-005
+// TS-LB3-SEC-013 TS-LB3-SEC-014 TS-LB3-SEC-017.
 //
 // Run: npm test  (bundles src/contract.ts via the read worker's esbuild — no deps)
 

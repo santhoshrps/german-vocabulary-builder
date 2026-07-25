@@ -1,5 +1,11 @@
 #!/usr/bin/env node
-// W2 pure-logic tests: nickname policy (NFR-4e/IDENT-4) + social JWT roundtrip.
+// W2 pure-logic tests: nickname policy (NFR-4e/IDENT-4), token codec and
+// identity hashing.
+//
+// Traceability:
+// TS-LB3-AUTH-003 TS-LB3-AUTH-005 TS-LB3-AUTH-017
+// TS-LB3-INVITE-004 TS-LB3-SEC-003 TS-LB3-SEC-006
+// TS-LB3-SEC-007 TS-LB3-SEC-009 TS-LB3-SEC-012.
 import { execSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -46,7 +52,16 @@ try {
   assert.notEqual(h1, await hashedSubject("k1", "apple", "sub2"));
   assert.equal(h1.length, 64);
 
-  console.log("policy.test OK — nickname policy, JWT roundtrip/tamper, identity hash");
+  // Base64url codec is canonical and padding-free; malformed input cannot be a
+  // second textual representation of the same credential.
+  for (let length = 0; length < 128; length++) {
+    const bytes = crypto.getRandomValues(new Uint8Array(length));
+    const encoded = b64urlEncode(bytes);
+    assert.doesNotMatch(encoded, /[+/=]/);
+    assert.deepEqual(b64urlDecode(encoded), bytes);
+  }
+
+  console.log("policy.test OK — nickname, JWT tamper, identity hash, base64url");
 } finally {
   rmSync(out, { recursive: true, force: true });
 }
