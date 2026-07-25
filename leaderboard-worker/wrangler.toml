@@ -1,0 +1,81 @@
+# Leaderboard worker — two fully isolated environments (LB3-NFR-12, owner 2026-07-25:
+# dev + prod, no standing test; scratch resources per run live in ../leaderboard-rig).
+#
+#   prod (top level)  → the live app.            Deploy ONLY via scripts/deploy.sh.
+#   [env.dev]         → Xcode DEBUG builds + TestFlight phones flipped to Development.
+#
+# Named environments do NOT inherit vars or bindings — every block re-declares its
+# full configuration; the deploy script verifies secret parity (names only) and
+# asserts /health after deploy, exactly like the read worker.
+#
+# STATUS: configuration only. `main` and src/ land with the first implementation
+# batch AFTER owner approval (spec §6.5 gate) — `wrangler deploy` fails until then,
+# deliberately. Database ids recorded 2026-07-25 from the owner's `d1 create` runs.
+#
+# Store split (capacity-model.md §6): SOCIAL_DB (relational + registers),
+# ERASURE_DB (deletion journal — never restored behind SOCIAL_DB), PROJECTION_1
+# (per-player day-state; PROJECTION_2+ created by assignment cap, never migrated).
+#
+# Queues: none yet — queue-less v1 (LB3-NFR-1b, owner 2026-07-25): the cron-driven
+# dispatcher executes outbox jobs directly on the free plan. On Workers Paid, add
+# german-social-outbox-{dev,prod} + …-dlq-{dev,prod} and their bindings here.
+
+name = "german-vocabulary-leaderboard-worker"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+# ---------------------------------------------------------------------------
+# PROD
+# ---------------------------------------------------------------------------
+
+[[d1_databases]]
+binding = "SOCIAL_DB"
+database_name = "german-social-prod"
+database_id = "e2134886-f40a-4b59-8ecb-f8973b1a78f2"
+
+[[d1_databases]]
+binding = "ERASURE_DB"
+database_name = "german-erasure-prod"
+database_id = "a7d20f19-dedb-4ca4-bf3e-76fe758919ce"
+
+[[d1_databases]]
+binding = "PROJECTION_1"
+database_name = "german-projection-1-prod"
+database_id = "a26e469d-f65d-4948-bdef-4b35ced34997"
+
+[triggers]
+crons = ["*/1 * * * *"]   # queue-less v1 outbox executor + cleanup (NFR-1b)
+
+[observability]
+enabled = true
+
+[vars]
+ENV_NAME = "prod"
+
+# ---------------------------------------------------------------------------
+# DEV
+# ---------------------------------------------------------------------------
+
+[[env.dev.d1_databases]]
+binding = "SOCIAL_DB"
+database_name = "german-social-dev"
+database_id = "650c877d-519d-4fd8-9205-a4b933deccc0"
+
+[[env.dev.d1_databases]]
+binding = "ERASURE_DB"
+database_name = "german-erasure-dev"
+database_id = "50bdd9a1-8bb6-410e-97af-375da3f7e560"
+
+[[env.dev.d1_databases]]
+binding = "PROJECTION_1"
+database_name = "german-projection-1-dev"
+database_id = "dafe72ab-ec6d-4678-9578-01f64f48b822"
+
+[env.dev.triggers]
+crons = ["*/1 * * * *"]
+
+[env.dev.observability]
+enabled = true
+
+[env.dev.vars]
+ENV_NAME = "dev"
