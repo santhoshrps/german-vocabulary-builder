@@ -2,7 +2,6 @@
 #
 #   prod (top level)  → the live app.            Deploy ONLY via scripts/deploy.sh.
 #   [env.dev]         → Xcode DEBUG builds + TestFlight phones flipped to Development.
-#   [env.test]        → automated integration tests + backend experiments; disposable.
 #
 # Each environment has its OWN content database, ops database, media bucket and
 # secrets. Wrangler named environments do NOT inherit vars or bindings, so every
@@ -83,7 +82,7 @@ R2_ACCOUNT_ID = "50163e5bf5ee8a574fb5e2dd442e38ed"
 # Until set, packurl answers 503 and clients use the streamed route.
 R2_MEDIA_BUCKET = "german-media-prod"
 
-# Secrets per environment (wrangler secret put <NAME> [--env dev|test]), never committed:
+# Secrets per environment (wrangler secret put <NAME> [--env dev]), never committed:
 #   SESSION_JWT_SECRET           random 32+ byte signing secret (openssl rand -hex 32)
 #   SESSION_JWT_SECRET_PREVIOUS  ONLY during a key-rotation grace window (MS2-FR-30e)
 #   APPLE_APPATTEST_ROOT_CA      base64 DER of Apple App Attest Root CA
@@ -136,42 +135,3 @@ R2_ACCOUNT_ID = "50163e5bf5ee8a574fb5e2dd442e38ed"
 # (wrangler secret put R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY --env dev).
 # Until set, packurl answers 503 and clients use the streamed route.
 R2_MEDIA_BUCKET = "german-media-dev"
-
-# ---------------------------------------------------------------------------
-# TEST — automated integration tests + backend sandbox (MS2-FR-32). Disposable:
-# fixtures are seeded before a suite and wiped at the START of the next run.
-#   Deploy:      scripts/deploy.sh test
-# ---------------------------------------------------------------------------
-
-[[env.test.d1_databases]]
-binding = "CONTENT_DB"
-database_name = "german-content-test"
-database_id = "8d110ea2-8f7d-4ff2-adc6-0465701bcf88"
-
-[[env.test.d1_databases]]
-binding = "OPS_DB"
-database_name = "german-ops-test"
-database_id = "7c2dd3ae-4ce1-4eb3-ba7c-7adbb835ed19"
-
-[[env.test.r2_buckets]]
-binding = "MEDIA"
-bucket_name = "german-media-test"
-
-[env.test.triggers]
-crons = ["17 3 * * *"]
-
-[env.test.observability]
-enabled = true
-
-[env.test.vars]
-ENV_NAME = "test"
-APP_TEAM_ID = "3VF33Y593F"
-APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
-ENTITLEMENT_PRODUCT_IDS = "com.ramapurampalanivel.germanwords.fullaccess.lifetime"
-SESSION_TTL_SECONDS = "600"
-# Forward-compat floor (MS2-FR-23): bump ONLY for a breaking content change.
-MIN_CLIENT_GENERATION = "1"
-APP_ATTEST_ENV = "development"
-STOREKIT_ENV = "xcode"
-R2_ACCOUNT_ID = "50163e5bf5ee8a574fb5e2dd442e38ed"
-R2_MEDIA_BUCKET = "german-media-test"

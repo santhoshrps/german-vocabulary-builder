@@ -38,14 +38,3 @@ enabled = true
 [env.dev.vars]
 ENV_NAME = "dev"
 
-# ---- TEST -----------------------------------------------------------------
-[[env.test.d1_databases]]
-binding = "CONTENT_DB"
-database_name = "german-content-test"
-database_id = "8d110ea2-8f7d-4ff2-adc6-0465701bcf88"
-
-[env.test.observability]
-enabled = true
-
-[env.test.vars]
-ENV_NAME = "test"

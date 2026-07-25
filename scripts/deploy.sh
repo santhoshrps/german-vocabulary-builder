@@ -1,8 +1,9 @@
 #!/bin/bash
 # deploy.sh — the ONLY way workers reach any environment (MS2-FR-30b/30c).
 #
-#   scripts/deploy.sh <dev|test|prod>     deploy BOTH workers to one environment
-#   scripts/deploy.sh all                 dev → test → prod, verifying each step
+#   scripts/deploy.sh <dev|prod>          deploy BOTH workers to one environment
+#   scripts/deploy.sh all                 dev → prod, verifying each step
+#   (the standing test environment was retired 2026-07-25 — MS2-FR-32 revised)
 #
 # Per environment, in order:
 #   1. secret PARITY gate  — required secret NAMES must exist (wrangler secret list);
@@ -12,7 +13,7 @@
 #   3. wire-verify         — curl /health and assert status+env+version match what
 #                            was just deployed. A verify that hits the wrong world
 #                            or stale code FAILS the deploy.
-# Production additionally requires typing 'prod' (skipped for dev/test).
+# Production additionally requires typing 'prod' (skipped for dev).
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -124,7 +125,7 @@ do_env() {
 }
 
 case "${1:-}" in
-  dev|test|prod) do_env "$1" ;;
-  all) do_env dev; do_env test; do_env prod ;;
-  *) echo "usage: scripts/deploy.sh <dev|test|prod|all>" >&2; exit 1 ;;
+  dev|prod) do_env "$1" ;;
+  all) do_env dev; do_env prod ;;
+  *) echo "usage: scripts/deploy.sh <dev|prod|all>" >&2; exit 1 ;;
 esac
