@@ -31,6 +31,7 @@ read_required=(SESSION_JWT_SECRET)
 read_required_prod=(SESSION_JWT_SECRET APPLE_APPATTEST_ROOT_CA APPLE_STOREKIT_ROOT_CA)
 read_warn=(R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY ADMIN_BROADCAST_TOKEN FCM_SERVICE_ACCOUNT)
 write_required=(API_KEY)
+lb_required=(SOCIAL_JWT_SECRET IDENTITY_HMAC_KEY_V1)
 
 env_flag() { # "" for prod (top-level config), "--env <name>" otherwise
   local env="$1"
@@ -120,8 +121,10 @@ do_env() {
     WARN_NAMES=("${read_warn[@]}"); check_parity read-worker "$env" "${read_required[@]}"
   fi
   WARN_NAMES=(); check_parity worker "$env" "${write_required[@]}"
+  WARN_NAMES=(); check_parity leaderboard-worker "$env" "${lb_required[@]}"
   deploy_and_verify read-worker "$env"
   deploy_and_verify worker "$env"
+  deploy_and_verify leaderboard-worker "$env"
 }
 
 case "${1:-}" in

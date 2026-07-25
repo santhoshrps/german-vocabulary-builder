@@ -1,0 +1,9 @@
+{
+  "name": "german-vocabulary-leaderboard-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test/routes.test.mjs",
+    "typecheck": "npx --prefix ../read-worker tsc --noEmit -p tsconfig.json"
+  }
+}
