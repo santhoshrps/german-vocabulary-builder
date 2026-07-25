@@ -63,43 +63,56 @@ export default {
     if (request.headers.get("x-rig-token") !== env.RIG_TOKEN) return json({ code: "AUTH" }, 401);
 
     try {
-      // POST /seed?players=N&days=D&shape=typical|declared|envelope&friends=1
-      // Bulk-inserts synthetic rows in batches; call repeatedly for large fleets.
+      // POST /seed?players=N&days=D&shape=typical|declared|envelope&start=S
+      // Bulk-inserts synthetic rows. FREE-PLAN SAFE: one D1 batch = one subrequest and
+      // free Workers allow ~50 subrequests/request, so statements are chunked into ≤ 90
+      // per batch and a request refuses work that would exceed ~45 batches. The driver
+      // calls this repeatedly (25 players/call) for large fleets.
       if (url.pathname === "/seed" && request.method === "POST") {
-        const players = Number(url.searchParams.get("players") ?? 100);
+        const players = Number(url.searchParams.get("players") ?? 25);
         const days = Number(url.searchParams.get("days") ?? 66);
         const start = Number(url.searchParams.get("start") ?? 0);
         const shape = SHAPES[url.searchParams.get("shape") ?? "typical"] ?? SHAPES.typical;
+        if (players * (days + 1) > 4000) return json({ code: "TOO_MANY_STATEMENTS" }, 400);
         const blob = packDayBlob(shape);
         const dayStmt = env.SCRATCH_DB.prepare(
           "INSERT OR REPLACE INTO day_state (player_id, day_u16, blob, measure) VALUES (?, ?, ?, ?)");
         const playerStmt = env.SCRATCH_DB.prepare(
           "INSERT OR REPLACE INTO players (player_id, board_revision) VALUES (?, 0)");
+        const statements: D1PreparedStatement[] = [];
         for (let p = start; p < start + players; p++) {
           const id = `rig-${p.toString().padStart(7, "0")}`;
-          const batch = [playerStmt.bind(id)];
-          for (let d = 0; d < days; d++) batch.push(dayStmt.bind(id, 20000 + d, blob, d + 1));
-          await env.SCRATCH_DB.batch(batch);
+          statements.push(playerStmt.bind(id));
+          for (let d = 0; d < days; d++) statements.push(dayStmt.bind(id, 20000 + d, blob, d + 1));
         }
-        return json({ seeded: players, days, blobBytes: blob.length });
+        for (let i = 0; i < statements.length; i += 90) {
+          await env.SCRATCH_DB.batch(statements.slice(i, i + 90));
+        }
+        return json({ seeded: players, days, blobBytes: blob.length,
+                      batches: Math.ceil(statements.length / 90) });
       }
 
-      // POST /friends?players=N — ring topology, 10 friends per player.
+      // POST /friends?start=S&count=N&fleet=F — ring topology, 10 friends per player.
+      // Same subrequest discipline: ≤ 90 statements per batch, bounded per request.
       if (url.pathname === "/friends" && request.method === "POST") {
-        const players = Number(url.searchParams.get("players") ?? 100);
+        const start = Number(url.searchParams.get("start") ?? 0);
+        const count = Number(url.searchParams.get("count") ?? 250);
+        const fleet = Number(url.searchParams.get("fleet") ?? 5000);
+        if (count * 5 > 4000) return json({ code: "TOO_MANY_STATEMENTS" }, 400);
         const stmt = env.SCRATCH_DB.prepare(
           "INSERT OR IGNORE INTO friendships (a, b) VALUES (?, ?)");
-        const batch: D1PreparedStatement[] = [];
-        for (let p = 0; p < players; p++) {
+        const statements: D1PreparedStatement[] = [];
+        for (let p = start; p < start + count; p++) {
           for (let k = 1; k <= 5; k++) {
-            const q = (p + k) % players;
+            const q = (p + k) % fleet;
             const [a, b] = [`rig-${p.toString().padStart(7, "0")}`, `rig-${q.toString().padStart(7, "0")}`].sort();
-            batch.push(stmt.bind(a, b));
-            if (batch.length >= 100) { await env.SCRATCH_DB.batch(batch.splice(0)); }
+            statements.push(stmt.bind(a, b));
           }
         }
-        if (batch.length) await env.SCRATCH_DB.batch(batch);
-        return json({ ok: true });
+        for (let i = 0; i < statements.length; i += 90) {
+          await env.SCRATCH_DB.batch(statements.slice(i, i + 90));
+        }
+        return json({ ok: true, from: start, count });
       }
 
       // POST /publish?player=rig-0000001&shape=declared
