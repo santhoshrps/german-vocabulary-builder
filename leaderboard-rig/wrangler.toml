@@ -1,0 +1,24 @@
+# Leaderboard capacity rig — THROWAWAY harness worker (capacity-model.md §7,
+# handbook cloudflare-setup.md §6). Not an environment: created for a measurement
+# run, deleted afterward together with its scratch database. Never binds dev or
+# prod resources.
+#
+# Per run:
+#   npx wrangler d1 create german-social-scratch     → paste database_id below
+#   npx wrangler d1 execute german-social-scratch --remote --file=schema.sql
+#   openssl rand -hex 24 | npx wrangler secret put RIG_TOKEN
+#   npx wrangler deploy
+#   node loadtest.mjs <worker-url> <rig-token>        → record into capacity-model.md §3/§4
+#   npx wrangler delete && npx wrangler d1 delete german-social-scratch
+
+name = "german-leaderboard-scratch-harness"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+[[d1_databases]]
+binding = "SCRATCH_DB"
+database_name = "german-social-scratch"
+database_id = "SET-PER-RUN"           # from `d1 create` output; throwaway
+
+[observability]
+enabled = true
