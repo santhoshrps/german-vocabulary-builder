@@ -21,6 +21,7 @@ import {
   handleUnblock, withIdempotency,
 } from "./social";
 import { handleDelete, handleDeleteStatus, handleExport, runOutboxTick } from "./deletion";
+import { integrityVerdict, mintChallenge } from "./integrity";
 
 export interface Env {
   SOCIAL_DB: D1Database;
@@ -38,6 +39,8 @@ export interface Env {
   /** Optional capability overrides (NFR-10b). */
   CAPABILITY_STATE?: string; // healthy | maintenance | disabled
   MIN_BUILD?: string;
+  /** App Attest root CA (owner runway) — enables cryptographic assertion verification. */
+  APPLE_APPATTEST_ROOT_CA?: string;
   /** Prod: https://learn-languages.app/german/join (owner 2026-07-25); dev: "" → worker origin. */
   INVITE_LINK_BASE?: string;
 }
@@ -69,6 +72,61 @@ export function envelope(
     status,
     headers: { "content-type": "application/json", ...headers },
   });
+}
+
+// --- request-body defense (audit LB3A-020; TS-LB3-SEC-010/011/012) ----------
+//
+// A publish body is bounded THREE ways before any handler or JSON.parse touches
+// it: an absolute byte ceiling, a nesting-depth bound, and duplicate-key
+// rejection. The depth + duplicate scan is a single left-to-right pass over the
+// raw text — a nesting bomb (deeply nested arrays/objects that blow the parser
+// stack) and a duplicate-key ambiguity (two "days" keys, last-wins) are refused
+// at the router, never reaching the merge. This is defense-in-depth: the
+// handler validates shape too, but the router never lets a bomb reach it.
+const MAX_PUBLISH_BYTES = 1_048_576; // 1 MiB hard ceiling — 1024 * 1024
+const MAX_JSON_DEPTH = 24;
+
+/** One-pass canonical-JSON scan: returns a wire code when the text exceeds the
+ *  byte ceiling, nests deeper than MAX_JSON_DEPTH, or repeats a key within one
+ *  object; null when the text is structurally safe to parse. */
+function guardRequestBody(text: string, maxBytes: number): ErrorCode | null {
+  if (new TextEncoder().encode(text).length > maxBytes) return "SCHEMA_INVALID";
+  type Frame = { obj: boolean; keys?: Set<string>; expectKey?: boolean };
+  const frames: Frame[] = [];
+  let inString = false, escaped = false, current = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) { escaped = false; current += ch; continue; }
+      if (ch === "\\") { escaped = true; continue; }
+      if (ch === '"') {
+        inString = false;
+        const top = frames[frames.length - 1];
+        if (top?.obj && top.expectKey) {
+          if (top.keys!.has(current)) return "SCHEMA_INVALID"; // duplicate key
+          top.keys!.add(current);
+          top.expectKey = false;
+        }
+        current = "";
+      } else current += ch;
+      continue;
+    }
+    switch (ch) {
+      case '"': inString = true; current = ""; break;
+      case "{":
+        frames.push({ obj: true, keys: new Set(), expectKey: true });
+        if (frames.length > MAX_JSON_DEPTH) return "SCHEMA_INVALID"; // nesting/depth bomb
+        break;
+      case "[":
+        frames.push({ obj: false });
+        if (frames.length > MAX_JSON_DEPTH) return "SCHEMA_INVALID"; // nesting/depth bomb
+        break;
+      case "}": case "]": frames.pop(); break;
+      case ",": { const top = frames[frames.length - 1]; if (top?.obj) top.expectKey = true; break; }
+      default: break;
+    }
+  }
+  return null;
 }
 
 // --- W1 handlers -----------------------------------------------------------
@@ -125,6 +183,7 @@ const HANDLERS: Partial<Record<string, Handler>> = {
   R3: async (request, env, requestId) => fromResult(requestId, await handleNonce(request, env)),
   R4: async (request, env, requestId) => fromResult(requestId, await handleExchange(request, env)),
   R5: async (request, env, requestId) => fromResult(requestId, await handleRefresh(request, env)),
+  R5b: async (_request, env, requestId) => fromResult(requestId, { code: "OK", data: await mintChallenge(env) }),
   R6: async (_request, env, requestId, ctx) => fromResult(requestId, await handleSignout(env, ctx!)),
   R7: async (request, env, requestId) => {
     // Join accepts BOTH the pre-join principal and a full session (idempotent).
@@ -133,7 +192,13 @@ const HANDLERS: Partial<Record<string, Handler>> = {
     return fromResult(requestId, await handleJoin(request, env, principal));
   },
   R8: async (_request, env, requestId, ctx) => fromResult(requestId, await handleProfile(env, ctx!)),
-  R12: async (request, env, requestId, ctx) => fromResult(requestId, await handlePublish(request, env, ctx!)),
+  R12: async (request, env, requestId, ctx) => {
+    // Router body defense before the handler: byte ceiling, depth bound, no
+    // duplicate keys. Read a clone so handlePublish still parses the original.
+    const guard = guardRequestBody(await request.clone().text(), MAX_PUBLISH_BYTES);
+    if (guard) return envelope(requestId, guard);
+    return fromResult(requestId, await handlePublish(request, env, ctx!));
+  },
   R13: async (request, env, requestId, ctx) => {
     const result = await handleBoard(request, env, ctx!);
     if (result.notModified) return new Response(null, { status: 304, headers: result.headers });
@@ -232,7 +297,15 @@ async function authorize(
       // counter, read-worker appattest module) lands with W4 before any
       // mutation route ships enabled to real users.
       const session = await verifySession(request, env);
-      return session.ok ? { refusal: null, ctx: session.ctx } : { refusal: session.code, ctx: null };
+      if (!session.ok) return { refusal: session.code, ctx: null };
+      if (route.auth === "sessionIntegrity") {
+        // IDENT-7 (audit LB3A-008): every mutation carries a challenge-bound
+        // integrity assertion; the verdict matrix gates it. Deny is a hard block;
+        // tighten allows a degraded provider (simulator/unsupported) through.
+        const verdict = await integrityVerdict(request, env);
+        if (verdict === "deny") return { refusal: "INTEGRITY_DENIED", ctx: null };
+      }
+      return { refusal: null, ctx: session.ctx };
     }
     case "capability":
     case "inviteToken":
@@ -270,6 +343,21 @@ export default {
       if (!url.pathname.startsWith(BASE)) return envelope(requestId, "NOT_FOUND");
       const route = ROUTES.find((r) => r.path === url.pathname && r.method === request.method);
       if (!route) return envelope(requestId, "NOT_FOUND");
+
+      // Contract-declared body policy, enforced generically from the route table
+      // (the single source): a wrong content type or a Content-Length past the
+      // route's ceiling is refused before auth or handler work. The byte-exact
+      // recheck still happens in the body-reading handlers (publish 1 MiB scan,
+      // social writes 4 KiB) — this is the cheap header-level first line.
+      if (route.method !== "GET") {
+        const declared = (request.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+        if (route.contentTypes.length > 0 && declared && !route.contentTypes.includes(declared)) {
+          return envelope(requestId, "SCHEMA_INVALID");
+        }
+        if (route.bodyLimit > 0 && Number(request.headers.get("content-length") ?? 0) > route.bodyLimit) {
+          return envelope(requestId, "SCHEMA_INVALID");
+        }
+      }
 
       const { refusal, ctx } = await authorize(route, request, env);
       if (refusal) return envelope(requestId, refusal);

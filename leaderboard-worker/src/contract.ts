@@ -13,44 +13,68 @@ export type AuthLevel =
   | "session"          // valid social JWT (aud=leaderboard, env, session_version)
   | "sessionIntegrity"; // session + App Attest / Play Integrity verdict (IDENT-7)
 
+/** How a route's replays are made safe (contract §2): GET/health are `none`
+ *  (nothing to dedupe); auth/publish/delete are `natural` (the operation itself
+ *  converges on replay — rotation grace, idempotent merge, tombstoned erasure);
+ *  social writes are `key` (the client's Idempotency-Key row is authoritative). */
+export type IdempotencyPolicy = "none" | "natural" | "key";
+
 export interface RouteSpec {
   method: "GET" | "POST" | "DELETE";
   path: string;
   auth: AuthLevel;
   /** Contract row, for traceability in tests and logs. */
   id: string;
+  /** Absolute request-body ceiling in bytes; 0 for bodyless GETs. The router
+   *  refuses anything larger before a handler or JSON.parse runs (SEC-010). */
+  bodyLimit: number;
+  /** Replay-safety policy (above). */
+  idempotency: IdempotencyPolicy;
+  /** Accepted request content types; empty for bodyless GETs. */
+  contentTypes: readonly string[];
 }
 
 export const BASE = "/v3/leaderboard";
 
+// Shared body policies — the route table stays the single source, and every
+// route declares its policy explicitly (default-deny: an omitted policy is a
+// contract error the architecture test catches).
+const NO_BODY = { bodyLimit: 0, idempotency: "none", contentTypes: [] } as const;
+const AUTH_BODY = { bodyLimit: 8192, idempotency: "natural", contentTypes: ["application/json"] } as const;
+const SMALL_NATURAL = { bodyLimit: 2048, idempotency: "natural", contentTypes: ["application/json"] } as const;
+const JSON_KEYED = { bodyLimit: 4096, idempotency: "key", contentTypes: ["application/json"] } as const;
+const JSON_NATURAL = { bodyLimit: 4096, idempotency: "natural", contentTypes: ["application/json"] } as const;
+const PUBLISH_BODY = { bodyLimit: 1_048_576, idempotency: "natural", contentTypes: ["application/json"] } as const;
+
 export const ROUTES: RouteSpec[] = [
-  { id: "R1", method: "GET", path: `${BASE}/capability`, auth: "public" },
-  { id: "R2", method: "GET", path: `${BASE}/health`, auth: "public" },
-  { id: "R3", method: "POST", path: `${BASE}/auth/nonce`, auth: "public" },
-  { id: "R4", method: "POST", path: `${BASE}/auth/exchange`, auth: "public" },
-  { id: "R5", method: "POST", path: `${BASE}/auth/refresh`, auth: "public" },
-  { id: "R6", method: "POST", path: `${BASE}/auth/signout`, auth: "session" },
-  { id: "R7", method: "POST", path: `${BASE}/profile/join`, auth: "sessionIntegrity" },
-  { id: "R8", method: "GET", path: `${BASE}/profile`, auth: "session" },
-  { id: "R9", method: "GET", path: `${BASE}/profile/export`, auth: "session" },
-  { id: "R10", method: "DELETE", path: `${BASE}/profile`, auth: "sessionIntegrity" },
-  { id: "R11", method: "GET", path: `${BASE}/profile/delete-status`, auth: "capability" },
-  { id: "R12", method: "POST", path: `${BASE}/publish`, auth: "sessionIntegrity" },
-  { id: "R13", method: "GET", path: `${BASE}/board`, auth: "session" },
-  { id: "R14", method: "GET", path: `${BASE}/invites`, auth: "session" },
-  { id: "R15", method: "POST", path: `${BASE}/invites`, auth: "sessionIntegrity" },
-  { id: "R16", method: "POST", path: `${BASE}/invites/withdraw`, auth: "session" },
-  { id: "R17", method: "POST", path: `${BASE}/invites/preview`, auth: "inviteToken" },
-  { id: "R18", method: "POST", path: `${BASE}/invites/accept`, auth: "sessionIntegrity" },
-  { id: "R19", method: "POST", path: `${BASE}/friends/remove`, auth: "session" },
-  { id: "R20", method: "POST", path: `${BASE}/blocks`, auth: "session" },
-  { id: "R20b", method: "POST", path: `${BASE}/blocks/remove`, auth: "sessionIntegrity" },
-  { id: "R21", method: "POST", path: `${BASE}/mutes`, auth: "session" },
-  { id: "R21b", method: "POST", path: `${BASE}/mutes/remove`, auth: "session" },
-  { id: "R22", method: "POST", path: `${BASE}/cheers`, auth: "sessionIntegrity" },
-  { id: "R23", method: "POST", path: `${BASE}/reports`, auth: "sessionIntegrity" },
-  { id: "R24", method: "GET", path: `${BASE}/e18/receipts`, auth: "session" },
-  { id: "R25", method: "POST", path: `${BASE}/e18/receipts/ack`, auth: "session" },
+  { id: "R1", method: "GET", path: `${BASE}/capability`, auth: "public", ...NO_BODY },
+  { id: "R2", method: "GET", path: `${BASE}/health`, auth: "public", ...NO_BODY },
+  { id: "R3", method: "POST", path: `${BASE}/auth/nonce`, auth: "public", ...SMALL_NATURAL },
+  { id: "R4", method: "POST", path: `${BASE}/auth/exchange`, auth: "public", ...AUTH_BODY },
+  { id: "R5", method: "POST", path: `${BASE}/auth/refresh`, auth: "public", ...SMALL_NATURAL },
+  { id: "R5b", method: "POST", path: `${BASE}/attest/challenge`, auth: "public", ...SMALL_NATURAL },
+  { id: "R6", method: "POST", path: `${BASE}/auth/signout`, auth: "session", ...SMALL_NATURAL },
+  { id: "R7", method: "POST", path: `${BASE}/profile/join`, auth: "sessionIntegrity", ...JSON_KEYED },
+  { id: "R8", method: "GET", path: `${BASE}/profile`, auth: "session", ...NO_BODY },
+  { id: "R9", method: "GET", path: `${BASE}/profile/export`, auth: "session", ...NO_BODY },
+  { id: "R10", method: "DELETE", path: `${BASE}/profile`, auth: "sessionIntegrity", ...SMALL_NATURAL },
+  { id: "R11", method: "GET", path: `${BASE}/profile/delete-status`, auth: "capability", ...NO_BODY },
+  { id: "R12", method: "POST", path: `${BASE}/publish`, auth: "sessionIntegrity", ...PUBLISH_BODY },
+  { id: "R13", method: "GET", path: `${BASE}/board`, auth: "session", ...NO_BODY },
+  { id: "R14", method: "GET", path: `${BASE}/invites`, auth: "session", ...NO_BODY },
+  { id: "R15", method: "POST", path: `${BASE}/invites`, auth: "sessionIntegrity", ...JSON_KEYED },
+  { id: "R16", method: "POST", path: `${BASE}/invites/withdraw`, auth: "session", ...JSON_KEYED },
+  { id: "R17", method: "POST", path: `${BASE}/invites/preview`, auth: "inviteToken", ...JSON_NATURAL },
+  { id: "R18", method: "POST", path: `${BASE}/invites/accept`, auth: "sessionIntegrity", ...JSON_KEYED },
+  { id: "R19", method: "POST", path: `${BASE}/friends/remove`, auth: "session", ...JSON_KEYED },
+  { id: "R20", method: "POST", path: `${BASE}/blocks`, auth: "session", ...JSON_KEYED },
+  { id: "R20b", method: "POST", path: `${BASE}/blocks/remove`, auth: "sessionIntegrity", ...JSON_KEYED },
+  { id: "R21", method: "POST", path: `${BASE}/mutes`, auth: "session", ...JSON_KEYED },
+  { id: "R21b", method: "POST", path: `${BASE}/mutes/remove`, auth: "session", ...JSON_KEYED },
+  { id: "R22", method: "POST", path: `${BASE}/cheers`, auth: "sessionIntegrity", ...JSON_KEYED },
+  { id: "R23", method: "POST", path: `${BASE}/reports`, auth: "sessionIntegrity", ...JSON_KEYED },
+  { id: "R24", method: "GET", path: `${BASE}/e18/receipts`, auth: "session", ...NO_BODY },
+  { id: "R25", method: "POST", path: `${BASE}/e18/receipts/ack`, auth: "session", ...JSON_KEYED },
 ];
 
 /** Stable error codes — the CLOSED registry (contract §3). Clients branch on these,

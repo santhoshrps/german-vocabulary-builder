@@ -15,6 +15,7 @@ const RECENT_AUTH_MS = 10 * 60_000;          // deletion needs a fresh provider 
 const JOURNAL_RETENTION_MS = 400 * 86_400_000; // ≥ longest recovery source, then expires
 const EXECUTOR_BATCH = 10;
 const MAX_ATTEMPTS_BEFORE_ALERT = 20;        // visible via outbox age/attempts (DLQ role)
+const DELETE_STATUS_PER_HOUR = 30;           // bounds capability-hash probing on the status route
 
 type Result = { code: ErrorCode; data?: unknown };
 
@@ -67,12 +68,28 @@ export async function handleDeleteStatus(request: Request, env: Env): Promise<Re
   const token = request.headers.get("x-deletion-capability") ?? "";
   if (!token || token.length > 64) return { code: "AUTH_INVALID" };
   const hash = await sha256Hex(token);
+  // Bounded admission: the status route authenticates ONLY by capability hash,
+  // so attempts per hash per hour are capped — brute-forcing the opaque
+  // capability space is shed here before any erasure-store read (audit).
+  const hourWindow = new Date().toISOString().slice(0, 13);
+  const taken = await env.SOCIAL_DB.prepare(
+    `INSERT INTO quotas (player_id, kind, quota_day, count) VALUES (?1, 'delete_status', ?2, 1)
+     ON CONFLICT (player_id, kind, quota_day) DO UPDATE SET count = count + 1
+     RETURNING count`).bind(hash, hourWindow).first();
+  if (Number(taken?.count ?? 0) > DELETE_STATUS_PER_HOUR) return { code: "RATE_LIMITED" };
   const saga = await env.ERASURE_DB.prepare(
-    "SELECT state, requested_at, updated_at FROM erasure_saga WHERE capability_hash = ?").bind(hash).first();
+    "SELECT state, requested_at, updated_at, expires_at FROM erasure_saga WHERE capability_hash = ?").bind(hash).first();
   if (!saga) return { code: "AUTH_INVALID" };
+  // Expiry participates in authorization: once the journal has aged past its
+  // retention the capability proves nothing (the saga is sweep-eligible) — the
+  // caller is told it expired rather than shown a stale terminal state.
+  if (Number(saga.expires_at) < Date.now()) return { code: "AUTH_EXPIRED" };
   return {
     code: "OK",
-    data: { state: saga.state, requestedAt: saga.requested_at, updatedAt: saga.updated_at },
+    data: {
+      state: saga.state, requestedAt: saga.requested_at,
+      updatedAt: saga.updated_at, expiresAt: saga.expires_at,
+    },
   };
 }
 
@@ -131,7 +148,10 @@ export async function runErasureStep(env: Env, playerId: string): Promise<boolea
   await env.SOCIAL_DB.batch([
     env.SOCIAL_DB.prepare("DELETE FROM friendships WHERE a = ?1 OR b = ?1").bind(playerId),
     env.SOCIAL_DB.prepare("DELETE FROM pair_state WHERE a = ?1 OR b = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM invites WHERE inviter = ?1").bind(playerId),
+    // Both ownership directions: an invite this player CONSUMED still carries
+    // their id in consumed_by, so erasing only inviter rows would retain the
+    // deleted player's identifier on every invite they accepted (audit).
+    env.SOCIAL_DB.prepare("DELETE FROM invites WHERE inviter = ?1 OR consumed_by = ?1").bind(playerId),
     env.SOCIAL_DB.prepare("DELETE FROM cheers WHERE from_player = ?1 OR to_player = ?1").bind(playerId),
     env.SOCIAL_DB.prepare("DELETE FROM blocks WHERE owner = ?1 OR target = ?1").bind(playerId),
     env.SOCIAL_DB.prepare("DELETE FROM mutes WHERE owner = ?1 OR target = ?1").bind(playerId),
@@ -146,6 +166,11 @@ export async function runErasureStep(env: Env, playerId: string): Promise<boolea
     env.SOCIAL_DB.prepare("DELETE FROM idempotency WHERE player_id = ?1").bind(playerId),
     env.SOCIAL_DB.prepare("DELETE FROM refresh_sessions WHERE player_id = ?1").bind(playerId),
     env.SOCIAL_DB.prepare("DELETE FROM credentials WHERE player_id = ?1").bind(playerId),
+    // Moderation reports are RETAINED for abuse investigation (never deleted),
+    // but the deleting player's identity as reporter is scrubbed to a tombstone
+    // — retention WITH declared deidentification, so no live identifier of an
+    // erased account survives in the reporter column (§6.4; audit).
+    env.SOCIAL_DB.prepare("UPDATE moderation_reports SET reporter = 'erased' WHERE reporter = ?1").bind(playerId),
     env.SOCIAL_DB.prepare("DELETE FROM players WHERE player_id = ?1").bind(playerId),
   ]);
 

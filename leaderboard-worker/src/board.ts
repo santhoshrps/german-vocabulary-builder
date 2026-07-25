@@ -93,7 +93,12 @@ export async function handleBoard(
   const regsOf = new Map<string, Registers>();
   for (const r of regRows.results ?? []) {
     const text = blobText(r.data);
-    regsOf.set(String(r.player_id), text ? JSON.parse(text) : EMPTY_REGISTERS);
+    // Poison isolation (ROBUST-8): one friend's malformed register JSON must not
+    // throw the whole authorized board into INTERNAL for every viewer — that row
+    // degrades to EMPTY_REGISTERS and the rest of the board renders.
+    let parsed: Registers = EMPTY_REGISTERS;
+    if (text) { try { parsed = JSON.parse(text); } catch { parsed = EMPTY_REGISTERS; } }
+    regsOf.set(String(r.player_id), parsed);
   }
   const checkpointEarned = new Map((checkRows.results ?? []).map((r) => [String(r.player_id), Number(r.earned ?? 0)]));
   const duoDaysOf = new Map<string, Set<number>>();

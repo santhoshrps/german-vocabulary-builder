@@ -31,6 +31,14 @@ export type AuthResult = { ok: true; ctx: SessionContext } | { ok: false; code: 
 
 function now(): number { return Date.now(); }
 
+/** Deterministic refresh successor: keyed by the server secret so it is
+ *  unpredictable to a holder of the predecessor raw token, yet reproducible —
+ *  a grace-window retry that presents the same predecessor recomputes the same
+ *  successor and is never stranded (IDENT-2c). Only a hash of it is ever stored. */
+async function successorToken(env: Env, family: string, baseHash: string): Promise<string> {
+  return sha256Hex(`${env.SOCIAL_JWT_SECRET}|refresh-successor|${family}|${baseHash}`);
+}
+
 async function ipWindowExceeded(env: Env, request: Request): Promise<boolean> {
   const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
   const windowKey = `${new Date().toISOString().slice(0, 13)}`; // hour window
@@ -117,27 +125,33 @@ function prejoinClaims(env: Env, hashed: string, family: string): SessionClaims 
   };
 }
 
-/** Mint JWT + rotating refresh credential; enforce the ≤ 10 family cap by
- *  evicting the least-recently-rotated family (IDENT-2b). */
+/** Mint JWT + rotating refresh credential. The ≤ 10 active-family cap is
+ *  enforced by REFUSAL, never silent eviction (IDENT-2c; audit): an eleventh
+ *  device is told it must retire one first (requiresDeviceManagement) and no
+ *  existing family is touched — the user chooses which device to sign out. */
 export async function issueSession(env: Env, playerId: string): Promise<unknown> {
   const player = await env.SOCIAL_DB.prepare(
     "SELECT session_version FROM players WHERE player_id = ?").bind(playerId).first();
   const sv = Number(player?.session_version ?? 1);
 
+  // Count this player's live device families (a family row always has a family
+  // PK; the explicit predicate keeps the scan family-scoped).
+  const active = await env.SOCIAL_DB.prepare(
+    "SELECT count(*) AS n FROM refresh_sessions WHERE family IS NOT NULL AND player_id = ?1 AND revoked = 0")
+    .bind(playerId).first();
+  if (Number(active?.n ?? 0) >= MAX_FAMILIES) {
+    // At the device cap: refuse rather than evict. The client surfaces device
+    // management; a family is revoked only by an explicit sign-out there.
+    return { requiresDeviceManagement: true };
+  }
+
   const family = crypto.randomUUID();
   const raw = randomToken(32);
   const t = now();
-  await env.SOCIAL_DB.batch([
-    env.SOCIAL_DB.prepare(
-      `DELETE FROM refresh_sessions WHERE family IN (
-         SELECT family FROM refresh_sessions WHERE player_id = ?1 AND revoked = 0
-         ORDER BY COALESCE(rotated_at, created_at) DESC LIMIT -1 OFFSET ?2)`)
-      .bind(playerId, MAX_FAMILIES - 1),
-    env.SOCIAL_DB.prepare(
-      `INSERT INTO refresh_sessions (family, player_id, hashed_token, expires_at, created_at)
-       VALUES (?1, ?2, ?3, ?4, ?5)`)
-      .bind(family, playerId, await sha256Hex(raw), t + REFRESH_INACTIVITY_MS, t),
-  ]);
+  await env.SOCIAL_DB.prepare(
+    `INSERT INTO refresh_sessions (family, player_id, hashed_token, expires_at, created_at)
+     VALUES (?1, ?2, ?3, ?4, ?5)`)
+    .bind(family, playerId, await sha256Hex(raw), t + REFRESH_INACTIVITY_MS, t).run();
 
   const iat = Math.floor(t / 1000);
   const jwt = await mintJwt(env.SOCIAL_JWT_SECRET, {
@@ -181,12 +195,21 @@ export async function handleRefresh(request: Request, env: Env): Promise<{ code:
     return { code: "AUTH_REFRESH_REUSED" };
   }
 
-  const nextRaw = randomToken(32);
-  await env.SOCIAL_DB.prepare(
-    `UPDATE refresh_sessions
-     SET prev_hashed_token = hashed_token, hashed_token = ?1, rotated_at = ?2, expires_at = ?3
-     WHERE family = ?4`)
-    .bind(await sha256Hex(nextRaw), t, t + REFRESH_INACTIVITY_MS, family).run();
+  // The successor is DERIVED from the predecessor's stored hash under the server
+  // secret, so a lost-response retry inside grace recomputes the IDENTICAL
+  // successor instead of rotating again and stranding the response the client
+  // never saw (IDENT-2c). On the first presentation (isCurrent) we advance the
+  // row; on a grace retry we recompute and return the same credential WITHOUT
+  // rotating — the predecessor hash it derives from is unchanged either way.
+  const baseHash = isCurrent ? String(row.hashed_token) : String(row.prev_hashed_token);
+  const nextRaw = await successorToken(env, family, baseHash);
+  if (isCurrent) {
+    await env.SOCIAL_DB.prepare(
+      `UPDATE refresh_sessions
+       SET prev_hashed_token = hashed_token, hashed_token = ?1, rotated_at = ?2, expires_at = ?3
+       WHERE family = ?4`)
+      .bind(await sha256Hex(nextRaw), t, t + REFRESH_INACTIVITY_MS, family).run();
+  }
 
   const playerId = String(row.player_id);
   const player = await env.SOCIAL_DB.prepare(

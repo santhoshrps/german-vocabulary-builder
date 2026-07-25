@@ -58,20 +58,52 @@ function badZone(z: DayComponent["zone"]): boolean {
     || !Number.isInteger(z.offsetMin) || z.offsetMin < -720 || z.offsetMin > 840 || z.offsetMin % 15 !== 0;
 }
 
+/** Pure structural gate (audit LB3A-020 / TS-LB3-SEC-010): every shape, length
+ *  and numeric-bound check that needs NO storage runs here so a hostile request
+ *  is refused before the rate-limit row, the player read, or any merge work —
+ *  never letting a malformed payload consume a D1 round-trip. Returns the wire
+ *  code to answer, or null when the request is structurally legal. Stale-window
+ *  skipping and envelope/encode checks stay in the DB pass; they are not shape. */
+function structuralError(body: WirePublish): ErrorCode | null {
+  if (Object.keys(body as unknown as Record<string, unknown>).some((k) => !TOP_FIELDS.has(k))) {
+    return "SCHEMA_UNKNOWN_FIELD";
+  }
+  if (body.schemaVersion !== 1) return "SCHEMA_VERSION_UNSUPPORTED";
+  if (body.ruleVersion !== RULE_VERSION) return "SCHEMA_VERSION_UNSUPPORTED";
+  const days = body.days ?? [], awards = body.awards ?? [], spends = body.spends ?? [];
+  const frontier = body.frontier ?? {};
+  if (days.length > MAX_DAYS || awards.length > MAX_AWARDS || spends.length > MAX_SPENDS
+    || Object.keys(frontier).length > MAX_COMPONENTS) return "SCHEMA_INVALID";
+  const maxDay = dayU16Today() + 1; // ≤ +1 calendar day of server UTC (SCORE-5c)
+  for (const w of days) {
+    if (!Number.isInteger(w.day) || w.day > maxDay || typeof w.component !== "string"
+      || w.component.length > 64 || !w.counters || badZone(w.zone)
+      || !Array.isArray(w.buckets) || w.buckets.length > MAX_BUCKETS) return "SCHEMA_INVALID";
+    if (!bucketsConsistent({ counters: w.counters, zone: w.zone, buckets: w.buckets })) return "SCHEMA_INVALID";
+  }
+  for (const a of awards) {
+    if (typeof a.kind !== "string" || a.kind.length > 32 || typeof a.dedupKey !== "string" || a.dedupKey.length > 64
+      || !Number.isInteger(a.points) || a.points < 0 || a.points > 4200
+      || typeof a.dayLabel !== "string" || !Number.isInteger(a.bucket)) return "SCHEMA_INVALID";
+  }
+  for (const sp of spends) {
+    if (typeof sp.repairedDay !== "string" || !Number.isInteger(sp.amount) || sp.amount < 0
+      || typeof sp.monthKey !== "string" || !Number.isInteger(sp.chargeBucket)) return "SCHEMA_INVALID";
+  }
+  return null;
+}
+
 export async function handlePublish(
   request: Request, env: Env, ctx: SessionContext,
 ): Promise<{ code: ErrorCode; data?: unknown }> {
   let body: WirePublish;
   try { body = await request.json(); } catch { return { code: "SCHEMA_INVALID" }; }
-  if (Object.keys(body as unknown as Record<string, unknown>).some((k) => !TOP_FIELDS.has(k))) {
-    return { code: "SCHEMA_UNKNOWN_FIELD" };
-  }
-  if (body.schemaVersion !== 1) return { code: "SCHEMA_VERSION_UNSUPPORTED" };
-  if (body.ruleVersion !== RULE_VERSION) return { code: "SCHEMA_VERSION_UNSUPPORTED" };
+  // Every storage-free shape/bound check first, so a hostile payload is refused
+  // before it can consume a single D1 round-trip (audit LB3A-020).
+  const structural = structuralError(body);
+  if (structural) return { code: structural };
   const days = body.days ?? [], awards = body.awards ?? [], spends = body.spends ?? [];
   const frontier = body.frontier ?? {};
-  if (days.length > MAX_DAYS || awards.length > MAX_AWARDS || spends.length > MAX_SPENDS
-    || Object.keys(frontier).length > MAX_COMPONENTS) return { code: "SCHEMA_INVALID" };
 
   // Transport rate limit (NFR-4e; measured-mandatory — the 2026-07-25 rig showed
   // bursts without a limiter degrade into timeouts instead of clean 429s). Fixed
@@ -89,33 +121,20 @@ export async function handlePublish(
     .bind(ctx.playerId).first();
   if (!player) return { code: "PROFILE_GONE" };
 
+  // Shape, bounds and numeric legality were settled by structuralError() before
+  // any storage touch; this pass only does the storage-dependent work — stale
+  // filtering against the fold window, the per-day envelope, and encoding.
   const windowStart = Math.max(windowStartU16(), Number(player.folded_through));
-  const maxDay = dayU16Today() + 1; // ≤ +1 calendar day of server UTC (SCORE-5c)
   const refusedStale: string[] = [];
   const accepted: Array<{ day: number; component: string; c: DayComponent; blob: Uint8Array; measure: number; hash: string }> = [];
 
   for (const w of days) {
-    if (!Number.isInteger(w.day) || typeof w.component !== "string" || w.component.length > 64
-      || !w.counters || badZone(w.zone) || !Array.isArray(w.buckets) || w.buckets.length > MAX_BUCKETS) {
-      return { code: "SCHEMA_INVALID" };
-    }
     if (w.day < windowStart) { refusedStale.push(labelOf(w.day)); continue; }
-    if (w.day > maxDay) return { code: "SCHEMA_INVALID" };
     const c: DayComponent = { counters: w.counters, zone: w.zone, buckets: w.buckets };
-    if (!bucketsConsistent(c)) return { code: "SCHEMA_INVALID" };
     if (envelopeViolation(c)) return { code: "PUBLISH_ENVELOPE_EXCEEDED" };
     let blob: Uint8Array;
     try { blob = encodeDayComponent(c); } catch { return { code: "SCHEMA_INVALID" }; }
     accepted.push({ day: w.day, component: w.component, c, blob, measure: measureOf(c), hash: await sha256Hex(blob) });
-  }
-  for (const a of awards) {
-    if (typeof a.kind !== "string" || a.kind.length > 32 || typeof a.dedupKey !== "string" || a.dedupKey.length > 64
-      || !Number.isInteger(a.points) || a.points < 0 || a.points > 4200
-      || typeof a.dayLabel !== "string" || !Number.isInteger(a.bucket)) return { code: "SCHEMA_INVALID" };
-  }
-  for (const sp of spends) {
-    if (typeof sp.repairedDay !== "string" || !Number.isInteger(sp.amount) || sp.amount < 0
-      || typeof sp.monthKey !== "string" || !Number.isInteger(sp.chargeBucket)) return { code: "SCHEMA_INVALID" };
   }
 
   let changed = false;
