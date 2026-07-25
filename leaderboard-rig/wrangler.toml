@@ -18,7 +18,7 @@ compatibility_date = "2024-09-23"
 [[d1_databases]]
 binding = "SCRATCH_DB"
 database_name = "german-social-scratch"
-database_id = "2d2ec49f-6831-40a7-aa6e-336a1f88aa98"   # per-run throwaway (created 2026-07-25)
+database_id = "SET-PER-RUN"           # from `d1 create` output; throwaway
 
 [observability]
 enabled = true
