@@ -19,7 +19,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 GIT_SHA=$(git rev-parse --short HEAD)
-if [[ -n "$(git status --porcelain -- read-worker/src worker/src 2>/dev/null)" ]]; then
+if [[ -n "$(git status --porcelain -- read-worker/src worker/src leaderboard-worker/src 2>/dev/null)" ]]; then
   echo "⚠️  worker sources have uncommitted changes — deploying tree state as ${GIT_SHA}-dirty" >&2
   GIT_SHA="${GIT_SHA}-dirty"
 fi

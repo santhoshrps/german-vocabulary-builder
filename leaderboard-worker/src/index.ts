@@ -12,6 +12,8 @@ import {
   verifyJoinSession, verifySession,
 } from "./auth";
 import { handleJoin, handleProfile } from "./profile";
+import { handlePublish } from "./publish";
+import { handleBoard } from "./board";
 
 export interface Env {
   SOCIAL_DB: D1Database;
@@ -118,6 +120,12 @@ const HANDLERS: Partial<Record<string, Handler>> = {
     return fromResult(requestId, await handleJoin(request, env, principal));
   },
   R8: async (_request, env, requestId, ctx) => fromResult(requestId, await handleProfile(env, ctx!)),
+  R12: async (request, env, requestId, ctx) => fromResult(requestId, await handlePublish(request, env, ctx!)),
+  R13: async (request, env, requestId, ctx) => {
+    const result = await handleBoard(request, env, ctx!);
+    if (result.notModified) return new Response(null, { status: 304, headers: result.headers });
+    return envelope(requestId, result.code, result.data, result.headers ?? {});
+  },
 };
 
 function fromResult(requestId: string, result: { code: ErrorCode; data?: unknown }): Response {
