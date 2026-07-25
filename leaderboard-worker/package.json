@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "node test/routes.test.mjs && node test/policy.test.mjs && node test/algebra.test.mjs",
-    "typecheck": "npx --prefix ../read-worker tsc --noEmit -p tsconfig.json"
+    "typecheck": "npx --prefix ../read-worker tsc --noEmit -p tsconfig.json",
+    "itest": "node test/integration.mjs"
   }
 }

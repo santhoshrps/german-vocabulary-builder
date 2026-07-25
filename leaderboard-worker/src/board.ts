@@ -8,6 +8,7 @@ import {
   decodeDayComponent, viewerRanges,
 } from "./algebra";
 import { sha256Hex } from "./crypto";
+import { blobBytes, blobText } from "./blob";
 import { ENVELOPE_V1 } from "./algebra";
 import { dayU16Today, labelOf, windowStartU16 } from "./publish";
 import type { SessionContext } from "./auth";
@@ -81,9 +82,8 @@ export async function handleBoard(
 
   const regsOf = new Map<string, Registers>();
   for (const r of regRows.results ?? []) {
-    regsOf.set(String(r.player_id), r.data && (r.data as ArrayBuffer).byteLength > 0
-      ? JSON.parse(new TextDecoder().decode(new Uint8Array(r.data as ArrayBuffer)))
-      : EMPTY_REGISTERS);
+    const text = blobText(r.data);
+    regsOf.set(String(r.player_id), text ? JSON.parse(text) : EMPTY_REGISTERS);
   }
   const checkpointEarned = new Map((checkRows.results ?? []).map((r) => [String(r.player_id), Number(r.earned ?? 0)]));
   const duoDaysOf = new Map<string, Set<number>>();
@@ -121,7 +121,9 @@ export async function handleBoard(
     try {
       const key = `${row.player_id}|${row.day_u16}`;
       const list = byPlayerDay.get(key) ?? [];
-      list.push(decodeDayComponent(new Uint8Array(row.blob as ArrayBuffer)));
+      const bytes = blobBytes(row.blob);
+      if (!bytes) continue;
+      list.push(decodeDayComponent(bytes));
       byPlayerDay.set(key, list);
     } catch { /* poison row: skip, never wedge (ROBUST-8) */ }
   }

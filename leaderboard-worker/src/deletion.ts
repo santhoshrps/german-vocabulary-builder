@@ -6,6 +6,7 @@
 // until terminal. ERASURE_DB is never restored behind SOCIAL_DB (contract T10).
 
 import { randomToken, sha256Hex } from "./crypto";
+import { blobBytes, blobText } from "./blob";
 import type { SessionContext } from "./auth";
 import type { Env } from "./index";
 import type { ErrorCode } from "./contract";
@@ -156,10 +157,10 @@ export async function runErasureStep(env: Env, playerId: string): Promise<boolea
   // way — "skipped" is a visible state, never a silent hole.
   await sagaState(env, playerId, "external");
   let revocation = "skipped-no-credential";
-  if (credential?.revocation && env.APPLE_SIWA_KEY_P8 && env.APPLE_SIWA_KEY_ID) {
+  const revocationBlob = blobBytes(credential?.revocation);
+  if (revocationBlob && env.APPLE_SIWA_KEY_P8 && env.APPLE_SIWA_KEY_ID) {
     try {
-      revocation = (await revokeAppleToken(env, new Uint8Array(credential.revocation as ArrayBuffer)))
-        ? "revoked" : "failed";
+      revocation = (await revokeAppleToken(env, revocationBlob)) ? "revoked" : "failed";
     } catch { revocation = "failed"; }
     if (revocation === "failed") return false; // cron retries; attempts counted
   }
@@ -284,7 +285,7 @@ export async function runOutboxTick(env: Env): Promise<void> {
     let done = false;
     try {
       if (job.kind === "erasure") {
-        done = await runErasureStep(env, new TextDecoder().decode(new Uint8Array(job.payload as ArrayBuffer)));
+        done = await runErasureStep(env, blobText(job.payload) ?? "");
       } else {
         done = await runCleanup(env);
       }

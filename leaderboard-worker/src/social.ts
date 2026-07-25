@@ -3,6 +3,7 @@
 // social mutations (publish is exempt by documented exception).
 
 import { randomToken, sha256Hex } from "./crypto";
+import { blobText } from "./blob";
 import { quotaDay } from "./board";
 import type { SessionContext } from "./auth";
 import type { Env } from "./index";
@@ -39,7 +40,7 @@ export async function withIdempotency(
     .bind(ctx.playerId, route, key).first();
   if (existing) {
     if (existing.request_hash !== requestHash) return { code: "IDEMPOTENCY_MISMATCH" };
-    return JSON.parse(new TextDecoder().decode(new Uint8Array(existing.result as ArrayBuffer))) as Result;
+    return JSON.parse(blobText(existing.result) ?? "{}") as Result;
   }
   const result = await run();
   // Semantic outcomes (OK and typed refusals) are recorded; INTERNAL is not —

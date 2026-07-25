@@ -1,0 +1,2 @@
+SOCIAL_JWT_SECRET = "local-itest-jwt-secret-not-real"
+IDENTITY_HMAC_KEY_V1 = "local-itest-hmac-key-not-real"

@@ -10,6 +10,7 @@ import {
   joinBitmaps, joinRegisters, measureOf, setBit,
 } from "./algebra";
 import { sha256Hex } from "./crypto";
+import { blobBytes, blobText } from "./blob";
 import type { SessionContext } from "./auth";
 import type { Env } from "./index";
 import type { ErrorCode } from "./contract";
@@ -18,6 +19,7 @@ const MAX_DAYS = 660;
 const MAX_AWARDS = 256;
 const MAX_SPENDS = 8;
 const MAX_COMPONENTS = 10;
+const PUBLISH_PER_HOUR = 120; // registered transport limit (NFR-4e)
 export const RULE_VERSION = 1;
 
 interface WireDay {
@@ -70,6 +72,17 @@ export async function handlePublish(
   const frontier = body.frontier ?? {};
   if (days.length > MAX_DAYS || awards.length > MAX_AWARDS || spends.length > MAX_SPENDS
     || Object.keys(frontier).length > MAX_COMPONENTS) return { code: "SCHEMA_INVALID" };
+
+  // Transport rate limit (NFR-4e; measured-mandatory — the 2026-07-25 rig showed
+  // bursts without a limiter degrade into timeouts instead of clean 429s). Fixed
+  // hour window per player: 20 sessions/day plus retries fits comfortably; a
+  // doctored client hammering publish is shed here before any merge work.
+  const hourWindow = new Date().toISOString().slice(0, 13);
+  const taken = await env.SOCIAL_DB.prepare(
+    `INSERT INTO quotas (player_id, kind, quota_day, count) VALUES (?1, 'publish', ?2, 1)
+     ON CONFLICT (player_id, kind, quota_day) DO UPDATE SET count = count + 1
+     RETURNING count`).bind(ctx.playerId, hourWindow).first();
+  if (Number(taken?.count ?? 0) > PUBLISH_PER_HOUR) return { code: "RATE_LIMITED" };
 
   const player = await env.SOCIAL_DB.prepare(
     "SELECT board_revision, folded_through, tz_zone FROM players WHERE player_id = ?")
@@ -126,9 +139,8 @@ export async function handlePublish(
   for (let attempt = 0; attempt < 3; attempt++) {
     const regRow = await env.SOCIAL_DB.prepare(
       "SELECT data, version FROM registers WHERE player_id = ?").bind(ctx.playerId).first();
-    const stored: Registers = regRow?.data && (regRow.data as ArrayBuffer).byteLength > 0
-      ? JSON.parse(new TextDecoder().decode(new Uint8Array(regRow.data as ArrayBuffer)))
-      : structuredClone(EMPTY_REGISTERS);
+    const storedText = blobText(regRow?.data);
+    const stored: Registers = storedText ? JSON.parse(storedText) : structuredClone(EMPTY_REGISTERS);
     const incoming: Registers = { ...structuredClone(EMPTY_REGISTERS), ...(body.registers ?? {}) };
     let merged = joinRegisters(stored, incoming);
     for (const r of accepted) {
@@ -214,9 +226,8 @@ async function mintDuoReceipts(
   const statements: D1PreparedStatement[] = [];
   const t = Date.now();
   for (const row of rows.results ?? []) {
-    const friendRegs: Registers = row.data && (row.data as ArrayBuffer).byteLength > 0
-      ? JSON.parse(new TextDecoder().decode(new Uint8Array(row.data as ArrayBuffer)))
-      : EMPTY_REGISTERS;
+    const friendText = blobText(row.data);
+    const friendRegs: Registers = friendText ? JSON.parse(friendText) : EMPTY_REGISTERS;
     const friendDays = bitsOf(friendRegs);
     for (const day of earningDays) {
       if (!friendDays.has(day)) continue;
