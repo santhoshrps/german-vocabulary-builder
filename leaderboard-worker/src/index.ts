@@ -20,6 +20,7 @@ import {
   handleReceiptAck, handleReceiptsList, handleRemove, handleReport,
   handleUnblock, withIdempotency,
 } from "./social";
+import { handleDelete, handleDeleteStatus, handleExport, runOutboxTick } from "./deletion";
 
 export interface Env {
   SOCIAL_DB: D1Database;
@@ -30,6 +31,10 @@ export interface Env {
   SOCIAL_JWT_SECRET: string;
   IDENTITY_HMAC_KEY_V1: string;
   DEPLOY_VERSION?: string;
+  APP_TEAM_ID?: string;
+  /** SIWA key (owner-provisioned secrets) — S5 revocation + code exchange. */
+  APPLE_SIWA_KEY_P8?: string;
+  APPLE_SIWA_KEY_ID?: string;
   /** Optional capability overrides (NFR-10b). */
   CAPABILITY_STATE?: string; // healthy | maintenance | disabled
   MIN_BUILD?: string;
@@ -148,6 +153,17 @@ const HANDLERS: Partial<Record<string, Handler>> = {
   R23: mutation("reports", (body, env, ctx) => handleReport(body, env, ctx)),
   R24: async (_request, env, requestId, ctx) => fromResult(requestId, await handleReceiptsList(env, ctx!)),
   R25: mutation("e18/ack", (body, env, ctx) => handleReceiptAck(body, env, ctx)),
+  R9: async (_request, env, requestId, ctx) => fromResult(requestId, await handleExport(env, ctx!)),
+  R10: async (_request, env, requestId, ctx) => {
+    const result = await handleDelete(env, ctx!);
+    if (result.status === 202) {
+      return new Response(JSON.stringify({ v: SCHEMA_VERSION, requestId, code: "OK", data: result.data }), {
+        status: 202, headers: { "content-type": "application/json" },
+      });
+    }
+    return envelope(requestId, result.code, result.data);
+  },
+  R11: async (request, env, requestId) => fromResult(requestId, await handleDeleteStatus(request, env)),
 };
 
 /** Idempotency-wrapped mutation: body read once, canonical text keys the record. */
@@ -170,9 +186,9 @@ function fromResult(requestId: string, result: { code: ErrorCode; data?: unknown
   return envelope(requestId, result.code, result.data);
 }
 
-// R7 verifies its own dual principal; R17's auth IS invite-token possession,
-// validated inside the handler (never consumes — FRIEND-1b).
-const SELF_AUTHORIZING = new Set(["R7", "R17"]);
+// R7 verifies its own dual principal; R17's auth IS invite-token possession;
+// R11's auth IS the deletion-status capability hash (works after session death).
+const SELF_AUTHORIZING = new Set(["R7", "R17", "R11"]);
 
 // --- auth guard (default-deny; capability/inviteToken levels land with their routes) --
 
@@ -227,9 +243,14 @@ export default {
     }
   },
 
-  // Queue-less v1 (LB3-NFR-1b): the cron drives the outbox executor. The executor
-  // arrives in W5; until then the tick is a safe no-op that proves the trigger path.
+  // Queue-less v1 (LB3-NFR-1b): the cron IS the outbox dispatcher — it drains
+  // due erasure jobs (idempotent saga steps, exponential backoff, loud when
+  // stuck) and runs the bounded cleanup sweeps.
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
-    console.log(JSON.stringify({ cron: "tick", env: env.ENV_NAME, outbox: "not-yet-implemented" }));
+    try {
+      await runOutboxTick(env);
+    } catch (error) {
+      console.error(JSON.stringify({ cron: "tick-failed", env: env.ENV_NAME, error: String(error) }));
+    }
   },
 } satisfies ExportedHandler<Env>;

@@ -7,6 +7,7 @@ import {
 } from "./crypto";
 import type { Env } from "./index";
 import type { ErrorCode } from "./contract";
+import { appleCodeExchange } from "./deletion";
 
 export const ACTIVE_HMAC_VERSION = 1;
 const JWT_TTL_SECONDS = 15 * 60;
@@ -52,14 +53,14 @@ export async function handleNonce(request: Request, env: Env): Promise<{ code: E
 
 // --- R4: provider exchange ---------------------------------------------------
 
-interface ExchangeBody { provider?: string; identityToken?: string; nonce?: string }
+interface ExchangeBody { provider?: string; identityToken?: string; nonce?: string; authorizationCode?: string }
 
 export async function handleExchange(request: Request, env: Env): Promise<{ code: ErrorCode; data?: unknown }> {
   if (await ipWindowExceeded(env, request)) return { code: "RATE_LIMITED" };
   let body: ExchangeBody;
   try { body = await request.json(); } catch { return { code: "SCHEMA_INVALID" }; }
   const keys = Object.keys(body as Record<string, unknown>);
-  if (keys.some((k) => !["provider", "identityToken", "nonce"].includes(k))) {
+  if (keys.some((k) => !["provider", "identityToken", "nonce", "authorizationCode"].includes(k))) {
     return { code: "SCHEMA_UNKNOWN_FIELD" };
   }
   if (!body.identityToken || !body.nonce) return { code: "SCHEMA_INVALID" };
@@ -94,6 +95,16 @@ export async function handleExchange(request: Request, env: Env): Promise<{ code
     return { code: "OK", data: { session: jwt, joined: false, expiresInSeconds: JWT_TTL_SECONDS } };
   }
 
+  // Revocation credential (inventory row 2): exchanged + stored when the SIWA
+  // key secrets exist; deletion's S5 needs it to sever the Apple-ID connection.
+  if (typeof body.authorizationCode === "string" && body.authorizationCode.length <= 512) {
+    const sealed = await appleCodeExchange(env, body.authorizationCode);
+    if (sealed) {
+      await env.SOCIAL_DB.prepare(
+        "UPDATE credentials SET revocation = ?1 WHERE provider = 'apple' AND key_version = ?2 AND hashed_subject = ?3")
+        .bind(sealed, ACTIVE_HMAC_VERSION, hashed).run();
+    }
+  }
   return { code: "OK", data: await issueSession(env, playerId) };
 }
 

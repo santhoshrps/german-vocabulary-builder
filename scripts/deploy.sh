@@ -41,7 +41,19 @@ env_flag() { # "" for prod (top-level config), "--env <name>" otherwise
 secret_names() { # dir, env — prints one secret name per line
   local dir="$1" env="$2"
   (cd "$dir" && npx wrangler secret list $(env_flag "$env") --format json 2>/dev/null) \
-    | python3 -c 'import sys,json; [print(s["name"]) for s in json.load(sys.stdin)]'
+    | python3 -c '
+import sys, json
+# wrangler intermittently prefixes banner/update noise (sometimes with ANSI
+# escapes) — try every "[" until one parses as the JSON array.
+raw = sys.stdin.read()
+secrets = None
+idx = raw.find("[")
+while idx >= 0:
+    try:
+        secrets = json.loads(raw[idx:]); break
+    except Exception:
+        idx = raw.find("[", idx + 1)
+[print(s["name"]) for s in (secrets or [])]'
 }
 
 WARN_NAMES=()  # optional-secret names for the next check_parity call (bash arrays
