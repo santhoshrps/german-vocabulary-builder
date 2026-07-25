@@ -74,7 +74,7 @@ export function envelope(
   });
 }
 
-// --- request-body defense (audit LB3A-020; TS-LB3-SEC-010/011/012) ----------
+// --- request-body defense (TS-LB3-SEC-010/011/012; publish-policy.test) -----
 //
 // A publish body is bounded THREE ways before any handler or JSON.parse touches
 // it: an absolute byte ceiling, a nesting-depth bound, and duplicate-key

@@ -58,7 +58,7 @@ function badZone(z: DayComponent["zone"]): boolean {
     || !Number.isInteger(z.offsetMin) || z.offsetMin < -720 || z.offsetMin > 840 || z.offsetMin % 15 !== 0;
 }
 
-/** Pure structural gate (audit LB3A-020 / TS-LB3-SEC-010): every shape, length
+/** Pure structural gate (TS-LB3-SEC-010; publish-policy.test): every shape, length
  *  and numeric-bound check that needs NO storage runs here so a hostile request
  *  is refused before the rate-limit row, the player read, or any merge work —
  *  never letting a malformed payload consume a D1 round-trip. Returns the wire
@@ -99,7 +99,7 @@ export async function handlePublish(
   let body: WirePublish;
   try { body = await request.json(); } catch { return { code: "SCHEMA_INVALID" }; }
   // Every storage-free shape/bound check first, so a hostile payload is refused
-  // before it can consume a single D1 round-trip (audit LB3A-020).
+  // before it can consume a single D1 round-trip (TS-LB3-SEC-010).
   const structural = structuralError(body);
   if (structural) return { code: structural };
   const days = body.days ?? [], awards = body.awards ?? [], spends = body.spends ?? [];
