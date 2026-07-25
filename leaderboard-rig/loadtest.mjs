@@ -65,17 +65,21 @@ const rand = (n) => `rig-${String(Math.floor(Math.random() * n)).padStart(7, "0"
 const FLEET = 5000; // seeded player count for load runs; /seed handles fleet-scale sizing
 
 if (mode === "seed") {
-  // Fixture bytes per shape (fills capacity §2), then a load-run fleet.
+  // Fixture bytes per shape (fills capacity §2), then a load-run fleet — all in
+  // subrequest-safe chunks (25 players/call, 250 friendship-owners/call).
   for (const shape of ["typical", "declared", "envelope"]) {
     const res = await fetch(`${url}/seed?players=5&days=66&shape=${shape}&start=9990000`, { method: "POST", headers });
     console.log(shape, await res.json());
   }
-  for (let start = 0; start < FLEET; start += 500) {
-    const res = await fetch(`${url}/seed?players=500&days=20&shape=typical&start=${start}`, { method: "POST", headers });
-    if (!res.ok) { console.error("seed failed", res.status, await res.text()); process.exit(1); }
-    process.stdout.write(`\rseeded ${start + 500}/${FLEET}`);
+  for (let start = 0; start < FLEET; start += 25) {
+    const res = await fetch(`${url}/seed?players=25&days=20&shape=typical&start=${start}`, { method: "POST", headers });
+    if (!res.ok) { console.error("\nseed failed", res.status, await res.text()); process.exit(1); }
+    if (start % 500 === 0) process.stdout.write(`\rseeded ${start + 25}/${FLEET}`);
   }
-  await fetch(`${url}/friends?players=${FLEET}`, { method: "POST", headers });
+  for (let start = 0; start < FLEET; start += 250) {
+    const res = await fetch(`${url}/friends?start=${start}&count=250&fleet=${FLEET}`, { method: "POST", headers });
+    if (!res.ok) { console.error("\nfriends failed", res.status, await res.text()); process.exit(1); }
+  }
   console.log("\nfleet + friends ready; stats:", await (await fetch(`${url}/stats`, { headers })).json());
 } else if (mode === "publish") {
   const rate = Number(aRaw ?? 116), seconds = Number(bRaw ?? 300);

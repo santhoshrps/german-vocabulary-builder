@@ -165,20 +165,26 @@ export default {
         return json({ ms: Date.now() - t0, rows: rows.results?.length, dayGroups: days.results?.length }, 200, { etag });
       }
 
-      // GET /stats — real bytes per table (the §3 MEASURED column source).
+      // GET /stats — row counts + blob bytes (the §3 MEASURED column source).
+      // D1 forbids sqlite_master and PRAGMA reads (SQLITE_AUTH) — table names are fixed.
       if (url.pathname === "/stats") {
-        const tables = await env.SCRATCH_DB.prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table'").all();
         const out: Record<string, unknown> = {};
-        for (const t of tables.results ?? []) {
-          const name = t.name as string;
-          if (name.startsWith("_") || name.startsWith("sqlite_")) continue;
-          const count = await env.SCRATCH_DB.prepare(`SELECT count(*) AS n FROM "${name}"`).first();
-          out[name] = count?.n;
+        for (const name of ["day_state", "players", "checkpoints", "friendships"]) {
+          try {
+            const count = await env.SCRATCH_DB.prepare(`SELECT count(*) AS n FROM ${name}`).first();
+            out[name] = count?.n;
+          } catch (error) {
+            out[name] = `ERR ${String(error)}`;
+          }
         }
-        const size = await env.SCRATCH_DB.prepare(
-          "SELECT page_count * page_size AS bytes FROM pragma_page_count(), pragma_page_size()").first();
-        return json({ rows: out, databaseBytes: size?.bytes });
+        try {
+          out.dayStateBytes = (await env.SCRATCH_DB.prepare(
+            "SELECT sum(length(blob)) AS bytes FROM day_state").first())?.bytes;
+        } catch (error) {
+          out.dayStateBytes = `ERR ${String(error)}`;
+        }
+        // Total database size incl. indexes comes from `wrangler d1 info` on the CLI side.
+        return json(out);
       }
 
       // GET /plan?q=board|publish — EXPLAIN QUERY PLAN evidence (release artifact).
