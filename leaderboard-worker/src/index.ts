@@ -14,6 +14,12 @@ import {
 import { handleJoin, handleProfile } from "./profile";
 import { handlePublish } from "./publish";
 import { handleBoard } from "./board";
+import {
+  handleBlock, handleCheer, handleInviteAccept, handleInviteCreate,
+  handleInvitePreview, handleInviteWithdraw, handleInvitesList, handleMute,
+  handleReceiptAck, handleReceiptsList, handleRemove, handleReport,
+  handleUnblock, withIdempotency,
+} from "./social";
 
 export interface Env {
   SOCIAL_DB: D1Database;
@@ -126,14 +132,47 @@ const HANDLERS: Partial<Record<string, Handler>> = {
     if (result.notModified) return new Response(null, { status: 304, headers: result.headers });
     return envelope(requestId, result.code, result.data, result.headers ?? {});
   },
+  R14: async (_request, env, requestId, ctx) => fromResult(requestId, await handleInvitesList(env, ctx!)),
+  R15: async (request, env, requestId, ctx) =>
+    fromResult(requestId, await withIdempotency(request, env, ctx!, "invites", "", () =>
+      handleInviteCreate(request, env, ctx!))),
+  R16: mutation("invites/withdraw", (body, env, ctx) => handleInviteWithdraw(body, env, ctx)),
+  R17: async (request, env, requestId) => fromResult(requestId, await handleInvitePreview(request, env)),
+  R18: mutation("invites/accept", (body, env, ctx) => handleInviteAccept(body, env, ctx)),
+  R19: mutation("friends/remove", (body, env, ctx) => handleRemove(body, env, ctx)),
+  R20: mutation("blocks", (body, env, ctx) => handleBlock(body, env, ctx)),
+  R20b: mutation("blocks/remove", (body, env, ctx) => handleUnblock(body, env, ctx)),
+  R21: mutation("mutes", (body, env, ctx) => handleMute(body, env, ctx, true)),
+  R21b: mutation("mutes/remove", (body, env, ctx) => handleMute(body, env, ctx, false)),
+  R22: mutation("cheers", (body, env, ctx) => handleCheer(body, env, ctx)),
+  R23: mutation("reports", (body, env, ctx) => handleReport(body, env, ctx)),
+  R24: async (_request, env, requestId, ctx) => fromResult(requestId, await handleReceiptsList(env, ctx!)),
+  R25: mutation("e18/ack", (body, env, ctx) => handleReceiptAck(body, env, ctx)),
 };
+
+/** Idempotency-wrapped mutation: body read once, canonical text keys the record. */
+function mutation(
+  route: string,
+  run: (body: Record<string, unknown>, env: Env, ctx: SessionContext) => Promise<{ code: ErrorCode; data?: unknown }>,
+): Handler {
+  return async (request, env, requestId, ctx) => {
+    let bodyText: string;
+    try { bodyText = await request.text(); } catch { return envelope(requestId, "SCHEMA_INVALID"); }
+    if (bodyText.length > 4096) return envelope(requestId, "SCHEMA_INVALID");
+    let body: Record<string, unknown>;
+    try { body = JSON.parse(bodyText || "{}"); } catch { return envelope(requestId, "SCHEMA_INVALID"); }
+    const result = await withIdempotency(request, env, ctx!, route, bodyText, () => run(body, env, ctx!));
+    return envelope(requestId, result.code, result.data);
+  };
+}
 
 function fromResult(requestId: string, result: { code: ErrorCode; data?: unknown }): Response {
   return envelope(requestId, result.code, result.data);
 }
 
-// R7 verifies its own dual principal inside the handler.
-const SELF_AUTHORIZING = new Set(["R7"]);
+// R7 verifies its own dual principal; R17's auth IS invite-token possession,
+// validated inside the handler (never consumes — FRIEND-1b).
+const SELF_AUTHORIZING = new Set(["R7", "R17"]);
 
 // --- auth guard (default-deny; capability/inviteToken levels land with their routes) --
 
