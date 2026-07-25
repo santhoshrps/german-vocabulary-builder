@@ -7,20 +7,27 @@
 // verification lands in W2 — until then every non-public level fails closed.
 
 import { BASE, ErrorCode, ROUTES, RouteSpec, SCHEMA_VERSION } from "./contract";
+import {
+  SessionContext, handleExchange, handleNonce, handleRefresh, handleSignout,
+  verifyJoinSession, verifySession,
+} from "./auth";
+import { handleJoin, handleProfile } from "./profile";
 
 export interface Env {
   SOCIAL_DB: D1Database;
   ERASURE_DB: D1Database;
   PROJECTION_1: D1Database;
   ENV_NAME: string;
+  APP_BUNDLE_ID: string;
+  SOCIAL_JWT_SECRET: string;
+  IDENTITY_HMAC_KEY_V1: string;
   DEPLOY_VERSION?: string;
   /** Optional capability overrides (NFR-10b). */
   CAPABILITY_STATE?: string; // healthy | maintenance | disabled
   MIN_BUILD?: string;
-  // W2+: SOCIAL_JWT_SECRET, IDENTITY_HMAC_KEY_V1 (secrets — names checked by deploy parity)
 }
 
-type Handler = (request: Request, env: Env, requestId: string) => Promise<Response>;
+type Handler = (request: Request, env: Env, requestId: string, ctx: SessionContext | null) => Promise<Response>;
 
 const STATUS: Partial<Record<ErrorCode, number>> = {
   OK: 200,
@@ -95,27 +102,55 @@ const capability: Handler = async (_request, env, requestId) => {
   });
 };
 
-// Handlers by contract id — W1 ships R1/R2; later batches fill the rest. A declared
-// route with no handler answers NOT_IMPLEMENTED (after auth enforcement).
+// Handlers by contract id — filled batch by batch. A declared route with no
+// handler answers NOT_IMPLEMENTED (after auth enforcement).
 const HANDLERS: Partial<Record<string, Handler>> = {
   R1: capability,
   R2: health,
+  R3: async (request, env, requestId) => fromResult(requestId, await handleNonce(request, env)),
+  R4: async (request, env, requestId) => fromResult(requestId, await handleExchange(request, env)),
+  R5: async (request, env, requestId) => fromResult(requestId, await handleRefresh(request, env)),
+  R6: async (_request, env, requestId, ctx) => fromResult(requestId, await handleSignout(env, ctx!)),
+  R7: async (request, env, requestId) => {
+    // Join accepts BOTH the pre-join principal and a full session (idempotent).
+    const principal = await verifyJoinSession(request, env);
+    if (principal.code) return envelope(requestId, principal.code);
+    return fromResult(requestId, await handleJoin(request, env, principal));
+  },
+  R8: async (_request, env, requestId, ctx) => fromResult(requestId, await handleProfile(env, ctx!)),
 };
 
-// --- auth guard (fails closed until W2 lands verification) -----------------
+function fromResult(requestId: string, result: { code: ErrorCode; data?: unknown }): Response {
+  return envelope(requestId, result.code, result.data);
+}
 
-async function authorize(route: RouteSpec): Promise<ErrorCode | null> {
+// R7 verifies its own dual principal inside the handler.
+const SELF_AUTHORIZING = new Set(["R7"]);
+
+// --- auth guard (default-deny; capability/inviteToken levels land with their routes) --
+
+async function authorize(
+  route: RouteSpec, request: Request, env: Env,
+): Promise<{ refusal: ErrorCode | null; ctx: SessionContext | null }> {
+  if (SELF_AUTHORIZING.has(route.id)) return { refusal: null, ctx: null };
   switch (route.auth) {
     case "public":
-      return null;
-    // W2 implements session JWT, deletion-status capability and invite-token
-    // verification. Until then every protected level refuses — default-deny is
-    // the starting state, not a retrofit (NFR-4f).
+      return { refusal: null, ctx: null };
     case "session":
-    case "sessionIntegrity":
+    case "sessionIntegrity": {
+      // IDENT-7: the integrity signal is parsed with the verdict matrix at the
+      // sessionIntegrity routes; "unavailable" maps to the tighten column, never
+      // a silent allow. Full App Attest assertion verification (stored key +
+      // counter, read-worker appattest module) lands with W4 before any
+      // mutation route ships enabled to real users.
+      const session = await verifySession(request, env);
+      return session.ok ? { refusal: null, ctx: session.ctx } : { refusal: session.code, ctx: null };
+    }
     case "capability":
     case "inviteToken":
-      return "AUTH_INVALID";
+      // Their sole routes (R11 delete-status, R17 preview) arrive in W4/W5;
+      // until then fail closed.
+      return { refusal: "AUTH_INVALID", ctx: null };
   }
 }
 
@@ -127,18 +162,18 @@ export default {
       // Root /health is the deploy pipeline's wire-verify convention (shared with the
       // read worker); the same handler also answers at the contract's R2 path.
       if (url.pathname === "/health" && request.method === "GET") {
-        return health(request, env, requestId);
+        return health(request, env, requestId, null);
       }
       if (!url.pathname.startsWith(BASE)) return envelope(requestId, "NOT_FOUND");
       const route = ROUTES.find((r) => r.path === url.pathname && r.method === request.method);
       if (!route) return envelope(requestId, "NOT_FOUND");
 
-      const refusal = await authorize(route);
+      const { refusal, ctx } = await authorize(route, request, env);
       if (refusal) return envelope(requestId, refusal);
 
       const handler = HANDLERS[route.id];
       if (!handler) return envelope(requestId, "NOT_IMPLEMENTED");
-      return await handler(request, env, requestId);
+      return await handler(request, env, requestId, ctx);
     } catch (error) {
       console.error(JSON.stringify({ requestId, outcome: "INTERNAL", error: String(error) }));
       return envelope(requestId, "INTERNAL");
