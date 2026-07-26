@@ -134,12 +134,16 @@ export async function handleInvitePreview(request: Request, env: Env): Promise<R
   if (typeof body.token !== "string" || body.token.length > 64) return { code: "SCHEMA_INVALID" };
   const hash = await sha256Hex(body.token);
   const invite = await env.SOCIAL_DB.prepare(
-    `SELECT i.state, i.expires_at, p.nickname FROM invites i JOIN players p ON p.player_id = i.inviter
+    `SELECT i.state, i.expires_at, i.inviter, p.nickname FROM invites i JOIN players p ON p.player_id = i.inviter
      WHERE i.token_hash = ?`).bind(hash).first();
   if (!invite) return { code: "INVITE_EXPIRED" };
   if (invite.state === "withdrawn") return { code: "INVITE_WITHDRAWN" };
   if (invite.state === "consumed") return { code: "INVITE_CONSUMED" };
   if (Number(invite.expires_at) < Date.now()) return { code: "INVITE_EXPIRED" };
+  // Deliberately MINIMAL (data-inventory row 7): any link holder can preview, so
+  // the response carries the nickname only — never the inviter's stable id.
+  // Pre-acceptance safety is TOKEN-bound instead (blocks/reports accept
+  // inviteToken and resolve the inviter server-side; audit LB3A-014).
   return { code: "OK", data: { inviterNickname: String(invite.nickname) } };
 }
 
@@ -266,7 +270,25 @@ export async function handleRemove(body: { playerId?: string }, env: Env, ctx: S
   return { code: "OK", data: { removed: true, generation: await currentGeneration(env, a, b) } };
 }
 
-export async function handleBlock(body: { playerId?: string }, env: Env, ctx: SessionContext): Promise<Result> {
+/// Token-bound target resolution (LB3-FR-FRIEND-13; audit LB3A-014): pre-accept
+/// safety actions carry the invite TOKEN, and the inviter is resolved HERE — the
+/// inviter's stable id never rides the preview to arbitrary link holders. Any
+/// invite state resolves (a withdrawn/expired invite is still reportable).
+async function resolveSafetyTarget(
+  body: { playerId?: string; inviteToken?: string }, env: Env,
+): Promise<string | null> {
+  if (typeof body.playerId === "string") return body.playerId;
+  if (typeof body.inviteToken !== "string" || body.inviteToken.length > 64) return null;
+  const invite = await env.SOCIAL_DB.prepare(
+    "SELECT inviter FROM invites WHERE token_hash = ?")
+    .bind(await sha256Hex(body.inviteToken)).first();
+  return invite ? String(invite.inviter) : null;
+}
+
+export async function handleBlock(body: { playerId?: string; inviteToken?: string }, env: Env, ctx: SessionContext): Promise<Result> {
+  const target = await resolveSafetyTarget(body, env);
+  if (target === null) return { code: "SCHEMA_INVALID" };
+  body = { ...body, playerId: target };
   if (typeof body.playerId !== "string" || body.playerId === ctx.playerId) return { code: "SCHEMA_INVALID" };
   const blocks = await env.SOCIAL_DB.prepare(
     "SELECT count(*) AS n FROM blocks WHERE owner = ?").bind(ctx.playerId).first();
@@ -370,7 +392,10 @@ export async function handleCheer(body: { playerId?: string }, env: Env, ctx: Se
 
 // --- R23 report --------------------------------------------------------------
 
-export async function handleReport(body: { playerId?: string; reason?: string; note?: string }, env: Env, ctx: SessionContext): Promise<Result> {
+export async function handleReport(body: { playerId?: string; inviteToken?: string; reason?: string; note?: string }, env: Env, ctx: SessionContext): Promise<Result> {
+  const target = await resolveSafetyTarget(body, env);
+  if (target === null) return { code: "SCHEMA_INVALID" };
+  body = { ...body, playerId: target };
   if (typeof body.playerId !== "string" || !REPORT_REASONS.has(body.reason ?? "")) return { code: "SCHEMA_INVALID" };
   if (body.note !== undefined && (typeof body.note !== "string" || body.note.length > 500)) return { code: "SCHEMA_INVALID" };
   const day = quotaDay(await playerZone(env, ctx.playerId));
@@ -402,22 +427,35 @@ export async function handleReceiptsList(env: Env, ctx: SessionContext): Promise
 }
 
 export async function handleReceiptAck(body: { receiptId?: string; offeredAmount?: number }, env: Env, ctx: SessionContext): Promise<Result> {
-  if (typeof body.receiptId !== "string" || !Number.isInteger(body.offeredAmount)) return { code: "SCHEMA_INVALID" };
+  if (typeof body.receiptId !== "string") return { code: "SCHEMA_INVALID" };
   const receipt = await env.SOCIAL_DB.prepare(
     "SELECT tier_ordinal, finalized_amount FROM e18_receipts WHERE receipt_id = ?1 AND player_id = ?2")
     .bind(body.receiptId, ctx.playerId).first();
   if (!receipt) return { code: "NOT_FOUND" };
+
+  // Two DISTINCT steps so the client's crash points converge (audit LB3A-009):
+  // FINALIZE (amount determination) never marks acked — the receipt keeps being
+  // listed until the client has durably APPLIED it and acks again. Only that
+  // second, offer-less ack sets acked = 1 and stops delivery.
+  if (receipt.finalized_amount != null) {
+    await env.SOCIAL_DB.prepare(
+      "UPDATE e18_receipts SET acked = 1 WHERE receipt_id = ?1 AND player_id = ?2")
+      .bind(body.receiptId, ctx.playerId).run();
+    return { code: "OK", data: { finalizedAmount: Number(receipt.finalized_amount), won: false } };
+  }
+
+  if (!Number.isInteger(body.offeredAmount)) return { code: "SCHEMA_INVALID" };
   const offered = Number(body.offeredAmount);
   // Ladder + tier validation (FRIEND-11): first two links per quota day pay the
   // full chased-band amount; later links pay base.
   const valid = Number(receipt.tier_ordinal) <= E18_FULL_PAY_PER_DAY ? E18_LADDER.has(offered) : offered === E18_BASE;
   if (!valid) return { code: "SCHEMA_INVALID" };
   const finalize = await env.SOCIAL_DB.prepare(
-    `UPDATE e18_receipts SET finalized_amount = ?1, acked = 1
+    `UPDATE e18_receipts SET finalized_amount = ?1
      WHERE receipt_id = ?2 AND player_id = ?3 AND finalized_amount IS NULL`)
     .bind(offered, body.receiptId, ctx.playerId).run();
   if ((finalize.meta?.changes ?? 0) === 0) {
-    // Lost the race — converge on the finalized amount (first valid ack won).
+    // Lost the race — converge on the finalized amount (first valid offer won).
     const now = await env.SOCIAL_DB.prepare(
       "SELECT finalized_amount FROM e18_receipts WHERE receipt_id = ?").bind(body.receiptId).first();
     return { code: "OK", data: { finalizedAmount: Number(now?.finalized_amount), won: false } };

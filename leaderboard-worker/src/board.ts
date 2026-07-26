@@ -60,11 +60,20 @@ export async function handleBoard(
   // action-state change (cheer bumps recipient revision) or zone change moves it.
   const cheered = await env.SOCIAL_DB.prepare(
     `SELECT to_player, quota_day FROM cheers WHERE from_player = ?`).bind(me).all();
+  // The latest cheer RECEIVED today (CHEER-2; audit LB3A-024): bounded to one
+  // row, named by nickname, self-only — the client surfaces it as the shared
+  // celebration. In the ETag basis so a fresh cheer invalidates a 304.
+  const cheeredMe = await env.SOCIAL_DB.prepare(
+    `SELECT c.from_player, c.created_at, p.nickname FROM cheers c
+     JOIN players p ON p.player_id = c.from_player
+     WHERE c.to_player = ?1 AND c.quota_day = ?2
+     ORDER BY c.created_at DESC LIMIT 1`).bind(me, quotaDay(viewerZone)).first();
   const etagBasis = JSON.stringify([
     viewerZone,
     (edges.results ?? []).map((e) => [e.a, e.b, e.generation]),
     [...revisions.entries()].sort(),
     (cheered.results ?? []).map((c) => [c.to_player, c.quota_day]).sort(),
+    cheeredMe ? [cheeredMe.from_player, cheeredMe.created_at] : null,
   ]);
   const etag = `"${(await sha256Hex(etagBasis)).slice(0, 24)}"`;
   if (request.headers.get("if-none-match") === etag) {
@@ -192,7 +201,12 @@ export async function handleBoard(
     data: {
       serverTimeMs: Date.now(),
       viewerZone,
-      self,
+      self: {
+        ...self,
+        latestCheer: cheeredMe
+          ? { fromNickname: String(cheeredMe.nickname), atMs: Number(cheeredMe.created_at) }
+          : undefined,
+      },
       friends: friendIds.map((id) => ({
         ...figures.get(id)!,
         duoDays: undefined, // duo detail is self-only; friends expose figures only

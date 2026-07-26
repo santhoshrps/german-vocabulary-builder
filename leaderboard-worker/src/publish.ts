@@ -155,6 +155,10 @@ export async function handlePublish(
 
   // ---- Commit B: SOCIAL_DB — registers (optimistic retry), awards, spends, duo ----
   const component = Object.keys(frontier)[0] ?? "unknown";
+  // OK is only ever returned when Commit B actually landed (audit LB3A-002): an
+  // exhausted optimistic-retry loop must answer retryable, never ack an
+  // unmerged register/award/spend set as clean.
+  let commitBLanded = false;
   for (let attempt = 0; attempt < 3; attempt++) {
     const regRow = await env.SOCIAL_DB.prepare(
       "SELECT data, version FROM registers WHERE player_id = ?").bind(ctx.playerId).first();
@@ -205,12 +209,19 @@ export async function handlePublish(
     const results = await env.SOCIAL_DB.batch(statements);
     const regWrote = (results[0].meta?.changes ?? 0) > 0;
     if (!regWrote) continue; // version raced — re-read and retry (bounded)
+    commitBLanded = true;
     changed = changed || regChanged
       || results.slice(1).some((r) => (r.meta?.changes ?? 0) > 0);
 
     // Duo minting (§3.2): friends whose bitmap shares a newly-earning label.
     await mintDuoReceipts(env, ctx.playerId, merged, accepted);
     break;
+  }
+  if (!commitBLanded) {
+    // Register version raced three times: NOTHING of Commit B is merged. The old
+    // code fell through and acked OK here — the client then marked awards/spends/
+    // registers clean forever (LB3A-002). Retryable, so the client stays dirty.
+    return { code: "INTERNAL" };
   }
 
   if (changed) {
@@ -219,10 +230,18 @@ export async function handlePublish(
       .bind(ctx.playerId, Date.now()).run();
   }
 
+  // Row-identifying ack (LB3A-002): exactly the day rows Commit A's transaction
+  // covered, keyed the way the client keys its durable publish state. A row the
+  // projection already dominated is still ACCEPTED (the server holds ≥ this
+  // state). refusedStale rows are deliberately NOT in the map — they stay dirty
+  // client-side until the client's own window excludes them.
+  const acceptedRows: Record<string, number> = {};
+  for (const r of accepted) acceptedRows[`${r.day}|${r.component}`] = r.measure;
+
   return {
     code: "OK",
     data: {
-      frontier, changed, refusedStale,
+      frontier, changed, refusedStale, acceptedRows,
       revision: Number(player.board_revision) + (changed ? 1 : 0),
       serverTimeMs: Date.now(),
     },
