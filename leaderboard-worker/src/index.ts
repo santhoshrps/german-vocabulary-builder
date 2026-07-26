@@ -21,7 +21,6 @@ import {
   handleUnblock, withIdempotency,
 } from "./social";
 import { handleDelete, handleDeleteStatus, handleExport, runOutboxTick } from "./deletion";
-import { integrityVerdict, mintChallenge } from "./integrity";
 
 export interface Env {
   SOCIAL_DB: D1Database;
@@ -45,8 +44,6 @@ export interface Env {
   /** Optional capability overrides (NFR-10b). */
   CAPABILITY_STATE?: string; // healthy | maintenance | disabled
   MIN_BUILD?: string;
-  /** App Attest root CA (owner runway) — enables cryptographic assertion verification. */
-  APPLE_APPATTEST_ROOT_CA?: string;
   /** Prod: https://learn-languages.app/german/join (owner 2026-07-25); dev: "" → worker origin. */
   INVITE_LINK_BASE?: string;
 }
@@ -56,7 +53,7 @@ type Handler = (request: Request, env: Env, requestId: string, ctx: SessionConte
 const STATUS: Partial<Record<ErrorCode, number>> = {
   OK: 200,
   AUTH_INVALID: 401, AUTH_EXPIRED: 401, AUTH_REFRESH_REUSED: 401,
-  AUTH_RECENT_REQUIRED: 403, INTEGRITY_CHALLENGE: 403, INTEGRITY_DENIED: 403,
+  AUTH_RECENT_REQUIRED: 403,
   SCHEMA_VERSION_UNSUPPORTED: 400, SCHEMA_UNKNOWN_FIELD: 400, SCHEMA_INVALID: 400,
   NICKNAME_INVALID: 400,
   LIMIT_FRIENDS: 409, LIMIT_INVITES_DAY: 409, LIMIT_CHEER_DAY: 409,
@@ -194,7 +191,6 @@ const HANDLERS: Partial<Record<string, Handler>> = {
   R3: async (request, env, requestId) => fromResult(requestId, await handleNonce(request, env)),
   R4: async (request, env, requestId) => fromResult(requestId, await handleExchange(request, env)),
   R5: async (request, env, requestId) => fromResult(requestId, await handleRefresh(request, env)),
-  R5b: async (_request, env, requestId) => fromResult(requestId, { code: "OK", data: await mintChallenge(env) }),
   R6: async (_request, env, requestId, ctx) => fromResult(requestId, await handleSignout(env, ctx!)),
   R7: async (request, env, requestId) => {
     // Join accepts BOTH the pre-join principal and a full session (idempotent).
@@ -300,22 +296,17 @@ async function authorize(
   switch (route.auth) {
     case "public":
       return { refusal: null, ctx: null };
-    case "session":
-    case "sessionIntegrity": {
-      // IDENT-7: the integrity signal is parsed with the verdict matrix at the
-      // sessionIntegrity routes; "unavailable" maps to the tighten column, never
-      // a silent allow. Full App Attest assertion verification (stored key +
-      // counter, read-worker appattest module) lands with W4 before any
-      // mutation route ships enabled to real users.
+    case "session": {
+      // No device-attestation level (owner decision 2026-07-26 — IDENT-7 revised).
+      // The former `sessionIntegrity` tier demanded an App Attest assertion the
+      // client could never produce, so it denied every write on real hardware; and
+      // even working, it would have spent DeviceCheck rate limit on /publish, which
+      // runs at launch, foreground and session end. Abuse control is server-side:
+      // session auth, per-route quotas, idempotency keys, relationship generations
+      // and the publish envelope. Reintroducing attestation means adding the tier
+      // back here TOGETHER with the client safeguards the requirements now specify.
       const session = await verifySession(request, env);
       if (!session.ok) return { refusal: session.code, ctx: null };
-      if (route.auth === "sessionIntegrity") {
-        // IDENT-7 (audit LB3A-008): every mutation carries a challenge-bound
-        // integrity assertion; the verdict matrix gates it. Deny is a hard block;
-        // tighten allows a degraded provider (simulator/unsupported) through.
-        const verdict = await integrityVerdict(request, env);
-        if (verdict === "deny") return { refusal: "INTEGRITY_DENIED", ctx: null };
-      }
       return { refusal: null, ctx: session.ctx };
     }
     case "capability":

@@ -32,7 +32,6 @@ try {
   assert.deepEqual(publicPaths, [
     `GET ${BASE}/capability`,
     `GET ${BASE}/health`,
-    `POST ${BASE}/attest/challenge`,
     `POST ${BASE}/auth/exchange`,
     `POST ${BASE}/auth/nonce`,
     `POST ${BASE}/auth/refresh`,
@@ -59,7 +58,7 @@ try {
   }
 
   // 5. Contract count and closed code registry sanity.
-  assert.equal(ROUTES.length, 28, "route count changed — update the contract doc and this test together");
+  assert.equal(ROUTES.length, 27, "route count changed — update the contract doc and this test together");
   assert.ok(ERROR_CODES.includes("GENERATION_STALE") && ERROR_CODES.includes("PUBLISH_REBASE_REQUIRED"));
   assert.equal(new Set(ERROR_CODES).size, ERROR_CODES.length, "duplicate error code");
 

@@ -10,8 +10,7 @@ export type AuthLevel =
   | "public"           // allowlisted: capability, health, auth bootstrap
   | "capability"       // deletion-status capability hash (works after session death)
   | "inviteToken"      // possession of an invite token (preview only)
-  | "session"          // valid social JWT (aud=leaderboard, env, session_version)
-  | "sessionIntegrity"; // session + App Attest / Play Integrity verdict (IDENT-7)
+  | "session";         // valid social JWT (aud=leaderboard, app, env, session_version)
 
 /** How a route's replays are made safe (contract §2): GET/health are `none`
  *  (nothing to dedupe); auth/publish/delete are `natural` (the operation itself
@@ -52,27 +51,26 @@ export const ROUTES: RouteSpec[] = [
   { id: "R3", method: "POST", path: `${BASE}/auth/nonce`, auth: "public", ...SMALL_NATURAL },
   { id: "R4", method: "POST", path: `${BASE}/auth/exchange`, auth: "public", ...AUTH_BODY },
   { id: "R5", method: "POST", path: `${BASE}/auth/refresh`, auth: "public", ...SMALL_NATURAL },
-  { id: "R5b", method: "POST", path: `${BASE}/attest/challenge`, auth: "public", ...SMALL_NATURAL },
   { id: "R6", method: "POST", path: `${BASE}/auth/signout`, auth: "session", ...SMALL_NATURAL },
-  { id: "R7", method: "POST", path: `${BASE}/profile/join`, auth: "sessionIntegrity", ...JSON_KEYED },
+  { id: "R7", method: "POST", path: `${BASE}/profile/join`, auth: "session", ...JSON_KEYED },
   { id: "R8", method: "GET", path: `${BASE}/profile`, auth: "session", ...NO_BODY },
   { id: "R9", method: "GET", path: `${BASE}/profile/export`, auth: "session", ...NO_BODY },
-  { id: "R10", method: "DELETE", path: `${BASE}/profile`, auth: "sessionIntegrity", ...SMALL_NATURAL },
+  { id: "R10", method: "DELETE", path: `${BASE}/profile`, auth: "session", ...SMALL_NATURAL },
   { id: "R11", method: "GET", path: `${BASE}/profile/delete-status`, auth: "capability", ...NO_BODY },
-  { id: "R12", method: "POST", path: `${BASE}/publish`, auth: "sessionIntegrity", ...PUBLISH_BODY },
+  { id: "R12", method: "POST", path: `${BASE}/publish`, auth: "session", ...PUBLISH_BODY },
   { id: "R13", method: "GET", path: `${BASE}/board`, auth: "session", ...NO_BODY },
   { id: "R14", method: "GET", path: `${BASE}/invites`, auth: "session", ...NO_BODY },
-  { id: "R15", method: "POST", path: `${BASE}/invites`, auth: "sessionIntegrity", ...JSON_KEYED },
+  { id: "R15", method: "POST", path: `${BASE}/invites`, auth: "session", ...JSON_KEYED },
   { id: "R16", method: "POST", path: `${BASE}/invites/withdraw`, auth: "session", ...JSON_KEYED },
   { id: "R17", method: "POST", path: `${BASE}/invites/preview`, auth: "inviteToken", ...JSON_NATURAL },
-  { id: "R18", method: "POST", path: `${BASE}/invites/accept`, auth: "sessionIntegrity", ...JSON_KEYED },
+  { id: "R18", method: "POST", path: `${BASE}/invites/accept`, auth: "session", ...JSON_KEYED },
   { id: "R19", method: "POST", path: `${BASE}/friends/remove`, auth: "session", ...JSON_KEYED },
   { id: "R20", method: "POST", path: `${BASE}/blocks`, auth: "session", ...JSON_KEYED },
-  { id: "R20b", method: "POST", path: `${BASE}/blocks/remove`, auth: "sessionIntegrity", ...JSON_KEYED },
+  { id: "R20b", method: "POST", path: `${BASE}/blocks/remove`, auth: "session", ...JSON_KEYED },
   { id: "R21", method: "POST", path: `${BASE}/mutes`, auth: "session", ...JSON_KEYED },
   { id: "R21b", method: "POST", path: `${BASE}/mutes/remove`, auth: "session", ...JSON_KEYED },
-  { id: "R22", method: "POST", path: `${BASE}/cheers`, auth: "sessionIntegrity", ...JSON_KEYED },
-  { id: "R23", method: "POST", path: `${BASE}/reports`, auth: "sessionIntegrity", ...JSON_KEYED },
+  { id: "R22", method: "POST", path: `${BASE}/cheers`, auth: "session", ...JSON_KEYED },
+  { id: "R23", method: "POST", path: `${BASE}/reports`, auth: "session", ...JSON_KEYED },
   { id: "R24", method: "GET", path: `${BASE}/e18/receipts`, auth: "session", ...NO_BODY },
   { id: "R25", method: "POST", path: `${BASE}/e18/receipts/ack`, auth: "session", ...JSON_KEYED },
 ];
@@ -82,7 +80,6 @@ export const ROUTES: RouteSpec[] = [
 export const ERROR_CODES = [
   "OK",
   "AUTH_INVALID", "AUTH_EXPIRED", "AUTH_REFRESH_REUSED", "AUTH_RECENT_REQUIRED",
-  "INTEGRITY_CHALLENGE", "INTEGRITY_DENIED",
   "SCHEMA_VERSION_UNSUPPORTED", "SCHEMA_UNKNOWN_FIELD", "SCHEMA_INVALID",
   "NICKNAME_INVALID",
   "LIMIT_FRIENDS", "LIMIT_INVITES_DAY", "LIMIT_CHEER_DAY", "LIMIT_REPORTS_DAY", "LIMIT_BLOCKS",
