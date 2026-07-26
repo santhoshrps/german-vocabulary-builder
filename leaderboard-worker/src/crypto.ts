@@ -49,6 +49,12 @@ export async function hashedSubject(secret: string, provider: string, subject: s
 export interface SessionClaims {
   sub: string;      // player id
   aud: "leaderboard";
+  /** Application tenant (the URL's first path segment: "german", later "spanish", …).
+   *  `aud` says WHICH SERVICE the token is for; `app` says WHICH APP'S DATA it may
+   *  touch. They are different questions and must not be conflated — a token minted
+   *  for one language is structurally unusable against another even if the two ever
+   *  share a signing secret or an auth service. Never inferred, never defaulted. */
+  app: string;
   env: string;
   sv: number;       // session_version (bumped to revoke everything)
   fam: string;      // refresh family (sign-out target)

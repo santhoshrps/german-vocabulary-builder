@@ -29,6 +29,12 @@ export interface Env {
   PROJECTION_1: D1Database;
   ENV_NAME: string;
   APP_BUNDLE_ID: string;
+  /** This deployment's application tenant — the URL's first path segment
+   *  ("german"; later "spanish", …). Every token, storage namespace, quota key and
+   *  log line is scoped by it. Declared per environment in wrangler.toml and NEVER
+   *  derived from a request path or client header: a request selects a backend, it
+   *  does not get to say which app's data that backend serves. */
+  APP_SLUG: string;
   SOCIAL_JWT_SECRET: string;
   IDENTITY_HMAC_KEY_V1: string;
   DEPLOY_VERSION?: string;
@@ -149,6 +155,11 @@ const health: Handler = async (_request, env, requestId) => {
     }
   }
   if (!env.ENV_NAME) missing.push("ENV_NAME");
+  // A deployment with no APP_SLUG would compare an absent token claim against an
+  // absent config value and PASS — the silent-default hazard. The request path
+  // stays a strict equality check; this makes the misconfiguration fail the
+  // deploy's health gate instead of shipping a worker that accepts unscoped tokens.
+  if (!env.APP_SLUG) missing.push("APP_SLUG");
   const body = {
     status: missing.length === 0 ? "ok" : "failing",
     env: env.ENV_NAME ?? "unknown",

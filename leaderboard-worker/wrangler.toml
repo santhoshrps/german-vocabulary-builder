@@ -55,6 +55,9 @@ enabled = true
 [vars]
 ENV_NAME = "prod"
 APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
+# Application tenant — the URL's first path segment. Later languages get their own
+# slug, bindings and databases; this value is never derived from a request.
+APP_SLUG = "german"
 # Invite links (owner decision 2026-07-25): learn-languages.app/german/join#<token>
 INVITE_LINK_BASE = "https://learn-languages.app/german/join"
 
@@ -89,5 +92,8 @@ enabled = true
 [env.dev.vars]
 ENV_NAME = "dev"
 APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
+# Application tenant — the URL's first path segment. Later languages get their own
+# slug, bindings and databases; this value is never derived from a request.
+APP_SLUG = "german"
 # Dev invite links ride the workers.dev origin (interim ruling 2026-07-25).
 INVITE_LINK_BASE = ""

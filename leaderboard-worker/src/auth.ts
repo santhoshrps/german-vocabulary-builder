@@ -120,7 +120,7 @@ function prejoinClaims(env: Env, hashed: string, family: string): SessionClaims 
   const iat = Math.floor(now() / 1000);
   return {
     sub: `prejoin:apple:${ACTIVE_HMAC_VERSION}:${hashed}`,
-    aud: "leaderboard", env: env.ENV_NAME, sv: 0, fam: family,
+    aud: "leaderboard", app: env.APP_SLUG, env: env.ENV_NAME, sv: 0, fam: family,
     iat, exp: iat + JWT_TTL_SECONDS, jti: crypto.randomUUID(),
   };
 }
@@ -155,7 +155,7 @@ export async function issueSession(env: Env, playerId: string): Promise<unknown>
 
   const iat = Math.floor(t / 1000);
   const jwt = await mintJwt(env.SOCIAL_JWT_SECRET, {
-    sub: playerId, aud: "leaderboard", env: env.ENV_NAME, sv, fam: family,
+    sub: playerId, aud: "leaderboard", app: env.APP_SLUG, env: env.ENV_NAME, sv, fam: family,
     iat, exp: iat + JWT_TTL_SECONDS, jti: crypto.randomUUID(),
   });
   return {
@@ -217,7 +217,7 @@ export async function handleRefresh(request: Request, env: Env): Promise<{ code:
   if (!player) return { code: "PROFILE_GONE" };
   const iat = Math.floor(t / 1000);
   const jwt = await mintJwt(env.SOCIAL_JWT_SECRET, {
-    sub: playerId, aud: "leaderboard", env: env.ENV_NAME,
+    sub: playerId, aud: "leaderboard", app: env.APP_SLUG, env: env.ENV_NAME,
     sv: Number(player.session_version), fam: family,
     iat, exp: iat + JWT_TTL_SECONDS, jti: crypto.randomUUID(),
   });
@@ -240,6 +240,8 @@ export async function verifySession(request: Request, env: Env): Promise<AuthRes
   const claims = await verifyJwt(env.SOCIAL_JWT_SECRET, header.slice(7));
   if (!claims) return { ok: false, code: "AUTH_INVALID" };
   if (claims.aud !== "leaderboard" || claims.env !== env.ENV_NAME) return { ok: false, code: "AUTH_INVALID" };
+  // Cross-app tokens fail closed — a missing claim is a refusal, never a default.
+  if (claims.app !== env.APP_SLUG) return { ok: false, code: "AUTH_INVALID" };
   if (claims.exp * 1000 < now()) return { ok: false, code: "AUTH_EXPIRED" };
   if (claims.sub.startsWith("prejoin:")) return { ok: false, code: "AUTH_INVALID" }; // join-only principal
   const player = await env.SOCIAL_DB.prepare(
@@ -266,6 +268,7 @@ export async function verifyJoinSession(request: Request, env: Env):
   if (!header.startsWith("Bearer ")) return { code: "AUTH_INVALID" };
   const claims = await verifyJwt(env.SOCIAL_JWT_SECRET, header.slice(7));
   if (!claims || claims.aud !== "leaderboard" || claims.env !== env.ENV_NAME) return { code: "AUTH_INVALID" };
+  if (claims.app !== env.APP_SLUG) return { code: "AUTH_INVALID" };
   if (claims.exp * 1000 < now()) return { code: "AUTH_EXPIRED" };
   if (claims.sub.startsWith("prejoin:")) {
     const [, provider, keyVersion, hashed] = claims.sub.split(":");
