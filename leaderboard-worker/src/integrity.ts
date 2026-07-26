@@ -37,7 +37,17 @@ export async function integrityVerdict(request: Request, env: Env): Promise<Inte
     // Degraded provider (unsupported device / simulator): tighten, don't deny.
     return "tighten";
   }
-  if (!assertion || !challenge) return "deny"; // a write with no integrity signal
+
+  // A client that reports the provider as AVAILABLE but sends no assertion cannot
+  // currently do better: the leaderboard never performs the one-time ATTESTATION
+  // that registers a key, so `generateAssertion` fails on an unattested key and the
+  // header is legitimately absent. Denying here was a false lockout — it blocked
+  // join, invites, publish, cheers, reports, unblock and delete on every real
+  // device, i.e. the entire feature. Tighten (allow, flagged) until the
+  // registration flow lands; this flips back to deny in the same change that adds
+  // it, and APPLE_APPATTEST_ROOT_CA gates the cryptographic verification either way.
+  if (!assertion) return "tighten";
+  if (!challenge) return "deny"; // an assertion with no challenge is malformed, not degraded
 
   // The challenge must be one-use and unexpired — consume it atomically.
   const consumed = await env.SOCIAL_DB.prepare(
