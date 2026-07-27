@@ -47,7 +47,7 @@ database_id = "a26e469d-f65d-4948-bdef-4b35ced34997"
 migrations_dir = "migrations/projection"
 
 [triggers]
-crons = ["*/1 * * * *"]   # queue-less v1 outbox executor + cleanup (NFR-1b)
+crons = ["*/15 * * * *"]  # outbox executor + cleanup; recovery cadence, not latency (NFR-1b)
 
 [observability]
 enabled = true
@@ -84,7 +84,7 @@ database_id = "dafe72ab-ec6d-4678-9578-01f64f48b822"
 migrations_dir = "migrations/projection"
 
 [env.dev.triggers]
-crons = ["*/1 * * * *"]
+crons = ["*/15 * * * *"]
 
 [env.dev.observability]
 enabled = true
