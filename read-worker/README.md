@@ -18,7 +18,12 @@ Two layers, combined into a short-lived session token:
    - **StoreKit 2** signed transaction (the paid path), or
    - **Promo code** (the self-test path — works now, before the iOS app exists).
 
-After verification, the worker issues a **session JWT** (default 1h). All data
+The live worker has two Apple-signed StoreKit lanes: `Production` (App Store) and
+`Sandbox` (TestFlight). Both exercise the same production catalogue and media, but
+the verified lane is preserved in sessions, purchase/device claims, revocations and
+snapshot grants. Locally signed `Xcode` transactions remain dev-only.
+
+After verification, the worker issues a **session JWT** (10 minutes). All data
 endpoints take that JWT as a `Bearer` token, so the expensive App Attest/StoreKit
 checks run once per session, not per request.
 
@@ -108,7 +113,9 @@ openssl rand -hex 32 | wrangler secret put SESSION_JWT_SECRET   # paste when pro
 wrangler secret put APPLE_APPATTEST_ROOT_CA   # base64 DER of Apple App Attest Root CA
 wrangler secret put APPLE_STOREKIT_ROOT_CA    # base64 DER of Apple Root CA - G3
 
-# 4. Set APP_TEAM_ID / APP_BUNDLE_ID / ENTITLEMENT_PRODUCT_IDS in wrangler.toml [vars]
+# 4. Set APP_TEAM_ID / APP_BUNDLE_ID / ENTITLEMENT_PRODUCT_IDS in wrangler.toml [vars].
+#    Production must keep STOREKIT_ACCEPTED_ENVIRONMENTS="Production,Sandbox";
+#    /health fails closed if either signed lane disappears or Xcode is added.
 
 # 5. Deploy
 cd read-worker && npm install && npm run deploy

@@ -1,4 +1,5 @@
 import { utf8, bytesToB64Url, b64UrlToBytes, timingSafeEqualBytes } from "./bytes";
+import { storeKitEnvironment, StoreKitEnvironment } from "./storekit-environment";
 
 // Minimal HS256 JWT. The same worker signs and verifies, so a symmetric secret is fine.
 
@@ -15,6 +16,9 @@ export interface SessionClaims {
   sub: string;     // device_id (or "promo:<label>" for test sessions)
   ent: string;     // entitlement type: "storekit" | "promo"
   scope: string;   // access scope: "free" | "full"
+  /// StoreKit only: Apple-signed transaction world. Optional while pre-deploy
+  /// Production sessions age out; every newly minted StoreKit session carries it.
+  sk_env?: StoreKitEnvironment;
   iss?: string;    // issuer (ISSUER) — optional in the type for decode, enforced on verify
   iat: number;
   exp: number;
@@ -37,10 +41,14 @@ export async function signSession(
   ent: string,
   scope: string,
   ttlSeconds: number,
-  now: number
+  now: number,
+  storeKitEnvironment?: StoreKitEnvironment,
 ): Promise<string> {
   const header = bytesToB64Url(utf8(JSON.stringify({ alg: "HS256", typ: "JWT" })));
-  const claims: SessionClaims = { sub, ent, scope, iss: issuer, iat: now, exp: now + ttlSeconds };
+  const claims: SessionClaims = {
+    sub, ent, scope, iss: issuer, iat: now, exp: now + ttlSeconds,
+    ...(storeKitEnvironment ? { sk_env: storeKitEnvironment } : {}),
+  };
   const payload = bytesToB64Url(utf8(JSON.stringify(claims)));
   const signingInput = `${header}.${payload}`;
   const key = await hmacKey(secret);
@@ -101,5 +109,16 @@ export async function verifySession(
   }
   if (claims.iss !== issuer) return null;
   if (typeof claims.exp !== "number" || claims.exp <= now) return null;
+  // Fail closed on invented environment claims and on environment data attached
+  // to a non-StoreKit session. A missing StoreKit claim is accepted only for the
+  // ≤10-minute rolling-deploy compatibility window; it represents Production,
+  // because Sandbox was not accepted before this schema existed.
+  if (claims.sk_env !== undefined && !storeKitEnvironment(claims.sk_env)) return null;
+  if (claims.ent !== "storekit" && claims.sk_env !== undefined) return null;
+  if (claims.ent === "storekit" && claims.sk_env === undefined) {
+    if (typeof claims.iat !== "number"
+        || claims.exp < claims.iat
+        || claims.exp - claims.iat > 600) return null;
+  }
   return claims;
 }

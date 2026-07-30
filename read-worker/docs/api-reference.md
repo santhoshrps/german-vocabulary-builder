@@ -80,8 +80,13 @@ Mints a session JWT. Two mutually exclusive modes.
 
 **Response 200**
 ```json
-{ "token": "<JWT>", "expiresIn": 3600, "entitlement": "promo|storekit", "scope": "free|full" }
+{ "token": "<JWT>", "expiresIn": 600, "entitlement": "storekit",
+  "scope": "full", "storeKitEnvironment": "Sandbox|Production" }
 ```
+
+Promo responses omit `storeKitEnvironment`. StoreKit responses copy it from the
+Apple-verified JWS: TestFlight is `Sandbox`, App Store is `Production`. Both use
+the live catalogue, but their operational purchase records and grants are isolated.
 
 **Errors**
 | Status | code | When |
@@ -94,7 +99,7 @@ Mints a session JWT. Two mutually exclusive modes.
 | 403 | `invalid promo code` | promo code unknown/inactive/expired |
 | 403 | `code already in use on the maximum number of devices` | full-tier promo code bound to `PROMO_DEVICE_CAP` other devices (personal codes, `promo-codes.md` §7) |
 | 503 | `device check required - try again shortly` | full-tier promo code with **zero** claims minted without an attested device (App Attest paused) — transient, retryable |
-| 403 | `entitlement verification failed` / `no active entitlement` | StoreKit invalid or no qualifying product |
+| 403 | `entitlement verification failed` / `no active entitlement` | StoreKit invalid, wrong bundle/product, unknown/disallowed environment, incomplete identity or no active product |
 
 > The two personal-code responses are a **contract with the app**
 > (`UnlockFlowCoordinator.redeemOutcome(for:)` matches status + body substring): 403 means

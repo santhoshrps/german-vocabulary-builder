@@ -13,6 +13,12 @@ import { opsQuery } from "./db";
 import { utf8, sha256, bytesToHex, b64UrlToBytes, b64ToBytes } from "./bytes";
 import { extractSPKI } from "./crypto/der";
 import { verifyChainToAppleRoot, ChainPurposePolicy } from "./crypto/x509";
+import {
+  parseStoreKitEnvironmentPolicy,
+  storeKitEnvironment,
+  storeKitRecordKey,
+  StoreKitEnvironment,
+} from "./storekit-environment";
 
 /// StoreKit certificate-purpose policy (audit SEC-001), matching Apple's official
 /// app-store-server-library verifier: the receipt/transaction-signing leaf carries
@@ -34,6 +40,10 @@ export interface Entitlement {
   /// StoreKit only: the purchase's stable identity, used to cap how many distinct
   /// devices one signed transaction can mint sessions for (Apple-ID sharing bound).
   originalTransactionId?: string;
+  /// StoreKit only: the Apple-signed transaction world. TestFlight is Sandbox;
+  /// App Store is Production. It is carried into the session and every operational
+  /// identity so test access can never become a production purchase record.
+  storeKitEnvironment?: StoreKitEnvironment;
   /// Promo only: sha256(code) hex — the key for per-code device claims (UA-FR-4b).
   codeHash?: string;
 }
@@ -118,16 +128,17 @@ interface TransactionPayload {
   environment?: string;     // "Production" | "Sandbox" | "Xcode" (audit SEC-003)
 }
 
-/// The signing environments this deployment accepts (audit SEC-003). Secure by default:
-/// a production deployment accepts ONLY "Production" — Sandbox/TestFlight-sandbox evidence
-/// (mintable for free with an Apple sandbox account) must never unlock production
-/// entitlements. Dev deployments accept every environment. The override var exists for ONE
-/// conscious case: enabling "Production,Sandbox" on prod while TestFlight testers exercise
-/// IAP (TestFlight purchases sign as Sandbox) — set it, test, remove it.
-function acceptedEnvironments(env: Env): Set<string> {
-  const configured = (env.STOREKIT_ACCEPTED_ENVIRONMENTS || "")
-    .split(",").map((s) => s.trim()).filter(Boolean);
-  if (configured.length > 0) return new Set(configured);
+/// The signing environments this deployment accepts (audit SEC-003). Production's
+/// checked-in policy is explicitly "Production,Sandbox": both are Apple-signed,
+/// but remain separate entitlement lanes. Missing configuration still fails closed
+/// to Production, while `/health` marks that production deployment misconfigured.
+/// Dev accepts every environment because its explicitly local Xcode mode is not a
+/// security boundary.
+export function acceptedEnvironments(env: Env): Set<StoreKitEnvironment> {
+  const configured = parseStoreKitEnvironmentPolicy(
+    env.STOREKIT_ACCEPTED_ENVIRONMENTS,
+  ).accepted;
+  if (configured.size > 0) return configured;
   return env.APP_ATTEST_ENV === "production"
     ? new Set(["Production"])
     : new Set(["Production", "Sandbox", "Xcode"]);
@@ -227,7 +238,11 @@ export async function verifyStoreKitTransaction(
   // Revocation precedence (audit SEC-004): the CURRENT server state dominates any signed
   // payload — a lifetime purchase's JWS never expires, so a cached pre-refund transaction
   // would otherwise re-mint sessions forever.
-  if (entitlement && (await isTransactionRevoked(env, entitlement.originalTransactionId))) {
+  if (entitlement && (await isTransactionRevoked(
+    env,
+    entitlement.originalTransactionId,
+    entitlement.storeKitEnvironment,
+  ))) {
     console.warn("storekit: revoked transaction rejected", {
       originalTransactionId: entitlement.originalTransactionId,
     });
@@ -238,42 +253,71 @@ export async function verifyStoreKitTransaction(
 
 /// Whether this purchase has a recorded refund/revocation (transaction_revocations,
 /// written by the App Store Server Notifications endpoint — audit SEC-004).
-async function isTransactionRevoked(env: Env, originalTransactionId?: string): Promise<boolean> {
-  if (!originalTransactionId) return false;
+async function isTransactionRevoked(
+  env: Env,
+  originalTransactionId?: string,
+  environment?: StoreKitEnvironment,
+): Promise<boolean> {
+  if (!originalTransactionId || !environment) return false;
+  const recordKey = storeKitRecordKey(environment, originalTransactionId);
   const row = await opsQuery(env,
     "SELECT 1 FROM transaction_revocations WHERE original_transaction_id = ?"
-  ).bind(originalTransactionId).first();
+  ).bind(recordKey).first();
   return !!row;
 }
 
 /// Records a refund/revocation (idempotent upsert). Called by the notifications endpoint.
 export async function recordTransactionRevocation(
-  env: Env, originalTransactionId: string, reason: string
+  env: Env,
+  originalTransactionId: string,
+  environment: StoreKitEnvironment,
+  reason: string,
 ): Promise<void> {
+  const recordKey = storeKitRecordKey(environment, originalTransactionId);
   await opsQuery(env,
     `INSERT INTO transaction_revocations (original_transaction_id, reason, recorded_at)
      VALUES (?, ?, datetime('now'))
      ON CONFLICT(original_transaction_id) DO UPDATE SET
        reason = excluded.reason, recorded_at = excluded.recorded_at`
-  ).bind(originalTransactionId, reason).run();
+  ).bind(recordKey, reason).run();
 }
 
-// Shared claim checks: bundle id, allowed product, environment, not expired/revoked.
-// A valid StoreKit purchase always grants full access.
-function validateTransactionClaims(env: Env, payload: TransactionPayload): Entitlement | null {
+/// Shared signed-identity checks used by both session minting and App Store Server
+/// Notifications. Notification transactions may already carry a revocation date, so
+/// identity and active-entitlement validation are deliberately separate.
+export function validateTransactionIdentity(
+  env: Env,
+  payload: TransactionPayload,
+): StoreKitEnvironment | null {
   if (payload.bundleId !== env.APP_BUNDLE_ID) throw new Error("storekit: bundleId mismatch");
 
-  // Environment binding (audit SEC-003): a production deployment must not accept Sandbox
-  // (or Xcode) evidence — a sandbox purchase is mintable for free with an Apple sandbox
-  // account. Fail closed on a MISSING field too: every StoreKit 2 signed transaction
-  // carries `environment`, so its absence means the payload is not what it claims to be.
-  const environment = payload.environment || "";
+  // Environment binding (audit SEC-003): every StoreKit 2 signed transaction carries
+  // this claim. TestFlight's Sandbox lane is valid but distinct from Production;
+  // unknown/missing/Xcode-on-prod evidence fails before any operational record is touched.
+  const environment = storeKitEnvironment(payload.environment);
+  if (!environment) {
+    throw new Error(`storekit: environment '${payload.environment || "missing"}' is unknown`);
+  }
   if (!acceptedEnvironments(env).has(environment)) {
-    throw new Error(`storekit: environment '${environment || "missing"}' not accepted by this deployment`);
+    throw new Error(`storekit: environment '${environment}' not accepted by this deployment`);
   }
 
   const allowed = env.ENTITLEMENT_PRODUCT_IDS.split(",").map((s) => s.trim()).filter(Boolean);
   if (!allowed.includes(payload.productId)) return null;
+  return environment;
+}
+
+// Shared active-entitlement checks: verified identity plus current purchase state.
+// A valid StoreKit purchase always grants full access.
+export function validateTransactionClaims(
+  env: Env,
+  payload: TransactionPayload,
+): Entitlement | null {
+  const environment = validateTransactionIdentity(env, payload);
+  if (!environment) return null;
+  if (!payload.originalTransactionId) {
+    throw new Error("storekit: missing originalTransactionId");
+  }
 
   const now = Date.now();
   if (payload.revocationDate && payload.revocationDate <= now) return null;
@@ -284,6 +328,6 @@ function validateTransactionClaims(env: Env, payload: TransactionPayload): Entit
     scope: "full",
     label: payload.productId,
     originalTransactionId: payload.originalTransactionId,
+    storeKitEnvironment: environment,
   };
 }
-

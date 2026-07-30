@@ -72,6 +72,11 @@ APP_ATTEST_ENV = "production"
 # APP_ATTEST_ENV="production" (see storeKitXcodeMode in src/entitlement.ts). Keep this
 # "production" here so a bare `wrangler deploy` always ships the locked-down config.
 STOREKIT_ENV = "production"
+# The live worker serves the same immutable catalogue to App Store and TestFlight.
+# Both transaction lanes are signed by Apple; the verified environment is preserved
+# in sessions, device claims and revocations so Sandbox can never become a Production
+# purchase. Xcode is structurally excluded. /health fails if this exact policy drifts.
+STOREKIT_ACCEPTED_ENVIRONMENTS = "Production,Sandbox"
 # Direct-from-storage pack delivery (MS-NFR-PERF-3): account id + bucket for minting
 # presigned R2 URLs. The access key pair are SECRETS (wrangler secret put
 # R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY) from an R2 API token scoped to READ this

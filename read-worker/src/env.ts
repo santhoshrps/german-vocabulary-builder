@@ -38,9 +38,10 @@ export interface Env {
   // entitlement.ts), so it can never take effect on a production deployment.
   STOREKIT_ENV?: string;
   // Signed-transaction environments this deployment accepts (audit SEC-003), comma-
-  // separated. UNSET is the secure default: production accepts only "Production";
-  // dev accepts everything. Set "Production,Sandbox" on prod ONLY while TestFlight
-  // testers exercise IAP (TestFlight signs as Sandbox), then remove it.
+  // separated. Production MUST configure exactly "Production,Sandbox": both are
+  // Apple-signed, and the worker preserves the verified environment in the session
+  // and operational record namespace. Xcode is never accepted by production.
+  // `/health` fails if this production policy is missing or weakened.
   STOREKIT_ACCEPTED_ENVIRONMENTS?: string;
 
   // Direct-from-storage pack delivery (MS-NFR-PERF-3): the worker authorizes and mints a

@@ -13,8 +13,14 @@ import { resolveChain, chainKey, isKnownLang } from "./languages";
 import { verifyAttestation, verifyAssertion, attestationRequired } from "./appattest";
 import {
   verifyPromoCode, verifyStoreKitTransaction, verifyAppleSignedPayload,
-  recordTransactionRevocation, storeKitXcodeMode, claimPromoDevice, Entitlement, Scope,
+  validateTransactionIdentity, recordTransactionRevocation, storeKitXcodeMode,
+  claimPromoDevice, Entitlement, Scope,
 } from "./entitlement";
+import {
+  storeKitEnvironment,
+  storeKitRecordKey,
+  storeKitSubject,
+} from "./storekit-environment";
 import {
   getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP, searchWord,
   getAliases, getVersionView, getChangeFeed, getVersionedRows,
@@ -45,8 +51,12 @@ function scopeOf(claims: SessionClaims): Scope {
 // per-install subject is exactly the fix — see handleSession/handleSearch.)
 function rateSubjectKey(claims: SessionClaims, ip: string): string {
   const sub = claims.sub || "";
+  const lane = claims.ent === "storekit"
+    ? (claims.sk_env ?? "Production") // compatibility for pre-deploy sessions
+    : null;
   return sub && !sub.startsWith("promo:") && !sub.startsWith("install:")
-    ? `dev:${sub}` : `ip:${ip}`;
+    ? `${lane ? `storekit:${lane.toLowerCase()}` : "device"}:${sub}`
+    : `ip:${ip}`;
 }
 
 // Keep only letters (incl. German ä/ö/ü/ß) and spaces; strips junk AND SQL LIKE wildcards
@@ -202,9 +212,16 @@ async function advanceSignCount(env: Env, deviceId: string, newCount: number): P
 const TRANSACTION_DEVICE_CAP = 5;
 
 async function enforceTransactionDeviceCap(
-  env: Env, originalTransactionId: string | undefined, deviceId: string
+  env: Env,
+  entitlement: Entitlement,
+  deviceId: string,
 ): Promise<void> {
-  if (!originalTransactionId) return; // payload carried no identity — nothing to bind on
+  const originalTransactionId = entitlement.originalTransactionId;
+  const storeKitEnvironment = entitlement.storeKitEnvironment;
+  if (!originalTransactionId || !storeKitEnvironment) {
+    throw new HttpError(403, "purchase identity incomplete");
+  }
+  const recordKey = storeKitRecordKey(storeKitEnvironment, originalTransactionId);
   // Single atomic claim (audit SEC-006 — same pattern as claimPromoDevice): the INSERT takes
   // a slot only while one is free, and D1 serializes writes, so two NEW devices racing for
   // the last slot can't both slip past a separate count check (the old known → count →
@@ -214,12 +231,12 @@ async function enforceTransactionDeviceCap(
      SELECT ?1, ?2
      WHERE (SELECT COUNT(*) FROM transaction_devices WHERE original_transaction_id = ?1) < ?3
      ON CONFLICT (original_transaction_id, device_id) DO NOTHING`
-  ).bind(originalTransactionId, deviceId, TRANSACTION_DEVICE_CAP).run();
+  ).bind(recordKey, deviceId, TRANSACTION_DEVICE_CAP).run();
   const mine = await opsQuery(env,
     "SELECT 1 FROM transaction_devices WHERE original_transaction_id = ?1 AND device_id = ?2"
-  ).bind(originalTransactionId, deviceId).first();
+  ).bind(recordKey, deviceId).first();
   if (!mine) {
-    console.warn("transaction device cap reached", { originalTransactionId });
+    console.warn("transaction device cap reached", { storeKitEnvironment });
     throw new HttpError(403, "device limit reached for this purchase");
   }
 }
@@ -235,12 +252,19 @@ async function enforceTransactionDeviceCap(
 interface NotificationPayload {
   notificationType?: string;
   subtype?: string;
-  data?: { signedTransactionInfo?: string };
+  data?: {
+    environment?: string;
+    bundleId?: string;
+    signedTransactionInfo?: string;
+  };
 }
 
 interface NotificationTransactionInfo {
+  bundleId?: string;
+  productId?: string;
   originalTransactionId?: string;
   revocationDate?: number;
+  environment?: string;
 }
 
 const REVOKING_NOTIFICATION_TYPES = new Set(["REFUND", "REVOKE", "REFUND_DECLINED_REVERSED"]);
@@ -272,9 +296,28 @@ async function handleAppStoreNotification(env: Env, request: Request): Promise<R
       throw new HttpError(401, "invalid transaction signature");
     }) as NotificationTransactionInfo;
   if (!txn.originalTransactionId) throw new HttpError(400, "missing originalTransactionId");
+  const transactionEnvironment = validateTransactionIdentity(env, {
+    bundleId: txn.bundleId ?? "",
+    productId: txn.productId ?? "",
+    originalTransactionId: txn.originalTransactionId,
+    revocationDate: txn.revocationDate,
+    environment: txn.environment,
+  });
+  if (!transactionEnvironment) throw new HttpError(400, "unknown notification product");
+  const outerEnvironment = storeKitEnvironment(payload.data?.environment);
+  if (!outerEnvironment || outerEnvironment !== transactionEnvironment) {
+    throw new HttpError(400, "notification environment mismatch");
+  }
+  if (payload.data?.bundleId !== env.APP_BUNDLE_ID) {
+    throw new HttpError(400, "notification bundle mismatch");
+  }
 
-  await recordTransactionRevocation(env, txn.originalTransactionId, type);
-  console.log(JSON.stringify({ evt: "ASSN_REVOKE", type }));
+  await recordTransactionRevocation(
+    env, txn.originalTransactionId, transactionEnvironment, type,
+  );
+  console.log(JSON.stringify({
+    evt: "ASSN_REVOKE", type, storeKitEnvironment: transactionEnvironment,
+  }));
   return json({ status: "recorded" });
 }
 
@@ -330,7 +373,13 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
       throw new HttpError(403, "entitlement verification failed");
     });
     if (!entitlement) throw new HttpError(403, "no active entitlement");
-    subject = `storekit:${entitlement.originalTransactionId ?? entitlement.label}`;
+    if (!entitlement.originalTransactionId || !entitlement.storeKitEnvironment) {
+      throw new HttpError(403, "purchase identity incomplete");
+    }
+    subject = storeKitSubject(
+      entitlement.storeKitEnvironment,
+      entitlement.originalTransactionId,
+    );
   } else {
     // ---- Production paid tier ----
     // The Apple-VERIFIED StoreKit purchase is the real gate (works on any network). App Attest is
@@ -343,7 +392,7 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
     });
     if (!entitlement) throw new HttpError(403, "no active entitlement");
     if (attestedDeviceId) {
-      await enforceTransactionDeviceCap(env, entitlement.originalTransactionId, attestedDeviceId);
+      await enforceTransactionDeviceCap(env, entitlement, attestedDeviceId);
       subject = attestedDeviceId;
     } else {
       // M17: key the subject on the PURCHASE, not the product. Every paid user shares one
@@ -352,16 +401,30 @@ async function handleSession(env: Env, request: Request): Promise<Response> {
       // sync. The Apple-verified originalTransactionId is unique per purchase (already
       // used for the device cap above); label remains only as a last-resort fallback for
       // a payload that carried no transaction identity.
-      subject = `storekit:${entitlement.originalTransactionId ?? entitlement.label}`;
+      if (!entitlement.originalTransactionId || !entitlement.storeKitEnvironment) {
+        throw new HttpError(403, "purchase identity incomplete");
+      }
+      subject = storeKitSubject(
+        entitlement.storeKitEnvironment,
+        entitlement.originalTransactionId,
+      );
     }
   }
 
   const ttl = parseInt(env.SESSION_TTL_SECONDS || "3600", 10);
   const token = await signSession(
     env.SESSION_JWT_SECRET, issuerFor(env.ENV_NAME), subject, entitlement.type, entitlement.scope,
-    ttl, nowSeconds()
+    ttl, nowSeconds(), entitlement.storeKitEnvironment,
   );
-  return json({ token, expiresIn: ttl, entitlement: entitlement.type, scope: entitlement.scope });
+  return json({
+    token,
+    expiresIn: ttl,
+    entitlement: entitlement.type,
+    scope: entitlement.scope,
+    ...(entitlement.storeKitEnvironment
+      ? { storeKitEnvironment: entitlement.storeKitEnvironment }
+      : {}),
+  });
 }
 
 // ---- Data endpoints (require a valid session JWT) ---------------------------

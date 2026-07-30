@@ -11,7 +11,7 @@ checks run once per session instead of once per request.
 ```
 GET  /v1/challenge ──────▶ server nonce
 POST /v1/devices/register ─ App Attest attestation ──▶ store device public key
-POST /v1/session ────────── assertion + entitlement ─▶ session JWT { scope }
+POST /v1/session ────────── assertion + entitlement ─▶ session JWT { scope, sk_env? }
                                                           │
 GET  /v1/version|manifest|rows  ── Bearer JWT ───────────┘
 GET  /v1/snapshot-manifest      ── Bearer JWT + one fresh assertion
@@ -70,17 +70,27 @@ The app signs a fresh challenge with its stored key. The worker verifies:
 ## 2. Entitlement & scope
 
 Two ways to prove a device may read, both in [`src/entitlement.ts`](../src/entitlement.ts).
-Each yields an `Entitlement { type, scope, label }` where `scope` is `free` or `full`.
+Each yields an `Entitlement { type, scope, label, storeKitEnvironment? }` where
+`scope` is `free` or `full`.
 
 ### StoreKit 2 (production paid path)
 A signed transaction (JWS) from the App Store. The worker:
 
 1. Verifies the JWS cert chain to the pinned **Apple Root CA – G3** (`APPLE_STOREKIT_ROOT_CA`).
 2. Verifies the ES256 signature with the leaf cert's key.
-3. Checks `bundleId` matches, `productId` is in `ENTITLEMENT_PRODUCT_IDS`, and the
-   transaction is not expired/revoked.
+3. Checks `bundleId` matches, `productId` is in `ENTITLEMENT_PRODUCT_IDS`, a stable
+   `originalTransactionId` exists, and the transaction is not expired/revoked.
+4. Preserves Apple's signed environment as a first-class authorization lane:
+   `Production` for the App Store and `Sandbox` for TestFlight. The live worker
+   accepts both; locally signed `Xcode` transactions remain rejected.
 
 A valid purchase always grants **`scope: "full"`**.
+
+Production and Sandbox use the same immutable production catalogue/media path but
+never the same operational identity. Sandbox purchase/device claims and revocations
+are prefixed with `sandbox:`; existing Production records retain their historical
+bare key. Sessions and snapshot grants carry the lane, so a test grant cannot be
+replayed as a production purchase.
 
 ### Promo codes (self-test & manual grants)
 A shared secret checked against the `promo_codes` table by `SHA256(code)` (the code itself
@@ -102,14 +112,17 @@ After verification, [`signSession`](../src/jwt.ts) issues an HS256 JWT signed wi
 
 ```json
 { "sub": "<device_id | promo:label>", "ent": "storekit|promo",
-  "scope": "free|full", "iat": <now>, "exp": <now + SESSION_TTL_SECONDS> }
+  "scope": "free|full", "sk_env": "Production|Sandbox",
+  "iat": <now>, "exp": <now + SESSION_TTL_SECONDS> }
 ```
 
 - Symmetric HS256 is fine because the same worker signs and verifies.
 - `scope` is the authorization decision, carried so every data request can filter by it
   without re-checking the entitlement.
-- TTL is `SESSION_TTL_SECONDS` (default 3600). **Shorten it** (e.g. 900) to shrink the
-  window a stolen token is usable; re-minting just costs one assertion.
+- `sk_env` exists only for StoreKit sessions and is copied from the Apple-verified
+  transaction. Promo sessions carrying it and tokens carrying unknown values fail closed.
+- TTL is `SESSION_TTL_SECONDS` (600 seconds in every deployed environment). The short
+  window limits a stolen token; re-minting happens transparently on demand.
 
 Data endpoints call `requireSession` ([`src/index.ts`](../src/index.ts)) which verifies the
 signature and expiry, then `scopeOf` maps an unknown/missing scope to `free`
@@ -153,7 +166,8 @@ That is the deliberate trade for keeping promo usable as an operator/test creden
 | Scraper / non-app client | App Attest (no genuine key → can't register or assert) |
 | Replayed captured request | Single-use server challenges (deleted on use) |
 | Cloned device key | Strictly increasing assertion counter |
-| Forged purchase | StoreKit JWS verified + pinned to Apple Root CA – G3 |
+| Forged purchase | StoreKit JWS verified + pinned to Apple Root CA – G3; bundle/product/environment/original ID checked |
+| Test purchase becoming a real purchase | Sandbox/Production retained in session, claims, revocations and snapshot grants |
 | Forged session token | HS256 signature over `SESSION_JWT_SECRET` |
 | Stolen session token | Short TTL; **bulk access additionally needs a fresh assertion-derived snapshot grant** |
 | Free user reaching paid rows | Server-side `scope` filter on every query (`free = 1`) |

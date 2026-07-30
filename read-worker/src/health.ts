@@ -12,6 +12,10 @@
 //              exactly the class of the prod-missing-R2-secrets incident.
 
 import { Env } from "./env";
+import {
+  isProductionStoreKitPolicy,
+  parseStoreKitEnvironmentPolicy,
+} from "./storekit-environment";
 
 interface HealthReport {
   status: "ok" | "misconfigured";
@@ -19,6 +23,7 @@ interface HealthReport {
   version: string;
   missing: string[];
   degraded: string[];
+  storeKitEnvironments: string[];
 }
 
 export function healthReport(env: Env): HealthReport {
@@ -41,6 +46,12 @@ export function healthReport(env: Env): HealthReport {
   require("SESSION_TTL_SECONDS", env.SESSION_TTL_SECONDS);
   require("APP_ATTEST_ENV", env.APP_ATTEST_ENV);
   require("SESSION_JWT_SECRET", env.SESSION_JWT_SECRET);
+  if (env.APP_ATTEST_ENV === "production"
+      && !isProductionStoreKitPolicy(env.STOREKIT_ACCEPTED_ENVIRONMENTS)) {
+    // A live worker without both Apple-signed lanes strands either TestFlight or
+    // App Store customers; any Xcode/unknown lane weakens the production boundary.
+    missing.push("STOREKIT_ACCEPTED_ENVIRONMENTS(Production,Sandbox)");
+  }
 
   // Apple root CAs: hard requirements wherever real attestations/transactions are
   // verified (production). In dev/test the xcode/development paths can run without
@@ -66,5 +77,8 @@ export function healthReport(env: Env): HealthReport {
     version: env.DEPLOY_VERSION ?? "unknown",
     missing,
     degraded,
+    storeKitEnvironments: [
+      ...parseStoreKitEnvironmentPolicy(env.STOREKIT_ACCEPTED_ENVIRONMENTS).accepted,
+    ].sort(),
   };
 }

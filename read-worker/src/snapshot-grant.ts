@@ -1,10 +1,12 @@
 import { b64UrlToBytes, bytesToB64Url, timingSafeEqualBytes, utf8 } from "./bytes";
 import { SessionClaims } from "./jwt";
+import { StoreKitEnvironment } from "./storekit-environment";
 
 type SnapshotGrantClaims = {
   typ: "snapshot-blocks";
   sub: string;
   scope: string;
+  storeKitEnvironment?: StoreKitEnvironment;
   language: string;
   snapshot: string;
   exp: number;
@@ -45,6 +47,7 @@ export async function mintSnapshotGrant(
     typ: "snapshot-blocks",
     sub: session.sub,
     scope: session.scope,
+    ...(session.sk_env ? { storeKitEnvironment: session.sk_env } : {}),
     language,
     snapshot,
     exp: Math.min(session.exp, now + 3_600),
@@ -77,6 +80,7 @@ export async function verifySnapshotGrant(
   if (claims.typ !== "snapshot-blocks"
       || claims.sub !== session.sub
       || claims.scope !== session.scope
+      || claims.storeKitEnvironment !== session.sk_env
       || claims.language !== language
       || claims.snapshot !== snapshot
       || !Number.isSafeInteger(claims.exp)

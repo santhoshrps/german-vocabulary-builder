@@ -106,7 +106,9 @@ CREATE TABLE IF NOT EXISTS rate_limits (
 
 CREATE INDEX IF NOT EXISTS idx_rate_limits_expiry ON rate_limits (expires_at);
 
--- Devices bound to a StoreKit purchase (per originalTransactionId; TRANSACTION_DEVICE_CAP).
+-- Devices bound to a StoreKit purchase (per environment-qualified originalTransactionId;
+-- TRANSACTION_DEVICE_CAP). Production keeps the historical bare id; Sandbox/Xcode use
+-- "<environment>:<id>" so TestFlight can never consume/borrow App Store device slots.
 CREATE TABLE IF NOT EXISTS transaction_devices (
   original_transaction_id TEXT NOT NULL,
   device_id               TEXT NOT NULL,               -- devices.device_id

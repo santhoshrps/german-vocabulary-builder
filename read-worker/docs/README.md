@@ -22,7 +22,8 @@ strong per-device authorization and a free/full content split.
 
 A device proves it is a genuine copy of your app (**App Attest**) and that it is
 entitled to read (**StoreKit purchase** or a **promo code**). On success the worker
-issues a short-lived **session JWT** carrying a `scope` of `free` or `full`. The client
+issues a short-lived **session JWT** carrying a `scope` of `free` or `full` and,
+for StoreKit, Apple's verified Sandbox/Production lane. The client
 then syncs by polling a tiny **version** value, pulling a **manifest** of
 `{id: content_hash}` to diff against its local copy, and fetching only the changed
 **rows** (or a full **snapshot** on first run). Every data response is served from an

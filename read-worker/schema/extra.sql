@@ -164,7 +164,9 @@ CREATE TABLE IF NOT EXISTS promo_claims (
   PRIMARY KEY (code_hash, device_id)
 );
 
--- Refund/revocation state per StoreKit purchase (audit SEC-004): written by the App Store
+-- Refund/revocation state per environment-qualified StoreKit purchase (audit SEC-004):
+-- Production retains the historical bare original id; Sandbox uses "sandbox:<id>", so
+-- TestFlight state can never revoke or become an App Store purchase. Written by the App Store
 -- Server Notifications V2 endpoint (/v1/appstore/notifications), consulted on EVERY signed-
 -- transaction verification, so the server's CURRENT state dominates a cached pre-refund JWS
 -- (a lifetime purchase's transaction never expires on its own). Idempotent upsert per

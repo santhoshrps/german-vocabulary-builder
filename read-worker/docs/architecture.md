@@ -17,7 +17,7 @@ database is touched as little as possible.
    App Attest key        │   ┌── auth ──────────────────────────────┐   │
    StoreKit purchase ───▶│   │ challenge → attestation → assertion   │   │
                          │   │ + entitlement (StoreKit / promo)      │   │
-                         │   │   → short-lived session JWT (scope)   │   │
+                         │   │ → session JWT (scope + StoreKit lane) │   │
                          │   └───────────────────────────────────────┘   │
                          │   ┌── data (JWT-gated, scoped) ──────────┐    │
                          │   │ version · manifest · rows · snapshot  │    │
