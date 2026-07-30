@@ -217,7 +217,10 @@ const HANDLERS: Partial<Record<string, Handler>> = {
     fromResult(requestId, await withIdempotency(request, env, ctx!, "invites", "", () =>
       handleInviteCreate(request, env, ctx!))),
   R16: mutation("invites/withdraw", (body, env, ctx) => handleInviteWithdraw(body, env, ctx)),
-  R17: async (request, env, requestId) => fromResult(requestId, await handleInvitePreview(request, env)),
+  R17: async (request, env, requestId) =>
+    fromResult(requestId, await handleInvitePreview(request, env)),
+  R17b: async (request, env, requestId, ctx) =>
+    fromResult(requestId, await handleInvitePreview(request, env, ctx!)),
   R18: mutation("invites/accept", (body, env, ctx) => handleInviteAccept(body, env, ctx)),
   R19: mutation("friends/remove", (body, env, ctx) => handleRemove(body, env, ctx)),
   R20: mutation("blocks", (body, env, ctx) => handleBlock(body, env, ctx)),

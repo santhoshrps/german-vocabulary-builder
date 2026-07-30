@@ -63,6 +63,7 @@ export const ROUTES: RouteSpec[] = [
   { id: "R15", method: "POST", path: `${BASE}/invites`, auth: "session", ...JSON_KEYED },
   { id: "R16", method: "POST", path: `${BASE}/invites/withdraw`, auth: "session", ...JSON_KEYED },
   { id: "R17", method: "POST", path: `${BASE}/invites/preview`, auth: "inviteToken", ...JSON_NATURAL },
+  { id: "R17b", method: "POST", path: `${BASE}/invites/preview-authenticated`, auth: "session", ...JSON_NATURAL },
   { id: "R18", method: "POST", path: `${BASE}/invites/accept`, auth: "session", ...JSON_KEYED },
   { id: "R19", method: "POST", path: `${BASE}/friends/remove`, auth: "session", ...JSON_KEYED },
   { id: "R20", method: "POST", path: `${BASE}/blocks`, auth: "session", ...JSON_KEYED },

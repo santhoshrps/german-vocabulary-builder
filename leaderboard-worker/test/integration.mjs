@@ -204,6 +204,20 @@ try {
   assert.ok(inv.json.data.link.includes("/german/join#"));
   const preview = await api("POST", "/invites/preview", { body: { token: invToken } });
   assert.equal(preview.json.data.inviterNickname, "Anna");
+  const unauthenticatedPrivatePreview = await api(
+    "POST", "/invites/preview-authenticated", { body: { token: invToken } },
+  );
+  assert.equal(unauthenticatedPrivatePreview.json.code, "AUTH_INVALID");
+  const ownPreview = await api("POST", "/invites/preview-authenticated", {
+    token: anna.session, body: { token: invToken },
+  });
+  assert.equal(ownPreview.json.code, "INVITE_OWN");
+  assert.equal(ownPreview.json.data, undefined);
+  const friendPreview = await api("POST", "/invites/preview-authenticated", {
+    token: ben.session, body: { token: invToken },
+  });
+  assert.equal(friendPreview.json.code, "OK");
+  assert.equal(friendPreview.json.data.inviterNickname, "Anna");
   const own = await api("POST", "/invites/accept", { token: anna.session, idem: crypto.randomUUID(), body: { token: invToken } });
   assert.equal(own.json.code, "INVITE_OWN");
   const accept = await api("POST", "/invites/accept", { token: ben.session, idem: crypto.randomUUID(), body: { token: invToken } });
@@ -212,7 +226,7 @@ try {
   assert.ok(accept.json.data.e18?.receiptId, "E18 receipt expected");
   const replayAccept = await api("POST", "/invites/accept", { token: ben.session, idem: crypto.randomUUID(), body: { token: invToken } });
   assert.equal(replayAccept.json.code, "INVITE_CONSUMED");
-  console.log("✓ invite → preview names inviter → own-tap no-op → accept links + E18 → replay consumed");
+  console.log("✓ invite → public/auth previews → own-preview + own-accept no-op → friend accept + E18 → replay consumed");
 
   // E18 finalize: first valid ack wins; bad amount rejected
   const receipts = await api("GET", "/e18/receipts", { token: ben.session });

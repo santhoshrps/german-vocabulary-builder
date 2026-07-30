@@ -149,6 +149,12 @@ try {
   const p2 = await social.handleInvitePreview(previewRequest(), env);
   assert.deepEqual(p1, { code: "OK", data: { inviterNickname: "Anna" } });
   assert.deepEqual(p2, p1);
+  const ownPreview = await social.handleInvitePreview(previewRequest(), env, ctx);
+  assert.deepEqual(ownPreview, { code: "INVITE_OWN" });
+  const friendPreview = await social.handleInvitePreview(
+    previewRequest(), env, { ...ctx, playerId: "friend-player" },
+  );
+  assert.deepEqual(friendPreview, p1);
   assert.equal([...db.invites.values()].filter((invite) =>
     invite.state === "pending").length, 9);
 

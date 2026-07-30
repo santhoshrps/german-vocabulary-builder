@@ -126,9 +126,11 @@ export async function handleInviteWithdraw(body: { inviteId?: string }, env: Env
   return { code: "OK", data: { withdrawn: true } }; // idempotent — absent/consumed converge
 }
 
-// --- R17 preview (invite-token possession; NEVER consumes — FRIEND-1b) -------
+// --- R17/R17b preview (NEVER consumes — FRIEND-1b/ROBUST-6) -----------------
 
-export async function handleInvitePreview(request: Request, env: Env): Promise<Result> {
+export async function handleInvitePreview(
+  request: Request, env: Env, ctx: SessionContext | null = null,
+): Promise<Result> {
   let body: { token?: string };
   try { body = await request.json(); } catch { return { code: "SCHEMA_INVALID" }; }
   if (typeof body.token !== "string" || body.token.length > 64) return { code: "SCHEMA_INVALID" };
@@ -140,6 +142,11 @@ export async function handleInvitePreview(request: Request, env: Env): Promise<R
   if (invite.state === "withdrawn") return { code: "INVITE_WITHDRAWN" };
   if (invite.state === "consumed") return { code: "INVITE_CONSUMED" };
   if (Number(invite.expires_at) < Date.now()) return { code: "INVITE_EXPIRED" };
+  // R17b carries a verified session solely so the server can refuse the
+  // creator's own link before the confirmation UI. The public R17 response
+  // remains minimal and the accept transaction repeats this authoritative
+  // guard, so preview can never become the only integrity boundary.
+  if (ctx?.playerId === String(invite.inviter)) return { code: "INVITE_OWN" };
   // Deliberately MINIMAL (data-inventory row 7): any link holder can preview, so
   // the response carries the nickname only — never the inviter's stable id.
   // Pre-acceptance safety is TOKEN-bound instead (blocks/reports accept
