@@ -21,6 +21,7 @@ import {
   handleUnblock, withIdempotency,
 } from "./social";
 import { handleDelete, handleDeleteStatus, handleExport, runOutboxTick } from "./deletion";
+import { APP_STORE_BADGE_SVG } from "./app-store-badge";
 
 export interface Env {
   SOCIAL_DB: D1Database;
@@ -240,25 +241,199 @@ const HANDLERS: Partial<Record<string, Handler>> = {
   R11: async (request, env, requestId) => fromResult(requestId, await handleDeleteStatus(request, env)),
 };
 
-/** The invite landing page (FRIEND-1b): no-referrer, strict CSP, zero external
- *  resources; the fragment token stays in the browser — this page never reads it. */
+const APP_STORE_ID = "6786836287";
+const APP_STORE_PRODUCT_URL = `https://apps.apple.com/app/id${APP_STORE_ID}`;
+
+/** The invite landing page (FRIEND-1b): no-referrer, strict CSP, zero third-party
+ *  resources; the fragment token stays in the browser — this page never reads it.
+ *
+ *  Apple currently returns 404 for the reserved product ID until the listing is
+ *  public. Keeping the stable product URL here means the badge and Safari's Smart
+ *  App Banner begin working automatically when App Store Connect publishes it. */
 function landingPage(): Response {
-  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+  const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#F6F1E6">
+<meta name="apple-itunes-app" content="app-id=${APP_STORE_ID}">
 <title>Join your friend on German Vocabulary</title>
-<style>body{font-family:-apple-system,system-ui,sans-serif;max-width:26rem;margin:15vh auto;padding:0 1.5rem;color:#222;line-height:1.5}h1{font-size:1.4rem}p{color:#555}</style>
-</head><body>
-<h1>A friend invited you to learn German together</h1>
-<p>Get the <strong>German Vocabulary</strong> app on your iPhone or iPad, then tap your
-invite link again — it will open in the app and connect you two.</p>
-<p>Invite links work once and expire after 30 days.</p>
-</body></html>`;
+<style>
+:root {
+  color-scheme: light;
+  --cream: #F6F1E6;
+  --cream-deep: #ECE4D3;
+  --red: #C23A2F;
+  --ink: #1A1A1A;
+  --muted: #6D655B;
+  --paper: #FFFCF6;
+}
+* { box-sizing: border-box; }
+html { min-height: 100%; background: var(--cream); }
+body {
+  min-height: 100vh;
+  min-height: 100svh;
+  margin: 0;
+  padding: clamp(1rem, 5vw, 3rem);
+  display: grid;
+  place-items: center;
+  overflow-x: hidden;
+  color: var(--ink);
+  background:
+    radial-gradient(circle at 12% 10%, rgba(194, 58, 47, .11), transparent 27rem),
+    radial-gradient(circle at 92% 92%, rgba(204, 153, 28, .12), transparent 24rem),
+    var(--cream);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: 1.5;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+.card {
+  position: relative;
+  width: min(100%, 32rem);
+  padding: clamp(1.5rem, 6vw, 2.6rem);
+  overflow: hidden;
+  text-align: center;
+  background: var(--paper);
+  border: 1px solid rgba(122, 113, 101, .18);
+  border-radius: 1.75rem;
+  box-shadow: 0 1.4rem 4rem rgba(61, 46, 35, .13);
+}
+.card::before {
+  position: absolute;
+  inset: 0 0 auto;
+  height: .42rem;
+  content: "";
+  background: var(--red);
+}
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: .65rem;
+  margin: .1rem auto 1.7rem;
+  font-size: .94rem;
+  font-weight: 700;
+  letter-spacing: -.01em;
+}
+.brand-mark {
+  width: 2.15rem;
+  height: 2.15rem;
+  display: grid;
+  place-items: center;
+  color: white;
+  background: var(--red);
+  border-radius: .72rem;
+  box-shadow: .18rem .18rem 0 var(--cream-deep);
+  font-family: Georgia, serif;
+  font-size: 1.1rem;
+  font-weight: 700;
+}
+.eyebrow {
+  margin: 0 0 .7rem;
+  color: var(--red);
+  font-size: .76rem;
+  font-weight: 800;
+  letter-spacing: .13em;
+}
+h1 {
+  max-width: 12em;
+  margin: 0 auto .85rem;
+  font-size: clamp(1.8rem, 7vw, 2.55rem);
+  line-height: 1.08;
+  letter-spacing: -.045em;
+}
+.intro {
+  max-width: 27rem;
+  margin: 0 auto 1.65rem;
+  color: var(--muted);
+  font-size: 1.04rem;
+}
+.app-store-link {
+  display: block;
+  width: fit-content;
+  margin: 0 auto;
+  padding: .35rem;
+  border-radius: .8rem;
+}
+.app-store-link:focus-visible {
+  outline: .2rem solid var(--red);
+  outline-offset: .22rem;
+}
+.app-store-link svg {
+  display: block;
+  width: 11.25rem;
+  height: auto;
+}
+.next-step {
+  margin: 1.6rem 0 0;
+  padding: 1rem 1.1rem;
+  color: var(--muted);
+  background: var(--cream);
+  border: 1px solid var(--cream-deep);
+  border-radius: 1rem;
+  font-size: .94rem;
+}
+.next-step strong { color: var(--ink); }
+.privacy {
+  margin: 1.1rem 0 0;
+  color: var(--muted);
+  font-size: .78rem;
+}
+.privacy::before {
+  color: var(--red);
+  content: "●";
+  margin-right: .45rem;
+}
+.legal {
+  max-width: 28rem;
+  margin: .8rem auto 0;
+  color: var(--muted);
+  font-size: .64rem;
+  line-height: 1.35;
+}
+@media (max-width: 24rem) {
+  body { padding: .75rem; }
+  .card { padding: 1.45rem 1.15rem; border-radius: 1.35rem; }
+  .brand { margin-bottom: 1.35rem; }
+}
+</style>
+</head>
+<body>
+<main class="card">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true">de</span>
+    <span>German Vocabulary</span>
+  </div>
+  <p class="eyebrow">LEARN TOGETHER</p>
+  <h1>A friend invited you to learn German together.</h1>
+  <p class="intro">Install German Vocabulary on your iPhone or iPad, then open the original invite link again to connect.</p>
+  <a class="app-store-link" href="${APP_STORE_PRODUCT_URL}" rel="noreferrer"
+     aria-label="Download German Vocabulary on the App Store">
+    ${APP_STORE_BADGE_SVG}
+  </a>
+  <p class="next-step"><strong>Already installed?</strong><br>Open the original invite link again and it will continue in the app.</p>
+  <p class="privacy">Private invite · works once · expires after 30 days</p>
+  <p class="legal">Apple and the Apple logo are trademarks of Apple Inc., registered in the U.S. and other countries and regions. App Store is a service mark of Apple Inc.</p>
+</main>
+</body>
+</html>`;
   return new Response(html, {
     headers: {
       "content-type": "text/html; charset=utf-8",
       "referrer-policy": "no-referrer",
-      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
+      "content-security-policy": [
+        "default-src 'none'",
+        "style-src 'unsafe-inline'",
+        "base-uri 'none'",
+        "form-action 'none'",
+        "frame-ancestors 'none'",
+      ].join("; "),
+      "cache-control": "public, max-age=300, stale-while-revalidate=86400",
+      "cross-origin-opener-policy": "same-origin",
+      "permissions-policy": "camera=(), geolocation=(), microphone=(), payment=(), usb=()",
       "x-content-type-options": "nosniff",
+      "x-frame-options": "DENY",
     },
   });
 }

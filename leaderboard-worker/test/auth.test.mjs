@@ -46,6 +46,12 @@ class AuthD1 {
       this.quotas.set(key, count);
       return { count };
     }
+    if (sql.includes("SELECT count(*) AS n FROM refresh_sessions")) {
+      const n = [...this.refresh.values()].filter(
+        (row) => row.player_id === args[0] && row.revoked === 0,
+      ).length;
+      return { n };
+    }
     if (sql.includes("FROM refresh_sessions WHERE family")) {
       return this.refresh.get(args[0]) ?? null;
     }

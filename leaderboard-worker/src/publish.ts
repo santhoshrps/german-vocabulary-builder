@@ -238,10 +238,30 @@ export async function handlePublish(
   const acceptedRows: Record<string, number> = {};
   for (const r of accepted) acceptedRows[`${r.day}|${r.component}`] = r.measure;
 
+  // A natural replay may follow a successful publish from another device. Echoing
+  // this request's frontier would then move the caller backwards. Derive the
+  // authoritative component maxima from the server projection instead. The
+  // retention predicate keeps this bounded to the same recent rows accepted by
+  // this endpoint, and the day_state primary key starts with (player_id, day_u16).
+  const frontierRows = await env.PROJECTION_1.prepare(
+    `SELECT component_id, MAX(measure) AS measure
+     FROM day_state
+     WHERE player_id = ?1 AND day_u16 >= ?2
+     GROUP BY component_id`)
+    .bind(ctx.playerId, windowStart).all();
+  const currentFrontier: Record<string, number> = {};
+  for (const row of frontierRows.results ?? []) {
+    const component = String(row.component_id ?? "");
+    const measure = Number(row.measure);
+    if (component && Number.isSafeInteger(measure) && measure >= 0) {
+      currentFrontier[component] = measure;
+    }
+  }
+
   return {
     code: "OK",
     data: {
-      frontier, changed, refusedStale, acceptedRows,
+      frontier: currentFrontier, changed, refusedStale, acceptedRows,
       revision: Number(player.board_revision) + (changed ? 1 : 0),
       serverTimeMs: Date.now(),
     },

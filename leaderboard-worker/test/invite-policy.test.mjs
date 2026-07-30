@@ -153,7 +153,8 @@ try {
     invite.state === "pending").length, 9);
 
   // Landing page never reads/transmits the fragment and ships no third-party
-  // bytes. The association file permits only the exact join path.
+  // bytes. It exposes the exact App Store product through Apple's standard badge
+  // and Smart App Banner. The association file permits only the exact join path.
   const landing = await worker.fetch(
     new Request("https://worker.test/german/join"),
     env,
@@ -161,9 +162,24 @@ try {
   assert.equal(landing.status, 200);
   assert.equal(landing.headers.get("referrer-policy"), "no-referrer");
   assert.equal(landing.headers.get("content-security-policy"),
-    "default-src 'none'; style-src 'unsafe-inline'");
+    "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+    + "form-action 'none'; frame-ancestors 'none'");
+  assert.equal(landing.headers.get("x-frame-options"), "DENY");
   const html = await landing.text();
-  assert.doesNotMatch(html, /<script|https?:\/\/|src=/i);
+  assert.doesNotMatch(html, /<script|<img|<iframe|<link|src=/i);
+  assert.match(html,
+    /<meta name="apple-itunes-app" content="app-id=6786836287">/);
+  assert.match(html,
+    /href="https:\/\/apps\.apple\.com\/app\/id6786836287"/);
+  assert.match(html,
+    /aria-label="Download German Vocabulary on the App Store"/);
+  assert.match(html, /<svg id="livetype"[^>]+viewBox="0 0 119\.66407 40">/);
+  assert.match(html, /Apple and the Apple logo are trademarks of Apple Inc\./);
+  assert.match(html, /--cream: #F6F1E6;/);
+  assert.match(html, /--red: #C23A2F;/);
+  assert.deepEqual([...html.matchAll(/href="([^"]+)"/g)].map((match) => match[1]),
+    ["https://apps.apple.com/app/id6786836287"],
+    "the App Store badge is the page's only navigation");
   assert.equal(html.includes(rawTokens[0]), false);
 
   const association = await worker.fetch(

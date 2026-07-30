@@ -65,7 +65,7 @@ const { mintJwt } = await import(join(out, "crypto.mjs"));
 async function prejoinSession(hashed) {
   const iat = Math.floor(Date.now() / 1000);
   return mintJwt(JWT_SECRET, {
-    sub: `prejoin:apple:1:${hashed}`, aud: "leaderboard", env: "dev",
+    sub: `prejoin:apple:1:${hashed}`, aud: "leaderboard", app: "german", env: "dev",
     sv: 0, fam: crypto.randomUUID(), iat, exp: iat + 900, jti: crypto.randomUUID(),
   });
 }
@@ -129,7 +129,9 @@ try {
   const today = Math.floor(Date.now() / 86_400_000);
   const payload = {
     schemaVersion: 1, ruleVersion: 1,
-    frontier: { "device-1": 262 },
+    // Content measure, not the points total: all monotone counters plus the
+    // duplicated per-bucket point measures (mirrors client/server algebra).
+    frontier: { "device-1": 1436 },
     days: [{
       day: today, component: "device-1",
       counters: { sessionPts: 240, wordPts: 13, timePts: 4, learnSec: 600, focusSec: 300, sessions: 2, wordsTouched: 20 },
@@ -162,7 +164,7 @@ try {
   // authoritative frontier between the original request and its replay. The
   // replay must answer CURRENT merged frontier/revision with changed=false.
   const otherDevice = structuredClone(payload);
-  otherDevice.frontier = { "device-2": 10 };
+  otherDevice.frontier = { "device-2": 15 };
   otherDevice.days[0].component = "device-2";
   otherDevice.days[0].counters = {
     sessionPts: 5, wordPts: 0, timePts: 0,
@@ -182,7 +184,7 @@ try {
   });
   assert.equal(replayAfterOther.json.data.changed, false);
   assert.deepEqual(replayAfterOther.json.data.frontier, {
-    "device-1": 262, "device-2": 10,
+    "device-1": 1436, "device-2": 15,
   }, "publish replay must return the current merged frontier");
   assert.ok(replayAfterOther.json.data.revision >= pubOther.json.data.revision);
   console.log("✓ publish replay returns current merged multi-device frontier");
