@@ -7,7 +7,9 @@
     "deploy": "wrangler deploy",
     "deploy:dev": "wrangler deploy --env dev",
     "typecheck": "tsc --noEmit",
-    "test:certs": "node test/cert-policy.test.mjs"
+    "test:certs": "node test/cert-policy.test.mjs",
+    "test:change-feed": "node --test test/change-feed.test.mjs",
+    "test:snapshot-grant": "node --test test/snapshot-grant.test.mjs"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.0.0",

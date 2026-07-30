@@ -30,6 +30,8 @@ load_dotenv(Path(__file__).parent / ".env")
 
 import dataset as dataset_mod
 import envs
+import change_feed
+import snapshot_blocks
 from registry import TABLES as V2_TABLES
 
 logger = logging.getLogger("sync")
@@ -107,6 +109,15 @@ VALID_LEVEL = re.compile(r"^(A1|A2|B1|B2|C1|C2)(\.[12])?$")
 
 UPSERT_CHUNK_SIZE = 200
 MAX_RETRIES = 3
+# The client may coalesce up to 5,000 mutations across retained versions. Each
+# individual D1 publication stays smaller so its JSON binds and atomic batch have
+# predictable memory/CPU; larger editorial drops select full recovery.
+MAX_ROUTINE_PUBLICATION_MUTATIONS = 500
+EXPECTED_SNAPSHOT_VIEWS = len(change_feed.LANGUAGES) * len(change_feed.SCOPES)
+# Change-feed history retains 256 versions. Refresh the immutable full snapshot
+# well before its cursor can age out so a fresh/reinstalling client can always
+# activate that frozen version and immediately catch up through retained deltas.
+SNAPSHOT_REFRESH_MAX_AGE = 200
 
 
 class ValidationError(Exception):
@@ -486,6 +497,122 @@ def get_db_state(client: httpx.Client, table: str) -> dict[str, str]:
     return response.json()
 
 
+def get_publication_state(client: httpx.Client) -> dict[str, Any]:
+    response = _request_with_retry(
+        lambda: client.get(f"{WORKER_URL}/publication/state", timeout=60.0)
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or not isinstance(payload.get("tables"), dict):
+        raise ValidationError("write worker returned an invalid publication state")
+    if payload.get("history_available") is not True:
+        raise ValidationError(
+            "change-feed schema is not installed in the target CONTENT database; "
+            "apply schema/content_change_feed.sql before publishing"
+        )
+    return payload
+
+
+def post_publication(
+    client: httpx.Client,
+    payload: dict[str, Any],
+    *,
+    baseline: bool = False,
+) -> dict[str, Any]:
+    route = "baseline" if baseline else "commit"
+    response = _request_with_retry(
+        lambda: client.post(
+            f"{WORKER_URL}/publication/{route}",
+            json=payload,
+            timeout=120.0,
+        )
+    )
+    response.raise_for_status()
+    result = response.json()
+    if not isinstance(result, dict):
+        raise ValidationError("write worker returned an invalid publication receipt")
+    return result
+
+
+def upload_snapshot_sets(
+    client: httpx.Client,
+    physical: dict[str, dict[str, dict[str, Any]]],
+    *,
+    generation: int,
+) -> list[dict[str, Any]]:
+    """Upload every immutable language/scope block set with bounded memory.
+
+    Uploaded blocks remain unreachable until the caller includes the returned
+    manifests in a publication transaction (or snapshot-activate transaction).
+    Re-running is safe: block identity is content-addressed and the writer
+    accepts only a byte-for-byte metadata match.
+    """
+    manifests: list[dict[str, Any]] = []
+    for snapshot in snapshot_blocks.iter_all_snapshots(
+        physical, generation=generation
+    ):
+        logger.info(
+            "  Snapshot %s/%s: uploading %d immutable block(s), %.1f MB compressed.",
+            snapshot.manifest["language"],
+            snapshot.manifest["scope"],
+            len(snapshot.blocks),
+            snapshot.manifest["total_compressed_bytes"] / (1024 * 1024),
+        )
+        for block in snapshot.blocks:
+            response = _request_with_retry(
+                lambda block=block: client.post(
+                    f"{WORKER_URL}/publication/snapshot-block",
+                    json=block.upload_payload(),
+                    timeout=120.0,
+                )
+            )
+            response.raise_for_status()
+        manifests.append(snapshot.manifest)
+    return manifests
+
+
+def activate_current_snapshots(
+    client: httpx.Client,
+    physical: dict[str, dict[str, dict[str, Any]]],
+    cursor: dict[str, Any],
+) -> dict[str, Any]:
+    generation = int(cursor["dataset_generation"])
+    manifests = upload_snapshot_sets(
+        client, physical, generation=generation)
+    payload = {
+        "contract_version": change_feed.CONTRACT_VERSION,
+        "target_base_version": cursor["base_version"],
+        "dataset_generation": generation,
+        "snapshots": manifests,
+    }
+    response = _request_with_retry(
+        lambda: client.post(
+            f"{WORKER_URL}/publication/snapshot-activate",
+            json=payload,
+            timeout=120.0,
+        )
+    )
+    response.raise_for_status()
+    receipt = response.json()
+    if not isinstance(receipt, dict):
+        raise ValidationError("write worker returned an invalid snapshot receipt")
+    return receipt
+
+
+def audit_publication(client: httpx.Client) -> None:
+    response = _request_with_retry(
+        lambda: client.get(f"{WORKER_URL}/publication/audit", timeout=120.0)
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("status") != "ok":
+        raise ValidationError("post-publish immutable history audit failed")
+    logger.info(
+        "  Publication audit passed: %s retained transition(s).",
+        payload.get("transitions", 0),
+    )
+
+
 def post_sync(
     client: httpx.Client,
     table: str,
@@ -610,6 +737,217 @@ def sync_table(
     post_sync(client, table, to_insert + to_update, to_delete)
     logger.info("  Done.")
     return counts
+
+
+# ---------------------------------------------------------------------------
+# Atomic routine publication / immutable change feed
+# ---------------------------------------------------------------------------
+
+PublishPlan = list[tuple[str, list[dict[str, Any]], int, set[str]]]
+
+
+def _target_physical_rows(
+    state: dict[str, Any],
+    plan: PublishPlan,
+) -> tuple[
+    dict[str, dict[str, dict[str, Any]]],
+    dict[str, dict[str, dict[str, Any]]],
+]:
+    current = change_feed.canonical_physical(state["tables"])
+    target: dict[str, dict[str, dict[str, Any]]] = {
+        table: {row_id: dict(row) for row_id, row in rows.items()}
+        for table, rows in current.items()
+    }
+    for table, authored_rows, _skipped, protected_ids in plan:
+        authored = {row["id"]: dict(row) for row in authored_rows}
+        if "*" in protected_ids:
+            # A partial --table publish overlays the table it did read but has
+            # no authority to delete rows belonging to unread tables.
+            replacement = dict(current[table])
+            replacement.update(authored)
+        else:
+            replacement = authored
+            # --skip-invalid deliberately retains the previously published row.
+            for row_id in protected_ids:
+                if row_id in current[table] and row_id not in replacement:
+                    replacement[row_id] = dict(current[table][row_id])
+        target[table] = replacement
+    return current, change_feed.canonical_physical(target)
+
+
+def _physical_change_counts(
+    delta: list[dict[str, Any]],
+    current: dict[str, dict[str, dict[str, Any]]],
+) -> tuple[dict[str, dict[str, int]], int]:
+    by_table: dict[str, dict[str, int]] = {}
+    total = 0
+    for group in delta:
+        inserted = sum(1 for row in group["upsert"] if row["id"] not in current[group["table"]])
+        updated = len(group["upsert"]) - inserted
+        deleted = len(group["delete"])
+        by_table[group["table"]] = {
+            "inserted": inserted,
+            "updated": updated,
+            "upserted": inserted + updated,
+            "deleted": deleted,
+        }
+        total += inserted + updated + deleted
+    return by_table, total
+
+
+def _snapshot_refresh_required(state: dict[str, Any]) -> bool:
+    if int(state.get("snapshot_views_available") or 0) != EXPECTED_SNAPSHOT_VIEWS:
+        return True
+    cursor = state.get("cursor")
+    oldest = state.get("oldest_snapshot_sequence")
+    if not isinstance(cursor, dict) or not isinstance(oldest, int):
+        # A missing age comes from an older Worker or corrupt/incomplete pointer
+        # set. Rebuild safely instead of guessing that retained deltas still span it.
+        return True
+    sequence = cursor.get("sequence")
+    if not isinstance(sequence, int) or oldest <= 0 or oldest > sequence:
+        return True
+    return sequence - oldest >= SNAPSHOT_REFRESH_MAX_AGE
+
+
+def _publish_routine_transaction(
+    client: httpx.Client,
+    state: dict[str, Any],
+    plan: PublishPlan,
+    *,
+    dry_run: bool,
+) -> tuple[dict[str, int], bool]:
+    """Publish one bounded atomic version.
+
+    Returns (summary totals, handled). `handled=False` means the change is too
+    large for the routine contract and the existing full-recovery publisher must
+    be used, followed by a generation-advancing baseline.
+    """
+    current, target = _target_physical_rows(state, plan)
+    delta = change_feed.physical_delta(current, target)
+    counts_by_table, mutation_count = _physical_change_counts(delta, current)
+    totals = {
+        "inserted": sum(v["inserted"] for v in counts_by_table.values()),
+        "updated": sum(v["updated"] for v in counts_by_table.values()),
+        "deleted": sum(v["deleted"] for v in counts_by_table.values()),
+        "skipped": sum(item[2] for item in plan),
+    }
+
+    for table in change_feed.PHYSICAL_TABLES:
+        item = counts_by_table[table]
+        logger.info(
+            "  [%s] %d upsert(s), %d delete(s)",
+            table, item["upserted"], item["deleted"],
+        )
+
+    cursor = state.get("cursor")
+    if mutation_count == 0:
+        if cursor is None and not dry_run:
+            baseline = change_feed.baseline_payload(
+                target, generation=change_feed.DATASET_GENERATION
+            )
+            baseline["snapshots"] = upload_snapshot_sets(
+                client,
+                target,
+                generation=change_feed.DATASET_GENERATION,
+            )
+            receipt = post_publication(client, baseline, baseline=True)
+            audit_publication(client)
+            logger.info(
+                "  Installed immutable baseline sequence %s.",
+                receipt.get("sequence", "?"),
+            )
+        else:
+            if not dry_run:
+                audit_publication(client)
+                if _snapshot_refresh_required(state):
+                    if not isinstance(cursor, dict):
+                        raise ValidationError("snapshot bootstrap requires a current cursor")
+                    receipt = activate_current_snapshots(client, target, cursor)
+                    logger.info(
+                        "  Installed %s immutable full-snapshot view(s).",
+                        receipt.get("snapshots_activated", "?"),
+                    )
+            logger.info("  Already in sync.")
+        return totals, True
+
+    if mutation_count > MAX_ROUTINE_PUBLICATION_MUTATIONS:
+        logger.warning(
+            "  %d physical mutations exceed the routine atomic limit (%d); "
+            "using the existing full-recovery publication path.",
+            mutation_count,
+            MAX_ROUTINE_PUBLICATION_MUTATIONS,
+        )
+        return totals, False
+
+    if dry_run:
+        logger.info("  [DRY RUN] Atomic publication not committed.")
+        return totals, True
+
+    try:
+        payload = change_feed.publication_payload(
+            current,
+            target,
+            current_cursor=cursor if isinstance(cursor, dict) else None,
+            generation=(
+                int(cursor["dataset_generation"])
+                if isinstance(cursor, dict)
+                else change_feed.DATASET_GENERATION
+            ),
+        )
+    except change_feed.PublicationRecoveryRequired as exc:
+        logger.warning("  %s", exc)
+        return totals, False
+    refresh_snapshots = _snapshot_refresh_required(state)
+    if refresh_snapshots:
+        payload["snapshots"] = upload_snapshot_sets(
+            client,
+            target,
+            generation=int(payload["dataset_generation"]),
+        )
+    receipt = post_publication(client, payload)
+    audit_publication(client)
+    logger.info(
+        "  Atomic publication committed: sequence %s, %s physical mutation(s).",
+        receipt.get("sequence", "?"),
+        receipt.get("physical_mutations", mutation_count),
+    )
+    if refresh_snapshots:
+        logger.info(
+            "  Refreshed %s immutable full-snapshot view(s) in the same transaction.",
+            receipt.get("snapshots_activated", "?"),
+        )
+    return totals, True
+
+
+def _install_recovery_baseline(
+    client: httpx.Client,
+    prior_state: dict[str, Any],
+) -> None:
+    """After an intentionally large legacy/full publication, cut a new generation.
+
+    Older cursors cannot be replayed through that non-routine publication, so the
+    generation advance makes clients select their existing manifest/snapshot
+    recovery path exactly once. Later bounded versions use the feed again.
+    """
+    final_state = get_publication_state(client)
+    physical = change_feed.canonical_physical(final_state["tables"])
+    prior_cursor = prior_state.get("cursor")
+    generation = (
+        int(prior_cursor["dataset_generation"]) + 1
+        if isinstance(prior_cursor, dict)
+        else change_feed.DATASET_GENERATION
+    )
+    baseline = change_feed.baseline_payload(physical, generation=generation)
+    baseline["snapshots"] = upload_snapshot_sets(
+        client, physical, generation=generation)
+    receipt = post_publication(client, baseline, baseline=True)
+    audit_publication(client)
+    logger.info(
+        "  Recovery baseline installed: generation %s, sequence %s.",
+        generation,
+        receipt.get("sequence", "?"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -776,18 +1114,41 @@ def main() -> None:
         plan.append(("id_aliases", aliases, 0, protected_aliases))
 
     with httpx.Client(event_hooks={"request": [_sign_request]}) as client:
-        for table, rows, skipped, protected_ids in plan:
-            try:
-                result = sync_table(client, table, rows, skipped, protected_ids, dry_run=args.dry_run)
-            except httpx.HTTPError as exc:
-                logger.error("%s: request failed: %s", table, exc)
-                failures.append(table)
-                continue
-            if result.get("aborted"):
-                aborted.append(table)
-                continue
-            for key in totals:
-                totals[key] += result[key]
+        try:
+            publication_state = get_publication_state(client)
+            routine_totals, handled = _publish_routine_transaction(
+                client, publication_state, plan, dry_run=args.dry_run
+            )
+            if handled:
+                totals = routine_totals
+            else:
+                # Large/structural worlds stay on the existing recovery path for
+                # now. It deliberately advances the dataset generation afterward,
+                # so no client can mistake it for a replayable routine delta.
+                for table, rows, skipped, protected_ids in plan:
+                    try:
+                        result = sync_table(
+                            client,
+                            table,
+                            rows,
+                            skipped,
+                            protected_ids,
+                            dry_run=args.dry_run,
+                        )
+                    except httpx.HTTPError as exc:
+                        logger.error("%s: request failed: %s", table, exc)
+                        failures.append(table)
+                        continue
+                    if result.get("aborted"):
+                        aborted.append(table)
+                        continue
+                    for key in totals:
+                        totals[key] += result[key]
+                if not args.dry_run and not failures and not aborted:
+                    _install_recovery_baseline(client, publication_state)
+        except (httpx.HTTPError, ValidationError, change_feed.PublicationError) as exc:
+            logger.error("Vocabulary publication failed: %s", exc)
+            failures.append("publication")
 
     dry_label = " (dry run — no changes written)" if args.dry_run else ""
     print(f"\n{'─' * 44}")

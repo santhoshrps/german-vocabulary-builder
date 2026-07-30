@@ -4,16 +4,19 @@ How an iOS client keeps its local SQLite copy in sync with the server, transferr
 little as possible. All data endpoints require a session JWT (see
 [authentication.md](authentication.md)) and are filtered by its `scope`.
 
-## The four data endpoints
+## Data endpoints
 
 | Endpoint | Returns | Typical size |
 |----------|---------|--------------|
 | `GET /v1/version` | `{ version }` | tiny |
+| `GET /v1/changes?from=…` | coalesced changed/deleted IDs + integrity metadata | proportional to retained changes |
 | `GET /v1/manifest` | `{ version, manifest: { table: { id: content_hash } } }` | small |
-| `GET /v1/rows/:table?ids=…` | `{ version, table, rows: [...] }` | one batch (≤200) |
-| `GET /v1/snapshot` | NDJSON, one row per line | whole (scoped) dataset |
+| `GET /v1/rows/:table?ids=…&version=…` | exact immutable target rows | one batch (≤200) |
+| `GET /v1/snapshot-manifest` | immutable full-install manifest + short-lived block grant | one block descriptor per 500–1,000 rows |
+| `GET /v1/snapshot-block/:id?snapshot=…&checksum=…` | one immutable zlib block | 500–1,000 rows |
+| `GET /v1/snapshot` | legacy NDJSON compatibility fallback | whole (scoped) dataset |
 
-All four are implemented in [`src/data.ts`](../src/data.ts) and served through the
+All are implemented in [`src/data.ts`](../src/data.ts) and served through the
 version-keyed edge cache (see [caching.md](caching.md)).
 
 ## Dataset version
@@ -22,7 +25,8 @@ The **version** is a short string that changes whenever the dataset changes. It 
 `getVersion` ([`src/data.ts`](../src/data.ts)):
 
 1. If `meta.dataset_version` exists (set by the write worker), use it.
-2. Otherwise derive it: for each table, hash `COUNT(*)` + `MAX(updated_at)`.
+2. Before an immutable publisher baseline exists, derive it from each table's
+   `COUNT(*)` + `MAX(updated_at)`.
    - `COUNT(*)` changes on **insert/delete**.
    - `MAX(updated_at)` changes on **insert/update** (the write path always stamps
      `updated_at` on upsert).
@@ -32,45 +36,79 @@ The version is **scope-specific** (`…:free` vs `…:full`). This means a free�
 always looks "changed" to the client and forces a re-sync, and free users don't re-sync
 when only full-tier rows change.
 
-## Steady-state sync (delta)
+## Steady-state sync (bounded immutable delta)
 
 ```
 1. GET /v1/version
    └─ same as local? ──▶ done. (nothing transferred)
 
-2. GET /v1/manifest                      // { id: content_hash } for the whole scope
-   └─ diff against the local store:
-        id present on server, absent locally  → fetch (new)
-        id present both, content_hash differs → fetch (changed)
-        id absent on server, present locally  → delete
+2. GET /v1/changes?from=<local version>
+   └─ validate continuity, generation, scope/language, counts, fingerprints,
+      changed/deleted ids, hashes, aliases and type changes
 
-3. GET /v1/rows/:table?ids=<changed ids> // in batches of ≤200
+3. GET /v1/rows/:table?ids=<changed ids>&version=<target> // batches ≤200
    └─ apply rows to local SQLite
 
-4. save the new version locally
+4. commit word mutations + target cursor in ONE local transaction
 ```
 
-The manifest carries `content_hash` per row (the same hash the sync script computes on
-the write side), so the client never downloads a row whose content it already has.
-**Deletions are detected by absence** — an id in the local store but not in the manifest
-is deleted. No tombstones or soft-deletes are needed.
+The routine path never downloads or scans the complete manifest. Immutable
+per-version records retain authoritative deletions and exact target row snapshots.
+Several missed versions are coalesced deterministically; a gap, incompatible
+generation or excessive chain returns 409/410 and selects full recovery.
+Coalescing compares endpoint state as well as the latest operation: a word added
+and deleted entirely after the client's cursor is omitted as a net no-op, while
+delete/re-add, update/delete and genuine adjective/adverb type changes remain
+explicit.
+
+The block snapshot remains the safety net for first install, scope/language
+changes, an expired cursor, a large editorial publication, explicit repair or
+failed integrity validation. The catalogue-wide hash manifest and legacy
+single-snapshot transport remain compatibility/recovery fallbacks.
 
 `ETag`/`If-None-Match` short-circuits this: the version is the ETag, so a client already
 on the current version gets `304 Not Modified` with no body.
 
-## First-time / full sync (snapshot)
+## First-time / full sync (immutable blocks)
 
-On first run (empty local store) or to reset, the client pulls `GET /v1/snapshot`:
+The preferred 50k+ path is:
 
-- The body is **NDJSON** — one JSON object per line: `{"t":"<table>","row":{...}}`.
-- The phone streams and inserts line-by-line in a single SQLite transaction, without
-  buffering the whole payload in memory.
-- Cloudflare compresses the response (gzip/brotli) automatically.
+1. `GET /v1/snapshot-manifest` with one fresh App Attest assertion for a
+   device-bound session. The response pins generation, version/sequence,
+   language, scope, counts/fingerprint and independently compressed block
+   metadata, plus a short-lived `download_grant`.
+2. Download the manifest's content-addressed blocks with
+   `X-Snapshot-Grant`. The grant is HMAC-signed and bound to the session subject,
+   scope, language and exact snapshot; it permits no other dataset. A resumed
+   install refreshes the grant with
+   `/snapshot-manifest?snapshot=<retained snapshot id>`.
+3. Verify each compressed size/checksum, decode at most two blocks off-main and
+   feed exactly one staging-database writer. Page commits and the durable install
+   journal make replay idempotent without retaining the whole catalogue.
+4. Validate exact table/global counts, stable-ID uniqueness and global
+   fingerprint; validate and checksum the complete `/aliases` graph as inert
+   snapshot-specific staging; seal the staged SQLite WAL; and reopen the
+   replacement to prove its exact transactional cursor.
+5. Durably switch the local content pointer and staged alias graph before
+   publishing the replacement container. A crash after the pointer switch can
+   finish alias installation and cleanup from local staged files while offline;
+   aliases are never applied to the superseded catalogue.
+6. If the frozen snapshot sequence is behind the current version, immediately
+   catch up through `/changes`; never mix generations inside the full install.
+   Client rechecks are bounded so continuous publication cannot hold onboarding.
+   The publisher refreshes the full snapshot set at age 200 inside the retained
+   256-version feed window, so this catch-up source cannot expire.
 
-For **device sessions**, snapshot additionally requires a fresh App Attest assertion —
-fetch `GET /v1/challenge`, sign it, and send `X-Challenge` + `X-Assertion` headers (see
-[authentication.md](authentication.md#4-per-request-assertion-on-v1snapshot)). Promo
-sessions are exempt.
+Blocks use the standard RFC 1950 zlib envelope around an RFC 1951 DEFLATE
+payload, including the Adler-32 trailer, and contain NDJSON rows without a table
+wrapper. Table identity comes from the signed/checksummed manifest. A normal
+installation contains the complete entitled scope—CEFR level never partitions
+the download.
+
+The legacy `GET /v1/snapshot` NDJSON response remains available until all deployed
+clients understand blocks. It is selected only for 404/501 or an explicitly
+unsupported block contract, not for an offline, checksum, storage or cancellation
+failure.
 
 ## Tiers
 
@@ -92,11 +130,16 @@ See [promo-codes.md](promo-codes.md) for how a tier is granted.
 ## Why this design
 
 - **Cheap steady state** — polling `version` is a tiny request; most syncs stop there.
-- **Minimal transfer** — only changed rows move, identified by content hash.
-- **Natural deletes** — absence in the manifest is the delete signal.
-- **Memory-safe bulk** — NDJSON streams; the phone never holds the whole dataset at once.
-- **Cache-friendly** — the manifest and snapshot are identical for all users at a given
-  version+scope, so one cached object serves everyone.
+- **Catalogue-independent routine work** — one changed word transfers and looks up
+  approximately one word whether the installed catalogue has 500 or 50,000 rows.
+- **Crash-proof publication** — canonical mutations, immutable history and the visible
+  version pointer are one D1 transaction.
+- **Exact races** — version-pinned row snapshots cannot mix two publications.
+- **Authoritative deletes** — retained tombstones preserve removals without a manifest scan.
+- **Memory-safe bulk** — independent blocks, bounded decode concurrency,
+  backpressure and one staging writer keep peak memory independent of catalogue size.
+- **Cache-friendly** — immutable blocks have one-year cache identities; authorization
+  grants gate access without making the block bytes user-specific.
 
 ## Client pseudocode
 
@@ -105,17 +148,20 @@ local_version = read_local_version()
 server = GET /v1/version
 if server.version == local_version: return  // up to date
 
-if local_store_empty:
-    stream GET /v1/snapshot                  // (device: + X-Challenge/X-Assertion)
-    apply each NDJSON line in a transaction
+if local_store_empty or cursor_incompatible:
+    manifest = GET /v1/snapshot-manifest     // one fresh assertion when device-bound
+    resume journal(manifest)
+    concurrently download 2–4 immutable blocks using manifest.download_grant
+    decode at most 2; page-write through exactly 1 staging writer
+    validate + seal + atomically activate staged catalogue
+    if manifest.sequence < server.sequence: apply /changes catch-up
 else:
-    m = GET /v1/manifest
-    for each table:
-        changed = ids where local hash != m[table][id] or id is new
-        removed = local ids not in m[table]
-        for batch in chunks(changed, 200):
-            r = GET /v1/rows/table?ids=batch
-            upsert r.rows
-        delete removed
-save_local_version(server.version)
+    feed = GET /v1/changes?from=local_version
+    validate feed
+    for batch in chunks(feed.changed, 200):
+        rows = GET /v1/rows/table?ids=batch&version=feed.to_version
+    atomically apply rows + deletions + feed.to_cursor
+
+// Missing block endpoints use legacy /manifest then /snapshot. Transient block
+// failures retain the journal and retry; they do not trigger the legacy payload.
 ```

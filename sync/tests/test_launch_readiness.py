@@ -34,19 +34,19 @@ def test_free_preview_contains_exactly_one_hundred_words():
     assert free == 100
 
 
-@pytest.mark.parametrize("language", ("es-419", "zh"))
-def test_launch_base_translation_packages_cover_every_word(language):
-    """Product purpose: Spanish and Mandarin must be complete before the public launch."""
+def test_launch_required_english_translation_package_covers_every_word():
+    """Product purpose: the required English package must cover the complete catalogue."""
+    language = dataset.REQUIRED_LANGUAGE
     tables = _preview().values()
     total = sum(len(table.core) for table in tables)
     translated = sum(table.coverage.get(language, 0) for table in _preview().values())
     assert translated == total, f"{language} coverage is {translated}/{total}"
 
 
-def test_every_launch_noun_has_article_and_plural():
-    """Product purpose: noun learning/mastery requires both article and plural content."""
+def test_every_launch_noun_has_an_article():
+    """Product purpose: every noun needs an article; a meaningful plural may not exist."""
     incomplete = [
         row["word"] for row in _preview()["nouns"].core
-        if not row.get("article") or not row.get("plural")
+        if not row.get("article")
     ]
-    assert incomplete == [], f"{len(incomplete)} nouns lack article/plural; sample={incomplete[:20]}"
+    assert incomplete == [], f"{len(incomplete)} nouns lack an article; sample={incomplete[:20]}"

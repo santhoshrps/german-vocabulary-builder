@@ -97,10 +97,11 @@ def test_table_type_partitions_match_the_product_word_types():
     assert registry.TABLES["adverbs_adjectives"].allowed_types == {"adverb", "adjective"}
 
 
-def test_noun_registry_requires_article_and_plural():
-    """Product purpose: every noun must ship with the two aspects used for learning and mastery."""
+def test_noun_registry_requires_article_but_allows_missing_plural():
+    """Product purpose: every noun needs an article; nouns without a plural remain valid."""
     required = set(registry.TABLES["nouns"].required)
-    assert {"article", "plural"} <= required
+    assert "article" in required
+    assert "plural" not in required
 
 
 def test_every_content_table_requires_a_german_example_sentence():

@@ -57,8 +57,11 @@ possible "are we current?" — most steady-state syncs end here or at `/v1/versi
 | Endpoint | `max-age` | Notes |
 |----------|-----------|-------|
 | `GET /v1/version` | 30s | Tiny; short TTL so clients notice new versions quickly. Not stored via the Cache API — just `Cache-Control` + `ETag`. |
+| `GET /v1/changes` | 300s | Keyed by current version, scope, language chain and installed `from` version. |
 | `GET /v1/manifest` | 300s | Version-keyed; one object per (version, scope). |
-| `GET /v1/rows/:table` | 300s | Keyed by (version, scope, table, sorted ids). |
+| `GET /v1/rows/:table` | 300s | Keyed by immutable target version, scope, language, table and sorted ids. |
+| `GET /v1/snapshot-manifest` | private/no-store response | Contains a subject-bound short-lived grant. The underlying manifest is immutable and read only once per full/resumed install. |
+| `GET /v1/snapshot-block/:id` | 31536000s, immutable | Content-addressed exact block bytes; request still validates session + subject/scope/language/snapshot grant before serving. |
 | `GET /v1/snapshot` | 86400s | Effectively immutable per version; long TTL. Access still gated by a fresh assertion for device sessions, but the **body** comes from cache. |
 
 `version` deliberately has a short TTL so a client polling it picks up a new dataset within
@@ -75,6 +78,12 @@ the assertion passes, the NDJSON is served from the version cache. So:
 - a stolen token still can't pull it, because the assertion runs first.
 
 This is why the per-request assertion doesn't wreck snapshot scalability.
+
+The block path performs one fresh assertion for the manifest, then returns a
+short-lived signed grant bound to the exact immutable snapshot. Each block request
+validates that grant and can share the content-addressed bytes at the edge. This
+avoids 60–100 App Attest operations for one large installation without allowing a
+stolen session JWT to mint bulk-download access.
 
 ## What is *not* cached
 
@@ -94,7 +103,8 @@ new version exists. Once it fetches the new version, every downstream key change
 
 With `N` users at one PoP and a version that changes `k` times/day:
 
-- Manifest/snapshot D1 queries ≈ `k` per PoP per scope (not `N`).
+- Manifest/legacy-snapshot D1 queries ≈ `k` per PoP per scope; a block manifest is
+  read once per rare full installation and immutable block bytes are edge-cacheable.
 - The other `N − 1` users per cache window are served from the edge.
 
 So D1 load scales with **how often the data changes**, not with **how many users read it**

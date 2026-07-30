@@ -25,7 +25,7 @@ sync/.venv/bin/python sync/sync.py --env prod         sync/.venv/bin/python sync
                                                       sync/.venv/bin/python sync/media_publish.py rollback --env prod
 
 # workers                                  # verification
-scripts/deploy.sh dev|test|prod            sync/.venv/bin/python sync/media_publish.py audit --env X [--deep]
+scripts/deploy.sh dev|prod                  sync/.venv/bin/python sync/media_publish.py audit --env X [--deep]
                                            sync/.venv/bin/python sync/media_publish.py qa --env X
                                            sync/.venv/bin/python sync/media_publish.py status --env X
 

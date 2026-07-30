@@ -45,8 +45,10 @@ Every request enters [`src/index.ts`](../src/index.ts) `fetch` and flows through
    (30/min) via KV. The expensive auth endpoints are the abuse surface.
 3. **Route + auth**:
    - Auth routes (`challenge`, `devices/register`, `session`) run their own verification.
-   - Data routes (`version`, `manifest`, `rows`, `snapshot`) call `requireSession` to
-     validate the JWT, derive the `scope`, and (for `snapshot`) require a fresh assertion.
+   - Data routes (`version`, `changes`, `manifest`, `rows`, block/legacy snapshots)
+     call `requireSession` to validate the JWT and derive `scope`.
+     `snapshot-manifest` (and legacy `snapshot`) also requires a fresh assertion;
+     immutable block reads require its subject-bound snapshot grant.
 4. **Serve** — data routes build a scoped response and serve it through the
    version-keyed edge cache.
 5. **Errors** — a thrown `HttpError` becomes its `{status, code}`; anything else is
@@ -59,8 +61,9 @@ The worker has two clearly separated planes:
 - **Auth plane** (stateful, infrequent, expensive): challenge issuance, App Attest
   verification, StoreKit/promo entitlement, JWT minting. Writes to D1 (`devices`),
   reads KV. Rate-limited. Runs at most once per session (plus once per snapshot).
-- **Data plane** (stateless, frequent, cheap): version/manifest/rows/snapshot. Gated by
-  the JWT only (except snapshot). Served from the edge cache. This is what 1000 users hit
+- **Data plane** (stateless, frequent, cheap): version/changes/manifest/rows and
+  immutable snapshot blocks. Gated by JWT plus the bulk grant where applicable
+  and served from the edge cache. This is what 1000 users hit
   repeatedly, and it almost never reaches D1.
 
 Keeping these separate is what lets the data plane scale: the costly cryptographic work
@@ -95,6 +98,7 @@ server-side paywall; see [sync-protocol.md](sync-protocol.md#tiers) and
   queries D1 about once per endpoint, then serves everyone else from cache.
 - **D1 writes** happen only on the auth plane: `devices` upsert on register, and a
   `sign_count` update per session / per snapshot assertion. These are low-frequency.
-- **Memory** — the snapshot is built as a single NDJSON string per cache-miss. For a few
-  thousand words this is small; if it ever grows large, move snapshots to R2 with range
-  requests (documented but not yet wired).
+- **Memory** — the preferred full install serves prebuilt 500–1,000-row immutable
+  compressed blocks. The legacy snapshot is still built as one NDJSON string per
+  cache miss only for backward compatibility; remove that fallback after all
+  supported clients migrate.

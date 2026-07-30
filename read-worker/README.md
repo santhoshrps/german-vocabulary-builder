@@ -36,14 +36,23 @@ checks run once per session, not per request.
 | `POST` | `/v1/devices/register` | App Attest attestation | Register a device's attested key. Body: `{keyId, attestationObject, challenge}` |
 | `POST` | `/v1/session` | promo **or** assertion+StoreKit | Mint a session JWT (see below) |
 | `GET` | `/v1/version` | Bearer JWT | Current dataset version (cheap poll) |
+| `GET` | `/v1/changes?from=…` | Bearer JWT | Immutable changed/deleted IDs since a retained version |
 | `GET` | `/v1/manifest` | Bearer JWT | `{table:{id:content_hash}}` for delta reconciliation |
-| `GET` | `/v1/rows/:table?ids=a,b,c` | Bearer JWT | Full rows for changed ids (≤200/request) |
+| `GET` | `/v1/rows/:table?ids=a,b,c&version=…` | Bearer JWT | Full rows pinned to an immutable target (≤200/request) |
+| `GET` | `/v1/snapshot-manifest` | Bearer JWT **+ one fresh assertion** | Immutable block manifest + short-lived subject-bound grant |
+| `GET` | `/v1/snapshot-block/:id?snapshot=…&checksum=…` | Bearer JWT + snapshot grant | One content-addressed zlib block (500–1,000 rows) |
 | `GET` | `/v1/snapshot` | Bearer JWT **+ fresh assertion** | Full dataset as NDJSON (first-time/full sync) |
 
-### Per-request assertion on `/v1/snapshot`
+### Bulk-download proof
 The bulk download is the one thing worth stealing, so a session JWT alone is **not**
-enough for device (StoreKit) sessions — each `/v1/snapshot` request must also carry a
-**fresh, single-use App Attest assertion**:
+enough for device-bound sessions. The preferred block path presents one fresh
+assertion on `/v1/snapshot-manifest`; the Worker returns a short-lived HMAC grant
+bound to the subject, scope, language and exact snapshot. Every block supplies that
+grant in `X-Snapshot-Grant`. This avoids hardware-signing once per block while a
+stolen bearer token still cannot mint bulk access.
+
+The legacy `/v1/snapshot` request continues to carry a fresh, single-use App Attest
+assertion directly:
 
 | Header | Value |
 |--------|-------|
@@ -68,22 +77,28 @@ Returns `{ token, expiresIn, entitlement }`.
 
 ## Client sync flow
 
-1. `GET /v1/version` → if unchanged from the local copy, stop.
-2. `GET /v1/manifest` → diff `{id: content_hash}` against the local store:
-   - id missing locally → fetch; hash differs → fetch; id gone from manifest → delete.
-3. `GET /v1/rows/:table?ids=…` for changed ids (loop in ≤200 batches), **or**
-   `GET /v1/snapshot` for a first-time full pull (fetch a fresh `/v1/challenge` and
-   attach `X-Challenge` + `X-Assertion` — see "Per-request assertion" above).
-4. Apply in a local SQLite transaction; save the new version.
+1. `GET /v1/version` → if unchanged from the transactional local cursor, stop.
+2. `GET /v1/changes?from=…` returns only coalesced changed/deleted IDs plus
+   hashes, counts, fingerprints, aliases and type changes.
+3. `GET /v1/rows/:table?ids=…&version=<target>` downloads only changed rows.
+   The target pin stays exact if a later publication lands mid-transfer.
+4. Apply words and the new cursor in one local SQLite transaction.
+5. First install, generation/scope/language changes, expired history, excessive
+   deltas and integrity failures use the immutable block manifest, resumable
+   downloads and an isolated single-writer staging store. Legacy `/snapshot` is
+   only the compatibility fallback when block endpoints are unavailable.
 
-`ETag`/`If-None-Match` returns **304** when the client is already current, and the
-manifest/snapshot are edge-cached, so steady-state sync transfers almost nothing.
+Change history and target row snapshots are bounded by the delta and retained for
+256 versions. Recovery manifests/snapshots remain version-keyed and edge-cached;
+the publisher atomically refreshes their pointers by age before a pointed
+snapshot can leave that retained delta window.
 
 ## Setup
 
 ```bash
-# 1. Apply the extra tables to the SAME D1 database
+# 1. Apply the extra + immutable change-feed tables to the SAME D1 database
 wrangler d1 execute german-vocabulary --file=read-worker/schema/extra.sql
+wrangler d1 execute german-vocabulary --file=../schema/content_change_feed.sql
 
 # 2. Create a KV namespace (challenges + rate limits) and paste its id into wrangler.toml
 wrangler kv namespace create KV
@@ -117,6 +132,8 @@ TOKEN=$(curl -s -X POST $BASE/v1/session \
 # 2. Use it
 curl -s $BASE/v1/version  -H "Authorization: Bearer $TOKEN"
 curl -s $BASE/v1/manifest -H "Authorization: Bearer $TOKEN"
+# Promo sessions are proof-exempt; capture the grant then fetch one listed block.
+SNAPSHOT=$(curl -s $BASE/v1/snapshot-manifest -H "Authorization: Bearer $TOKEN")
 curl -s $BASE/v1/snapshot -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -135,7 +152,8 @@ curl -s $BASE/v1/snapshot -H "Authorization: Bearer $TOKEN"
 | `src/crypto/der.ts` | Minimal DER/ASN.1 reader (X.509 cert handling) |
 | `src/appattest.ts` | App Attest attestation + assertion verification |
 | `src/entitlement.ts` | StoreKit 2 JWS verification + promo code |
-| `src/data.ts` | Version, manifest, rows, snapshot from D1 |
+| `src/data.ts` | Version, manifest, rows, immutable block snapshot and legacy snapshot from D1 |
+| `src/snapshot-grant.ts` | Short-lived subject/scope/language/snapshot-bound block grants |
 | `schema/extra.sql` | `meta`, `devices`, `promo_codes` tables |
 
 

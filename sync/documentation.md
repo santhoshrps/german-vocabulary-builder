@@ -1,6 +1,9 @@
 # sync.py — How It Works
 
-Reads the three local Excel files and synchronises their contents into the Cloudflare D1 database via the Worker API. Each run is fully idempotent: running it twice in a row with no Excel changes makes no DB calls beyond the initial state fetch.
+Reads the three local Excel files and publishes them through the Cloudflare write
+Worker. Routine changes are committed as one immutable version: physical word
+mutations, per-language/scope change records and the visible cursor move atomically.
+Each run remains idempotent.
 
 ## Usage
 
@@ -43,7 +46,7 @@ uv pip compile requirements.in -o requirements.txt   # uv
 
 | Flag | Description |
 |------|-------------|
-| `--dry-run` | Fetches DB state and computes the diff, but does not call `POST /sync`. Prints what would be added, updated, and deleted. Safe to run at any time. |
+| `--dry-run` | Fetches publication state and computes the diff, but does not commit a publication. Prints what would be added, updated, and deleted. Safe to run at any time. |
 | `--table TABLE` | Restricts the sync to one table. Choices: `verbs`, `nouns`, `adverbs_adjectives`. |
 | `--skip-invalid` | Rows that fail row-level validation (empty required field, bad Level, empty Word) are skipped with a warning instead of failing the whole table; the remaining valid rows sync normally. A skipped word that already exists in the DB is **preserved, not deleted** — the previously-synced version stays live until the row is fixed. Structural errors (missing file, bad headers, multiple sheets) still abort the table. |
 | `-v`, `--verbose` | Debug-level output: per-step progress (reading Excel, fetching DB state). |
@@ -56,13 +59,13 @@ always printed regardless of verbosity.
 
 ---
 
-## Sync Flow (per table)
+## Publication flow
 
 ```
 Excel file  ──read + validate──▶  rows with IDs and hashes
                                           │
                                           ▼
-DB (via Worker)  ──fetch──▶  { id: content_hash }
+DB (via Worker)  ──fetch──▶  current physical rows + publication cursor
                                           │
                                           ▼
                                        diff
@@ -70,9 +73,60 @@ DB (via Worker)  ──fetch──▶  { id: content_hash }
                                insert/update  delete
                                    └────┬────┘
                                         ▼
-                               POST /sync/:table
-                               (skipped on --dry-run)
+                         POST /publication/commit
+                  (one D1 transaction; skipped on --dry-run)
 ```
+
+Routine publications contain at most 500 physical mutations. The app may
+coalesce several retained versions up to its 5,000-mutation safety ceiling.
+A larger editorial drop deliberately uses the existing recovery publisher and
+then installs a new dataset generation, causing devices to use full recovery
+once; it is never represented as an incomplete delta.
+
+### Immutable full-install snapshots
+
+The full-recovery publisher builds every language × access-scope view from one
+frozen canonical dataset. Each physical word table is stable-ID sorted, split
+into deterministic 750-row chunks (the final remainder may be smaller), encoded
+as NDJSON and independently compressed with the standard RFC 1950 zlib envelope
+(RFC 1951 DEFLATE payload plus Adler-32 trailer). It uploads content-addressed
+blocks first; uploaded rows remain `committed = 0` and cannot be served.
+
+Only after all 12 manifests pass exact generation/version, language/scope,
+schema, table/global count, byte-size, block checksum/metadata and global
+fingerprint validation does the write Worker atomically:
+
+1. insert every immutable manifest at the current publication sequence;
+2. mark only its already-verified blocks committed; and
+3. move every language/scope snapshot pointer.
+
+Rollback exposes none of these changes. Replaying an identical block/activation
+is idempotent; conflicting bytes or metadata are rejected. Routine one-word
+publications do **not** rebuild full snapshots one-for-one: a phone may finish
+the retained frozen snapshot and catch up from its manifest `sequence` through
+`/changes`. The publisher refreshes all 12 snapshot views at age 200, within
+the 256-version change-feed window, and includes that refresh in the boundary
+delta's atomic publication. A full-install cursor therefore cannot age out of
+the feed needed for immediate catch-up. When retention later reaches the old
+sequence, the same Worker transaction deletes only its now-unpointed blocks and
+manifest before pruning the parent version; the active snapshot is protected by
+its pointer.
+
+Dataset mutation and its immutable change record/version pointer are published
+in the same D1 batch. Blocks are derived data staged before that visibility
+boundary. A baseline/recovery publication carries the complete snapshot
+manifests in its atomic transaction; the current pointer can never name an
+incomplete block set.
+
+Apply `schema/content_change_feed.sql` to every CONTENT database before using
+this publisher. The Worker retains 256 immutable versions. The publication tool
+and Worker both validate IDs, hashes, counts, fingerprints, aliases, table
+identity, language and access scope before the D1 transaction.
+
+After the Workers/schema are first deployed, run a normal `python sync.py
+--env <environment>`. If the catalogue is already current, that run installs the
+initial immutable baseline without rewriting vocabulary rows. Older app cursors
+recover once through the manifest and all later bounded updates use `/changes`.
 
 ### Step 1 — Read and validate Excel
 

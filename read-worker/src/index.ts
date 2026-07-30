@@ -17,7 +17,8 @@ import {
 } from "./entitlement";
 import {
   getVersion, getManifest, getRows, buildSnapshotNdjson, isTable, ROWS_CAP, searchWord,
-  getAliases,
+  getAliases, getVersionView, getChangeFeed, getVersionedRows,
+  getBlockSnapshotManifest, getBlockSnapshotPayload,
 } from "./data";
 import {
   loadManifest, scopedManifest, allowedPacks, normalizePackName, getPackObject,
@@ -25,6 +26,7 @@ import {
 } from "./audio";
 import { sha256, utf8 } from "./bytes";
 import { handleAdminBroadcast, handleAdminCanary, handleMessagesManifest, processScheduledSends } from "./messages";
+import { mintSnapshotGrant, verifySnapshotGrant } from "./snapshot-grant";
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -432,25 +434,64 @@ async function requireFreshAssertion(
   await advanceSignCount(env, deviceId, result.newSignCount);
 }
 
-async function handleVersion(env: Env, scope: Scope): Promise<Response> {
-  const version = await getVersion(env, scope);
+async function handleVersion(env: Env, request: Request, scope: Scope): Promise<Response> {
+  const chain = resolveChain(new URL(request.url).searchParams.get("lang"));
+  const view = await getVersionView(env, scope, chain);
+  const version = view?.version ?? await getVersion(env, scope);
   // minClient: the forward-compat floor (MS2-FR-23). Clients compare it to their
   // own content-schema generation and show a friendly update prompt when behind.
   const minClient = parseInt(env.MIN_CLIENT_GENERATION ?? "1", 10) || 1;
-  return json({ version, minClient }, 200, {
-    ETag: `"${version}:${minClient}"`,
+  return json({
+    version,
+    minClient,
+    ...(view ? {
+      dataset_generation: view.datasetGeneration,
+      sequence: view.sequence,
+      fingerprint: view.fingerprint,
+      counts: view.counts,
+    } : {}),
+  }, 200, {
+    ETag: `"${version}:${chainKey(chain)}:${minClient}"`,
     "Cache-Control": "public, max-age=30",
   });
+}
+
+async function handleChanges(
+  env: Env, request: Request, ctx: ExecutionContext, scope: Scope
+): Promise<Response> {
+  const url = new URL(request.url);
+  const from = url.searchParams.get("from")?.trim() ?? "";
+  if (!from || from.length > 160) throw new HttpError(400, "invalid from version");
+  const chain = resolveChain(url.searchParams.get("lang"));
+  const key = chainKey(chain);
+  const current = await getVersionView(env, scope, chain);
+  if (!current) throw new HttpError(404, "change feed not available");
+  const result = await getChangeFeed(env, from, scope, chain);
+  if (result.kind === "unavailable") {
+    throw new HttpError(result.status, result.reason);
+  }
+  return serveCachedByVersion(
+    request,
+    ctx,
+    `${current.version}:${key}`,
+    `changes:${scope}:${key}:${from}`,
+    300,
+    async () => ({
+      body: JSON.stringify(result.feed),
+      contentType: "application/json",
+    }),
+  );
 }
 
 async function handleManifest(
   env: Env, request: Request, ctx: ExecutionContext, scope: Scope
 ): Promise<Response> {
-  const version = await getVersion(env, scope);
   // The manifest is language-resolved (composite hashes, LG-FR-13): the chain is
   // part of the cached body's identity AND its ETag — two languages must never
   // share a 304 or a cached entry.
   const chain = resolveChain(new URL(request.url).searchParams.get("lang"));
+  const version = (await getVersionView(env, scope, chain))?.version
+    ?? await getVersion(env, scope);
   const key = chainKey(chain);
   return serveCachedByVersion(request, ctx, `${version}:${key}`, `manifest:${scope}:${key}`, 300, async () => ({
     body: JSON.stringify({ version, manifest: await getManifest(env, scope, chain) }),
@@ -468,21 +509,34 @@ async function handleRows(
   if (ids.length === 0) throw new HttpError(400, "no ids");
   if (ids.length > ROWS_CAP) throw new HttpError(400, `too many ids (max ${ROWS_CAP})`);
 
-  const version = await getVersion(env, scope);
   const chain = resolveChain(url.searchParams.get("lang"));
+  const version = (await getVersionView(env, scope, chain))?.version
+    ?? await getVersion(env, scope);
   const key = chainKey(chain);
-  const tag = `rows:${scope}:${key}:${table}:${ids.slice().sort().join(",")}`;
-  return serveCachedByVersion(request, ctx, `${version}:${key}`, tag, 300, async () => ({
-    body: JSON.stringify({ version, table, rows: await getRows(env, table, ids, scope, chain) }),
-    contentType: "application/json",
-  }));
+  const expectedVersion = url.searchParams.get("version")?.trim() || null;
+  if (expectedVersion && expectedVersion.length > 160) {
+    throw new HttpError(400, "invalid target version");
+  }
+  const responseVersion = expectedVersion ?? version;
+  const tag = `rows:${scope}:${key}:${responseVersion}:${table}:${ids.slice().sort().join(",")}`;
+  return serveCachedByVersion(request, ctx, `${responseVersion}:${key}`, tag, 300, async () => {
+    const rows = expectedVersion
+      ? await getVersionedRows(env, table, ids, scope, chain, expectedVersion)
+      : await getRows(env, table, ids, scope, chain);
+    if (!rows) throw new HttpError(409, "target version rows unavailable");
+    return {
+      body: JSON.stringify({ version: responseVersion, table, rows }),
+      contentType: "application/json",
+    };
+  });
 }
 
 async function handleSnapshot(
   env: Env, request: Request, ctx: ExecutionContext, scope: Scope
 ): Promise<Response> {
-  const version = await getVersion(env, scope);
   const chain = resolveChain(new URL(request.url).searchParams.get("lang"));
+  const version = (await getVersionView(env, scope, chain))?.version
+    ?? await getVersion(env, scope);
   const key = chainKey(chain);
   return serveCachedByVersion(request, ctx, `${version}:${key}`, `snapshot:${scope}:${key}`, 86400, async () => ({
     body: await buildSnapshotNdjson(env, scope, chain),
@@ -493,6 +547,76 @@ async function handleSnapshot(
     // double-gzip incident, see cache.ts).
     contentType: "text/plain; charset=utf-8",
   }));
+}
+
+async function handleBlockSnapshotManifest(
+  env: Env, request: Request, claims: SessionClaims
+): Promise<Response> {
+  const url = new URL(request.url);
+  const chain = resolveChain(url.searchParams.get("lang"));
+  const snapshotID = url.searchParams.get("snapshot")?.trim();
+  if (snapshotID !== undefined && !/^[0-9a-f]{64}$/.test(snapshotID)) {
+    throw new HttpError(400, "invalid snapshot id");
+  }
+  const scope = scopeOf(claims);
+  const manifest = await getBlockSnapshotManifest(
+    env, scope, chain, snapshotID);
+  if (!manifest) throw new HttpError(404, "block snapshot unavailable");
+  const downloadGrant = await mintSnapshotGrant(
+    env.SESSION_JWT_SECRET,
+    claims,
+    manifest.snapshot_id,
+    manifest.language,
+    nowSeconds(),
+  );
+  // The manifest itself is immutable and cheap; the attached grant is
+  // subject-bound and therefore must never enter the shared edge cache.
+  return json(
+    { ...manifest, download_grant: downloadGrant },
+    200,
+    { "Cache-Control": "private, no-store" },
+  );
+}
+
+async function handleBlockSnapshotPayload(
+  env: Env, request: Request, claims: SessionClaims, blockID: string
+): Promise<Response> {
+  const url = new URL(request.url);
+  const snapshotID = url.searchParams.get("snapshot")?.trim() ?? "";
+  if (!/^[0-9a-f]{64}$/.test(snapshotID) || !/^[0-9a-f]{64}$/.test(blockID)) {
+    throw new HttpError(400, "invalid snapshot or block id");
+  }
+  const chain = resolveChain(url.searchParams.get("lang"));
+  const language = chain[0];
+  const grant = request.headers.get("X-Snapshot-Grant") ?? "";
+  const secrets = [env.SESSION_JWT_SECRET, env.SESSION_JWT_SECRET_PREVIOUS]
+    .filter((value): value is string => !!value);
+  if (!await verifySnapshotGrant(
+    secrets, grant, claims, snapshotID, language, nowSeconds())) {
+    throw new HttpError(401, "invalid or expired snapshot grant");
+  }
+  const scope = scopeOf(claims);
+  const block = await getBlockSnapshotPayload(env, snapshotID, blockID, scope, chain);
+  if (!block) throw new HttpError(404, "snapshot block unavailable");
+  const requestedChecksum = url.searchParams.get("checksum")?.trim();
+  if (requestedChecksum && requestedChecksum !== block.metadata.checksum) {
+    throw new HttpError(409, "snapshot block checksum mismatch");
+  }
+  const etag = `"${block.metadata.checksum}"`;
+  if (request.headers.get("If-None-Match") === etag) {
+    return new Response(null, { status: 304, headers: { ETag: etag } });
+  }
+  return new Response(block.payload, {
+    headers: {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": String(block.payload.byteLength),
+      "Cache-Control": "public, max-age=31536000, immutable",
+      "ETag": etag,
+      "X-Snapshot-ID": snapshotID,
+      "X-Block-ID": block.metadata.id,
+      "X-Block-Checksum": block.metadata.checksum,
+    },
+  });
 }
 
 // ---- Search & submissions ---------------------------------------------------
@@ -1126,7 +1250,11 @@ export default {
 
       if (request.method === "GET" && route === "version") {
         const claims = await requireSession(env, request);
-        return await handleVersion(env, scopeOf(claims));
+        return await handleVersion(env, request, scopeOf(claims));
+      }
+      if (request.method === "GET" && route === "changes") {
+        const claims = await requireSession(env, request);
+        return await handleChanges(env, request, ctx, scopeOf(claims));
       }
       if (request.method === "GET" && route === "manifest") {
         const claims = await requireSession(env, request);
@@ -1141,10 +1269,22 @@ export default {
         await requireFreshAssertion(env, request, claims);
         return await handleSnapshot(env, request, ctx, scopeOf(claims));
       }
+      if (request.method === "GET" && route === "snapshot-manifest") {
+        const claims = await requireSession(env, request);
+        await requireFreshAssertion(env, request, claims);
+        return await handleBlockSnapshotManifest(env, request, claims);
+      }
+      if (request.method === "GET" && route === "snapshot-block" && sub) {
+        const claims = await requireSession(env, request);
+        return await handleBlockSnapshotPayload(env, request, claims, sub);
+      }
       // Identity re-key map (WD-ID-4/5): id_aliases as one cached JSON body.
       if (request.method === "GET" && route === "aliases") {
         const claims = await requireSession(env, request);
-        const version = await getVersion(env, scopeOf(claims));
+        const scope = scopeOf(claims);
+        const chain = resolveChain(url.searchParams.get("lang"));
+        const version = (await getVersionView(env, scope, chain))?.version
+          ?? await getVersion(env, scope);
         return await serveCachedByVersion(request, ctx, `${version}:aliases`, "aliases", 3600, async () => ({
           body: JSON.stringify({ version, aliases: await getAliases(env) }),
           contentType: "application/json",

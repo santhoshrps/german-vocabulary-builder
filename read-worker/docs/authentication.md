@@ -14,7 +14,9 @@ POST /v1/devices/register ─ App Attest attestation ──▶ store device publ
 POST /v1/session ────────── assertion + entitlement ─▶ session JWT { scope }
                                                           │
 GET  /v1/version|manifest|rows  ── Bearer JWT ───────────┘
-GET  /v1/snapshot               ── Bearer JWT + fresh assertion
+GET  /v1/snapshot-manifest      ── Bearer JWT + one fresh assertion
+GET  /v1/snapshot-block/:id     ── Bearer JWT + signed snapshot grant
+GET  /v1/snapshot               ── Bearer JWT + fresh assertion (legacy)
 ```
 
 ---
@@ -42,7 +44,8 @@ worker verifies, in order:
 The device's public key + initial counter are stored in the `devices` table. The
 `device_id` is the base64url key id.
 
-### Assertion (per protected action) — used by `/v1/session` and `/v1/snapshot`
+### Assertion (per protected action) — used by `/v1/session`,
+`/v1/snapshot-manifest` and legacy `/v1/snapshot`
 The app signs a fresh challenge with its stored key. The worker verifies:
 
 1. The ECDSA signature over `SHA256(authenticatorData ‖ SHA256(challenge))` against the
@@ -114,11 +117,11 @@ signature and expiry, then `scopeOf` maps an unknown/missing scope to `free`
 
 ---
 
-## 4. Per-request assertion on `/v1/snapshot`
+## 4. Bulk-download assertion and snapshot grants
 
 The full-dataset download is the one thing worth stealing, so a session JWT alone is **not
 enough** for device sessions. `requireFreshAssertion` ([`src/index.ts`](../src/index.ts))
-requires, on **every** snapshot request:
+requires, on every **legacy** `/v1/snapshot` request:
 
 | Header | Value |
 |--------|-------|
@@ -131,6 +134,14 @@ checks the counter — so the bulk export can't be pulled with a stolen token. T
 **body is still served from the version cache**; only the access check runs per request.
 
 **Promo sessions are exempt** (no device key) — they get the snapshot with the JWT alone.
+
+The preferred block installer applies the same fresh-assertion gate once at
+`/v1/snapshot-manifest`. The response's short-lived HMAC grant is bound to the
+session subject, scope, language and exact immutable snapshot. Block requests
+must provide it in `X-Snapshot-Grant`; a token stolen without the hardware proof
+cannot mint a grant, while the legitimate client avoids dozens of App Attest
+operations. A resumed installation obtains a new grant for the exact retained
+snapshot ID.
 That is the deliberate trade for keeping promo usable as an operator/test credential.
 
 ---
@@ -144,6 +155,6 @@ That is the deliberate trade for keeping promo usable as an operator/test creden
 | Cloned device key | Strictly increasing assertion counter |
 | Forged purchase | StoreKit JWS verified + pinned to Apple Root CA – G3 |
 | Forged session token | HS256 signature over `SESSION_JWT_SECRET` |
-| Stolen session token | Short TTL; **full snapshot additionally needs a fresh assertion** |
+| Stolen session token | Short TTL; **bulk access additionally needs a fresh assertion-derived snapshot grant** |
 | Free user reaching paid rows | Server-side `scope` filter on every query (`free = 1`) |
 | Auth endpoint abuse | Per-IP rate limiting on `challenge`/`session`/`devices` |

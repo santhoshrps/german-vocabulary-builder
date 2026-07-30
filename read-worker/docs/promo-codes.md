@@ -72,7 +72,8 @@ carries a `scope` claim, and returns:
 { "token": "<jwt>", "expiresIn": 3600, "entitlement": "promo", "scope": "full" }
 ```
 
-Every data endpoint (`/v1/version`, `/v1/manifest`, `/v1/rows`, `/v1/snapshot`)
+Every data endpoint (`/v1/version`, `/v1/changes`, `/v1/manifest`, `/v1/rows`,
+`/v1/snapshot-manifest`, `/v1/snapshot-block`, legacy `/v1/snapshot`)
 reads the scope from the JWT and filters its D1 queries accordingly
 ([`src/data.ts`](../src/data.ts)): `free` sessions add `WHERE free = 1`, `full`
 sessions see everything.
@@ -94,7 +95,7 @@ check fails, and it re-syncs to pick up the rest of the dataset automatically.
 │         │                                    │              │
 │         │   GET /v1/version  (Bearer token)  │ scope from   │
 │         │ ────────────────────────────────► │   JWT claim  │
-│         │   GET /v1/manifest / rows / snapshot               │
+│         │   GET /v1/manifest / rows / snapshot blocks        │
 │         │ ◄──────────────────────────────────│ filtered by  │──► D1 verbs/nouns/…
 │         │   only in-scope rows               │ WHERE free=1 │    (free flag)
 └─────────┘                                    └──────────────┘

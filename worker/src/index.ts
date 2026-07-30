@@ -1,3 +1,17 @@
+import {
+  ALLOWED_TABLES,
+  TABLE_COLUMNS,
+  PhysicalTable,
+} from "./content-tables";
+import {
+  handlePublicationAudit,
+  handlePublicationBaseline,
+  handlePublicationCommit,
+  handlePublicationState,
+  handleSnapshotActivation,
+} from "./publication";
+import { handleSnapshotBlockUpload } from "./snapshot-publication";
+
 interface Env {
   // The CONTENT database for this environment (MS2-FR-29): the write worker is the
   // publish pipeline's single write path into content. It binds NO ops database —
@@ -8,40 +22,8 @@ interface Env {
   DEPLOY_VERSION?: string; // git SHA injected by scripts/deploy.sh
 }
 
-const ALLOWED_TABLES = new Set([
-  "verbs", "nouns", "adverbs_adjectives", "translations", "id_aliases",
-]);
-
 // Max ids per DELETE statement — keeps bound parameters well under SQLite/D1 limits
 const DELETE_CHUNK_SIZE = 100;
-
-// Fixed column order per table — drives parameterised INSERT, never sourced from user
-// input. SCHEMA v2 (WD-ID/LG-FR-9): core tables carry German + sense only; source-
-// language text lives in `translations`; `id_aliases` maps v1 ids to v2. Deploying
-// this against a v1 database is safe by construction: any sync against it fails on
-// the schema mismatch, which is exactly the freeze the blue/green cutover wants.
-const TABLE_COLUMNS: Record<string, string[]> = {
-  verbs: [
-    "id", "content_hash", "free", "level", "capital", "type", "word", "sense",
-    "german_sentence", "ich", "du", "er_sie_es",
-    "wir", "ihr", "sie_sie", "past_participle", "simple_past",
-  ],
-  nouns: [
-    "id", "content_hash", "free", "level", "capital", "type", "article", "word",
-    "plural", "sense", "image", "german_sentence",
-  ],
-  adverbs_adjectives: [
-    "id", "content_hash", "free", "level", "capital", "type", "word", "sense",
-    "german_sentence", "comparative", "superlative",
-  ],
-  translations: [
-    "id", "content_hash", "word_id", "lang", "word", "sentence",
-    "article", "article_plural", "plural",
-  ],
-  id_aliases: [
-    "id", "content_hash", "new_id", "reason",
-  ],
-};
 
 function hexToBytes(hex: string): Uint8Array {
   if (hex.length % 2 !== 0) return new Uint8Array(0);
@@ -177,7 +159,7 @@ async function handlePostSync(
     return json({ error: "every delete entry must be a string" }, 400);
   }
 
-  const columns = TABLE_COLUMNS[table];
+  const columns = TABLE_COLUMNS[table as PhysicalTable];
   const placeholders = columns.map(() => "?").join(", ");
   const updateSet = columns
     .filter((c) => c !== "id")
@@ -250,6 +232,30 @@ export default {
     const parts = url.pathname.split("/").filter(Boolean);
     const [route, table] = parts;
 
+    // Immutable vocabulary publication protocol. The same HMAC gate as the
+    // legacy writer protects these operator-only endpoints.
+    if (request.method === "GET" && route === "publication" && table === "state") {
+      return handlePublicationState(env);
+    }
+    if (request.method === "GET" && route === "publication" && table === "audit") {
+      return handlePublicationAudit(env);
+    }
+    if (request.method === "POST" && route === "publication" && table === "commit") {
+      return handlePublicationCommit(env, request);
+    }
+    if (request.method === "POST" && route === "publication" && table === "baseline") {
+      return handlePublicationBaseline(env, request);
+    }
+    if (request.method === "POST"
+        && route === "publication"
+        && table === "snapshot-block") {
+      return handleSnapshotBlockUpload(env, request);
+    }
+    if (request.method === "POST"
+        && route === "publication"
+        && table === "snapshot-activate") {
+      return handleSnapshotActivation(env, request);
+    }
     if (request.method === "GET" && route === "state" && table) {
       return handleGetState(table, env);
     }

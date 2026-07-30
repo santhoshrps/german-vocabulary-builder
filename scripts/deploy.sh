@@ -90,10 +90,10 @@ deploy_and_verify() { # dir, env
     echo "❌ could not find deployed URL in wrangler output" >&2; echo "$out" >&2; return 1
   fi
   # Wire-verify: status + env + version must all match THIS deploy. Edge propagation
-  # takes a few seconds, so poll (up to ~30s) until the deployed version answers —
+  # can take more than 30 seconds, so poll (up to ~90s) until the deployed version answers —
   # then assert strictly. A mismatch after the window is a real failure.
   local health ok=""
-  for _ in 1 2 3 4 5 6; do
+  for _ in {1..18}; do
     health=$(curl -fsS --max-time 15 "$url/health" || true)
     if echo "$health" | python3 -c "
 import sys, json
@@ -119,6 +119,19 @@ print(f'✅ {env} verified at ' + '$url' + f' — version {sha}{extra}')
 "
 }
 
+apply_content_schema() { # env
+  local env="$1"
+  local database
+  if [[ "$env" == "prod" ]]; then
+    database="german-content-prod"
+  else
+    database="german-content-dev"
+  fi
+  echo "── applying idempotent vocabulary change-feed schema → $env"
+  (cd worker && npx wrangler d1 execute "$database" --remote \
+    --file=../schema/content_change_feed.sql $(env_flag "$env"))
+}
+
 do_env() {
   local env="$1"
   if [[ "$env" == "prod" ]]; then
@@ -134,6 +147,9 @@ do_env() {
   fi
   WARN_NAMES=(); check_parity worker "$env" "${write_required[@]}"
   WARN_NAMES=(); check_parity leaderboard-worker "$env" "${lb_required[@]}"
+  # Schema lands before either Worker can expose/use the new contract. The SQL is
+  # additive and idempotent; production is already behind the typed gate above.
+  apply_content_schema "$env"
   deploy_and_verify read-worker "$env"
   deploy_and_verify worker "$env"
   deploy_and_verify leaderboard-worker "$env"
