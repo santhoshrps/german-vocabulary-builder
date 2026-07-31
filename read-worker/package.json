@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "test:certs": "node test/cert-policy.test.mjs",
     "test:entitlement": "node --test test/entitlement-environment.test.mjs",
+    "test:ops-migration": "node --test test/ops-migration.test.mjs",
     "test:change-feed": "node --test test/change-feed.test.mjs",
     "test:snapshot-grant": "node --test test/snapshot-grant.test.mjs"
   },

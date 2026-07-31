@@ -36,6 +36,7 @@ database_id = "79a2229f-0615-4203-8f82-d271a391b1d5"
 binding = "OPS_DB"
 database_name = "german-ops-prod"
 database_id = "e9a72e23-d8dd-4b3b-b550-4940728b15fc"
+migrations_dir = "migrations/ops"
 
 [[r2_buckets]]
 binding = "MEDIA"
@@ -110,6 +111,7 @@ database_id = "8cc25e6f-df57-4704-892c-fdc78ebc246d"
 binding = "OPS_DB"
 database_name = "german-ops-dev"
 database_id = "ef5fc11a-a46e-415d-8b3a-99d670cea562"
+migrations_dir = "migrations/ops"
 
 [[env.dev.r2_buckets]]
 binding = "MEDIA"
@@ -135,6 +137,10 @@ MIN_CLIENT_GENERATION = "1"
 APP_ATTEST_ENV = "development"
 # Local Xcode StoreKit testing: trust locally-signed transactions (dev origin only).
 STOREKIT_ENV = "xcode"
+# Dev deliberately accepts all three known lanes; unlike production, Xcode is
+# expected here. Declaring it explicitly avoids named-environment inheritance
+# ambiguity and makes /health report the effective policy.
+STOREKIT_ACCEPTED_ENVIRONMENTS = "Production,Sandbox,Xcode"
 R2_ACCOUNT_ID = "50163e5bf5ee8a574fb5e2dd442e38ed"
 # Presign secrets for THIS bucket: the german-media-dev-read token pair
 # (wrangler secret put R2_ACCESS_KEY_ID/R2_SECRET_ACCESS_KEY --env dev).

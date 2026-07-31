@@ -9,17 +9,20 @@
 #   1. secret PARITY gate  — required secret NAMES must exist (wrangler secret list);
 #                            a missing name aborts BEFORE deploy (the prod-missing-
 #                            R2-secrets class of incident dies here, not as a 503).
-#   2. deploy              — with DEPLOY_VERSION=<git sha> injected as a var.
-#   3. wire-verify         — curl /health and assert status+env+version match what
-#                            was just deployed. A verify that hits the wrong world
-#                            or stale code FAILS the deploy.
+#   2. schema              — apply versioned OPS migrations, then idempotent OPS/content
+#                            schemas before code can depend on them.
+#   3. deploy              — with DEPLOY_VERSION=<git sha> injected as a var.
+#   4. wire-verify         — curl /health and assert status+env+version + bounded
+#                            runtime schema readiness match what was just deployed.
+#                            A verify that hits the wrong world or stale code FAILS
+#                            the deploy.
 # Production additionally requires typing 'prod' (skipped for dev).
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 GIT_SHA=$(git rev-parse --short HEAD)
-if [[ -n "$(git status --porcelain -- read-worker/src worker/src leaderboard-worker/src 2>/dev/null)" ]]; then
+if [[ -n "$(git status --porcelain -- read-worker worker leaderboard-worker schema scripts 2>/dev/null)" ]]; then
   echo "⚠️  worker sources have uncommitted changes — deploying tree state as ${GIT_SHA}-dirty" >&2
   GIT_SHA="${GIT_SHA}-dirty"
 fi
@@ -129,7 +132,25 @@ apply_content_schema() { # env
   fi
   echo "── applying idempotent vocabulary change-feed schema → $env"
   (cd worker && npx wrangler d1 execute "$database" --remote \
-    --file=../schema/content_change_feed.sql $(env_flag "$env"))
+    --yes --file=../schema/content_change_feed.sql $(env_flag "$env"))
+}
+
+apply_operational_schema() { # env
+  local env="$1"
+  local database
+  if [[ "$env" == "prod" ]]; then
+    database="german-ops-prod"
+  else
+    database="german-ops-dev"
+  fi
+  echo "── applying versioned operational migrations → $env"
+  # Wrangler skips confirmation in CI mode but still captures its automatic D1
+  # backup. Each migration is transactional and recorded in d1_migrations.
+  (cd read-worker && CI=true npx wrangler d1 migrations apply "$database" \
+    --remote $(env_flag "$env"))
+  echo "── reconciling canonical operational schema → $env"
+  (cd read-worker && npx wrangler d1 execute "$database" --remote --yes \
+    --file=../schema/ops.sql $(env_flag "$env"))
 }
 
 do_env() {
@@ -147,8 +168,10 @@ do_env() {
   fi
   WARN_NAMES=(); check_parity worker "$env" "${write_required[@]}"
   WARN_NAMES=(); check_parity leaderboard-worker "$env" "${lb_required[@]}"
-  # Schema lands before either Worker can expose/use the new contract. The SQL is
-  # additive and idempotent; production is already behind the typed gate above.
+  # Operational migrations land before the read worker can expose/use their
+  # contract. The canonical schemas then make a fresh database complete while
+  # remaining no-ops for existing objects.
+  apply_operational_schema "$env"
   apply_content_schema "$env"
   deploy_and_verify read-worker "$env"
   deploy_and_verify worker "$env"

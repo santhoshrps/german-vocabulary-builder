@@ -27,7 +27,7 @@ test.before(async () => {
         export { validateTransactionClaims } from ${JSON.stringify(resolve("src/entitlement.ts"))};
         export { signSession, verifySession, issuerFor } from ${JSON.stringify(resolve("src/jwt.ts"))};
         export { mintSnapshotGrant, verifySnapshotGrant } from ${JSON.stringify(resolve("src/snapshot-grant.ts"))};
-        export { healthReport } from ${JSON.stringify(resolve("src/health.ts"))};
+        export { healthReport, REQUIRED_OPS_SCHEMA } from ${JSON.stringify(resolve("src/health.ts"))};
       `,
       resolveDir: process.cwd(),
       sourcefile: "storekit-environment-harness.ts",
@@ -49,7 +49,7 @@ test.after(() => {
 function env(overrides = {}) {
   return {
     CONTENT_DB: {},
-    OPS_DB: {},
+    OPS_DB: operationalDatabase(),
     ENV_NAME: "prod",
     APP_TEAM_ID: "TEAM",
     APP_BUNDLE_ID: "com.example.words",
@@ -62,6 +62,28 @@ function env(overrides = {}) {
     APPLE_APPATTEST_ROOT_CA: "root",
     APPLE_STOREKIT_ROOT_CA: "root",
     ...overrides,
+  };
+}
+
+function operationalDatabase({ omitTable, omitColumn, fails = false } = {}) {
+  const results = [];
+  for (const [table, requiredColumns] of Object.entries(contract.REQUIRED_OPS_SCHEMA)) {
+    if (table === omitTable) continue;
+    for (const column of new Set(["id", ...requiredColumns])) {
+      if (`${table}.${column}` !== omitColumn) {
+        results.push({ table_name: table, column_name: column });
+      }
+    }
+  }
+  return {
+    prepare() {
+      return {
+        async all() {
+          if (fails) throw new Error("schema unavailable");
+          return { results };
+        },
+      };
+    },
   };
 }
 
@@ -137,13 +159,14 @@ test("record keys preserve legacy Production identity and namespace test records
   assert.equal(contract.storeKitSubject("Sandbox", "123"), "storekit:sandbox:123");
 });
 
-test("health gate makes loss or weakening of TestFlight policy deploy-blocking", () => {
-  const healthy = contract.healthReport(env());
+test("health gate makes StoreKit policy and operational schema drift deploy-blocking", async () => {
+  const healthy = await contract.healthReport(env());
   assert.equal(healthy.status, "ok");
   assert.deepEqual(healthy.storeKitEnvironments, ["Production", "Sandbox"]);
+  assert.deepEqual(healthy.opsSchemaMissing, []);
 
   for (const policy of [undefined, "Production", "Production,Sandbox,Xcode", "Sandbox"]) {
-    const report = contract.healthReport(env({
+    const report = await contract.healthReport(env({
       STOREKIT_ACCEPTED_ENVIRONMENTS: policy,
     }));
     assert.equal(report.status, "misconfigured", String(policy));
@@ -151,6 +174,26 @@ test("health gate makes loss or weakening of TestFlight policy deploy-blocking",
       "STOREKIT_ACCEPTED_ENVIRONMENTS(Production,Sandbox)",
     ));
   }
+
+  const missingTable = await contract.healthReport(env({
+    OPS_DB: operationalDatabase({ omitTable: "transaction_revocations" }),
+  }));
+  assert.equal(missingTable.status, "misconfigured");
+  assert.deepEqual(missingTable.opsSchemaMissing, ["table:transaction_revocations"]);
+  assert.ok(missingTable.missing.includes("OPS_DB.table:transaction_revocations"));
+
+  const missingColumn = await contract.healthReport(env({
+    OPS_DB: operationalDatabase({ omitColumn: "pending_sends.envelope" }),
+  }));
+  assert.equal(missingColumn.status, "misconfigured");
+  assert.deepEqual(missingColumn.opsSchemaMissing, ["column:pending_sends.envelope"]);
+  assert.ok(missingColumn.missing.includes("OPS_DB.column:pending_sends.envelope"));
+
+  const unavailable = await contract.healthReport(env({
+    OPS_DB: operationalDatabase({ fails: true }),
+  }));
+  assert.equal(unavailable.status, "misconfigured");
+  assert.deepEqual(unavailable.opsSchemaMissing, ["schema-query"]);
 });
 
 test("session JWT preserves the verified lane and rejects invented lane claims", async () => {

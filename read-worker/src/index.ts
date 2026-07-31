@@ -1244,13 +1244,11 @@ export default {
     const [version, route, sub] = parts;
 
     try {
-      // Unauthenticated liveness probe (project rule: every service exposes /health).
-      // Deliberately static — it touches no D1/R2, so it can't amplify load, and it lets
-      // monitors distinguish "worker down" from "route missing". Reports environment
-      // identity, deployed version, and a names-only config self-check (MS2-FR-30b/30c);
-      // scripts/deploy.sh asserts all three after every deploy.
+      // Unauthenticated health/readiness probe (project rule: every service exposes
+      // /health). It includes one cached, bounded sqlite-metadata check—never operational
+      // rows—so deployment cannot report healthy while runtime tables/columns are absent.
       if (request.method === "GET" && url.pathname === "/health") {
-        return json(healthReport(env));
+        return json(await healthReport(env));
       }
 
       if (version !== "v1") return json({ error: "not found" }, 404);

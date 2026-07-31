@@ -58,10 +58,16 @@ CREATE TABLE IF NOT EXISTS feedback (
   cefr_level  TEXT NOT NULL,                          -- e.g. 'A1.1'
   locale      TEXT NOT NULL,                          -- e.g. 'en_DE'
   status      TEXT NOT NULL DEFAULT 'new',            -- 'new' | 'read'
-  created_at  TEXT NOT NULL DEFAULT (datetime('now')) -- UTC
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),-- UTC
+  kind        TEXT NOT NULL DEFAULT 'review',
+  contact_email       TEXT,
+  contact_expires_at  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_feedback_status ON feedback (status, created_at);
+CREATE INDEX IF NOT EXISTS idx_feedback_kind ON feedback (kind, status, created_at);
+CREATE INDEX IF NOT EXISTS idx_feedback_contact_expiry
+  ON feedback (contact_expires_at) WHERE contact_email IS NOT NULL;
 
 -- Content reports (words.md WD-REP-5): a learner flagged a clip/picture/card at the
 -- moment they met it. Stored pending for MANUAL curator review — never auto-acted-on;
@@ -116,6 +122,15 @@ CREATE TABLE IF NOT EXISTS transaction_devices (
   PRIMARY KEY (original_transaction_id, device_id)
 );
 
+-- Refund/revocation state per environment-qualified StoreKit purchase. This is
+-- consulted during every StoreKit session mint, so it belongs in the canonical
+-- split OPS schema—not only the retired single-database compatibility schema.
+CREATE TABLE IF NOT EXISTS transaction_revocations (
+  original_transaction_id TEXT PRIMARY KEY,
+  reason                  TEXT NOT NULL,
+  recorded_at             TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Devices bound to a FULL-tier promo code (UA-FR-4b personal codes; PROMO_DEVICE_CAP).
 CREATE TABLE IF NOT EXISTS promo_claims (
   code_hash  TEXT NOT NULL,                            -- promo_codes.code_hash
@@ -145,6 +160,8 @@ CREATE TABLE IF NOT EXISTS broadcast_audit (
   outcome    TEXT NOT NULL,                           -- dry_run | refused_cap | refused_confirm | sent | fcm_error
   detail     TEXT,                                    -- bounded operator note / FCM status
   actor      TEXT NOT NULL,                           -- token fingerprint prefix, never the token
+  descriptor_hash TEXT,
+  envelope_hash   TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -174,12 +191,3 @@ CREATE TABLE IF NOT EXISTS pending_sends (
 );
 
 CREATE INDEX IF NOT EXISTS idx_pending_sends_due ON pending_sends (status, send_at);
-
--- Audit hash columns (AN-FR-PUSH-20): descriptor + final-envelope hashes ride
--- every send-path row. (ALTER for existing databases.)
--- ALTER TABLE broadcast_audit ADD COLUMN descriptor_hash TEXT;
--- ALTER TABLE broadcast_audit ADD COLUMN envelope_hash TEXT;
-
--- PM-SPEC-011 (owner 2026-07-24): stable retry envelope for scheduled sends.
--- (ALTER for existing databases.)
--- ALTER TABLE pending_sends ADD COLUMN envelope TEXT;
