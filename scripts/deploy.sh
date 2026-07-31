@@ -1,8 +1,11 @@
 #!/bin/bash
 # deploy.sh — the ONLY way workers reach any environment (MS2-FR-30b/30c).
 #
-#   scripts/deploy.sh <dev|prod>          deploy BOTH workers to one environment
-#   scripts/deploy.sh all                 dev → prod, verifying each step
+#   scripts/deploy.sh <dev|prod>          deploy all workers to one environment
+#   scripts/deploy.sh all                 all workers: dev → prod
+#   scripts/deploy.sh leaderboard-<dev|prod>
+#                                         deploy only the leaderboard worker
+#   scripts/deploy.sh leaderboard-all     leaderboard worker: dev → prod
 #   (the standing test environment was retired 2026-07-25 — MS2-FR-32 revised)
 #
 # Per environment, in order:
@@ -22,7 +25,8 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 GIT_SHA=$(git rev-parse --short HEAD)
-if [[ -n "$(git status --porcelain -- read-worker worker leaderboard-worker schema scripts 2>/dev/null)" ]]; then
+if [[ "${1:-}" != "check-queue-config" ]] && \
+   [[ -n "$(git status --porcelain -- read-worker worker leaderboard-worker schema scripts 2>/dev/null)" ]]; then
   echo "⚠️  worker sources have uncommitted changes — deploying tree state as ${GIT_SHA}-dirty" >&2
   GIT_SHA="${GIT_SHA}-dirty"
 fi
@@ -79,6 +83,78 @@ check_parity() { # dir, env, required...
     fi
   done
   return 0
+}
+
+verify_leaderboard_queue_config() { # env — static names/settings, no credentials
+  local env="$1"
+  python3 - "$env" <<'PY'
+import pathlib, re, sys
+env = sys.argv[1]
+text = pathlib.Path("leaderboard-worker/wrangler.toml").read_text()
+dev_marker = "[[env.dev.d1_databases]]"
+selected = text[:text.index(dev_marker)] if env == "prod" else text[text.index(dev_marker):]
+primary = f"german-social-outbox-{env}"
+dlq = f"german-social-outbox-dlq-{env}"
+
+prefix = "" if env == "prod" else r"env\.dev\."
+def blocks(kind):
+    pattern = rf"\[\[{prefix}queues\.{kind}\]\](.*?)(?=\n\[\[?|\Z)"
+    return re.findall(pattern, selected, flags=re.S)
+def string(block, key):
+    match = re.search(rf"(?m)^{re.escape(key)}\s*=\s*\"([^\"]+)\"\s*$", block)
+    return match.group(1) if match else None
+def integer(block, key):
+    match = re.search(rf"(?m)^{re.escape(key)}\s*=\s*(\d+)\s*$", block)
+    return int(match.group(1)) if match else None
+
+producers = [p for p in blocks("producers") if string(p, "binding") == "SOCIAL_OUTBOX"]
+consumers = [c for c in blocks("consumers") if string(c, "queue") == primary]
+problems = []
+if len(producers) != 1 or string(producers[0], "queue") != primary:
+    problems.append(f"SOCIAL_OUTBOX producer != {primary}")
+if len(consumers) != 1:
+    problems.append(f"consumer != {primary}")
+else:
+    expected = {
+        "dead_letter_queue": dlq,
+        "max_batch_size": 5,
+        "max_batch_timeout": 2,
+        "max_retries": 5,
+        "retry_delay": 60,
+        "max_concurrency": 2,
+    }
+    for key, value in expected.items():
+        actual = string(consumers[0], key) if isinstance(value, str) else integer(consumers[0], key)
+        if actual != value:
+            problems.append(f"{key}={actual!r}, expected {value!r}")
+queue_var = re.search(r'(?m)^SOCIAL_OUTBOX_QUEUE\s*=\s*"([^"]+)"\s*$', selected)
+if not queue_var or queue_var.group(1) != primary:
+    problems.append("SOCIAL_OUTBOX_QUEUE var mismatch")
+if problems:
+    print(f"❌ leaderboard-worker [{env}] Queue config: " + "; ".join(problems))
+    raise SystemExit(1)
+print(f"✅ leaderboard-worker [{env}] Queue config: {primary} → {dlq}")
+PY
+}
+
+check_queue_resources() { # env — presence only; never reads message bodies
+  local env="$1"
+  local primary="german-social-outbox-$env"
+  local dlq="german-social-outbox-dlq-$env"
+  local listed
+  listed=$(cd leaderboard-worker && \
+    WRANGLER_LOG_PATH="/tmp/leaderboard-queues-$env.log" \
+    npx --prefix ../read-worker wrangler queues list 2>&1) \
+    || { echo "$listed" >&2; return 1; }
+  local missing=()
+  grep -Fq "$primary" <<<"$listed" || missing+=("$primary")
+  grep -Fq "$dlq" <<<"$listed" || missing+=("$dlq")
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo "❌ leaderboard-worker [$env]: missing Queue resource(s): ${missing[*]}" >&2
+    echo "   create explicitly with: scripts/provision-leaderboard-queues.sh $env" >&2
+    return 1
+  fi
+  echo "✅ leaderboard-worker [$env]: Queue resources present: $primary, $dlq"
 }
 
 deploy_and_verify() { # dir, env
@@ -153,6 +229,16 @@ apply_operational_schema() { # env
     --file=../schema/ops.sql $(env_flag "$env"))
 }
 
+apply_leaderboard_schema() { # env — migrations MUST precede Queue-aware code
+  local env="$1"
+  echo "── applying leaderboard D1 migrations → $env"
+  for binding in SOCIAL_DB ERASURE_DB PROJECTION_1; do
+    (cd leaderboard-worker && CI=true \
+      npx --prefix ../read-worker wrangler d1 migrations apply "$binding" \
+      --remote $(env_flag "$env"))
+  done
+}
+
 do_env() {
   local env="$1"
   if [[ "$env" == "prod" ]]; then
@@ -168,18 +254,51 @@ do_env() {
   fi
   WARN_NAMES=(); check_parity worker "$env" "${write_required[@]}"
   WARN_NAMES=(); check_parity leaderboard-worker "$env" "${lb_required[@]}"
+  verify_leaderboard_queue_config "$env"
+  (cd leaderboard-worker && npm run bindings:check)
+  check_queue_resources "$env"
   # Operational migrations land before the read worker can expose/use their
   # contract. The canonical schemas then make a fresh database complete while
   # remaining no-ops for existing objects.
   apply_operational_schema "$env"
   apply_content_schema "$env"
+  apply_leaderboard_schema "$env"
   deploy_and_verify read-worker "$env"
   deploy_and_verify worker "$env"
+  deploy_and_verify leaderboard-worker "$env"
+}
+
+do_leaderboard_env() {
+  local env="$1"
+  if [[ "$env" == "prod" ]]; then
+    if [[ -f PROD_FREEZE ]]; then
+      echo "❌ production deploys are frozen (see PROD_FREEZE). The cutover step lifts this." >&2
+      exit 1
+    fi
+    read -r -p "About to deploy leaderboard PRODUCTION. Type 'prod' to continue: " answer
+    [[ "$answer" == "prod" ]] || { echo "aborted" >&2; exit 1; }
+  fi
+  WARN_NAMES=(); check_parity leaderboard-worker "$env" "${lb_required[@]}"
+  verify_leaderboard_queue_config "$env"
+  (cd leaderboard-worker && npm run bindings:check)
+  check_queue_resources "$env"
+  apply_leaderboard_schema "$env"
   deploy_and_verify leaderboard-worker "$env"
 }
 
 case "${1:-}" in
   dev|prod) do_env "$1" ;;
   all) do_env dev; do_env prod ;;
-  *) echo "usage: scripts/deploy.sh <dev|prod|all>" >&2; exit 1 ;;
+  leaderboard-dev) do_leaderboard_env dev ;;
+  leaderboard-prod) do_leaderboard_env prod ;;
+  leaderboard-all) do_leaderboard_env dev; do_leaderboard_env prod ;;
+  check-queue-config)
+    [[ "${2:-}" == "dev" || "${2:-}" == "prod" ]] \
+      || { echo "usage: scripts/deploy.sh check-queue-config <dev|prod>" >&2; exit 1; }
+    verify_leaderboard_queue_config "$2"
+    ;;
+  *)
+    echo "usage: scripts/deploy.sh <dev|prod|all|leaderboard-dev|leaderboard-prod|leaderboard-all|check-queue-config ENV>" >&2
+    exit 1
+    ;;
 esac

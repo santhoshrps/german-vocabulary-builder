@@ -18,6 +18,7 @@ const suites = [
   "publish-policy.test.mjs",
   "board-policy.test.mjs",
   "deletion.test.mjs",
+  "outbox.test.mjs",
 ];
 
 const failures = [];

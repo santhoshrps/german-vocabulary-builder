@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "test": "node test/run-unit.mjs",
-    "typecheck": "npx --prefix ../read-worker tsc --noEmit -p tsconfig.json",
+    "bindings:check": "WRANGLER_LOG_PATH=/tmp/leaderboard-wrangler-types.log npx --prefix ../read-worker wrangler types worker-configuration.d.ts --check --env-interface GeneratedLeaderboardBindings --strict-vars=false --include-runtime=false --env=\"\"",
+    "typecheck": "npm run bindings:check && npx --prefix ../read-worker tsc --noEmit -p tsconfig.json",
     "itest": "node test/integration.mjs",
     "test:all": "npm test && npm run itest"
   }

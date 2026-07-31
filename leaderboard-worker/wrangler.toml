@@ -16,9 +16,12 @@
 # ERASURE_DB (deletion journal — never restored behind SOCIAL_DB), PROJECTION_1
 # (per-player day-state; PROJECTION_2+ created by assignment cap, never migrated).
 #
-# Queues: none yet — queue-less v1 (LB3-NFR-1b, owner 2026-07-25): the cron-driven
-# dispatcher executes outbox jobs directly on the free plan. On Workers Paid, add
-# german-social-outbox-{dev,prod} + …-dlq-{dev,prod} and their bindings here.
+# Queue policy (LB3-NFR-1b, owner 2026-07-26): every environment has an isolated
+# primary Queue and DLQ. D1 remains authoritative until terminal completion.
+# Batches of 5 and concurrency 2 bound D1 contention while allowing a slow Apple
+# revocation not to block cleanup. A 2-second batch timeout keeps erasure latency
+# low; five 60-second Queue retries cover transient faults before DLQ while the
+# 30-minute D1 dispatch lease independently recreates delivery.
 
 name = "german-vocabulary-leaderboard-worker"
 main = "src/index.ts"
@@ -31,23 +34,36 @@ compatibility_date = "2024-09-23"
 [[d1_databases]]
 binding = "SOCIAL_DB"
 database_name = "german-social-prod"
-database_id = "e2134886-f40a-4b59-8ecb-f8973b1a78f2"
+database_id = "5c9e8d17-7dc6-4b8e-a11c-6308298a19ad"
 migrations_dir = "migrations/social"
 
 [[d1_databases]]
 binding = "ERASURE_DB"
 database_name = "german-erasure-prod"
-database_id = "a7d20f19-dedb-4ca4-bf3e-76fe758919ce"
+database_id = "f9a8e719-88db-4981-82b5-66645050b0d7"
 migrations_dir = "migrations/erasure"
 
 [[d1_databases]]
 binding = "PROJECTION_1"
 database_name = "german-projection-1-prod"
-database_id = "a26e469d-f65d-4948-bdef-4b35ced34997"
+database_id = "883f9907-463b-47b9-9bef-ab50be6707e1"
 migrations_dir = "migrations/projection"
 
+[[queues.producers]]
+binding = "SOCIAL_OUTBOX"
+queue = "german-social-outbox-prod"
+
+[[queues.consumers]]
+queue = "german-social-outbox-prod"
+max_batch_size = 5
+max_batch_timeout = 2
+max_retries = 5
+retry_delay = 60
+max_concurrency = 2
+dead_letter_queue = "german-social-outbox-dlq-prod"
+
 [triggers]
-crons = ["*/15 * * * *"]  # outbox executor + cleanup; recovery cadence, not latency (NFR-1b)
+crons = ["*/15 * * * *"]  # D1→Queue recovery + aggregate health; never direct execution
 
 [observability]
 enabled = true
@@ -58,6 +74,7 @@ APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
 # Application tenant — the URL's first path segment. Later languages get their own
 # slug, bindings and databases; this value is never derived from a request.
 APP_SLUG = "german"
+SOCIAL_OUTBOX_QUEUE = "german-social-outbox-prod"
 # Invite links (owner decision 2026-07-25): learn-languages.app/german/join#<token>
 INVITE_LINK_BASE = "https://learn-languages.app/german/join"
 
@@ -83,6 +100,19 @@ database_name = "german-projection-1-dev"
 database_id = "dafe72ab-ec6d-4678-9578-01f64f48b822"
 migrations_dir = "migrations/projection"
 
+[[env.dev.queues.producers]]
+binding = "SOCIAL_OUTBOX"
+queue = "german-social-outbox-dev"
+
+[[env.dev.queues.consumers]]
+queue = "german-social-outbox-dev"
+max_batch_size = 5
+max_batch_timeout = 2
+max_retries = 5
+retry_delay = 60
+max_concurrency = 2
+dead_letter_queue = "german-social-outbox-dlq-dev"
+
 [env.dev.triggers]
 crons = ["*/15 * * * *"]
 
@@ -95,5 +125,6 @@ APP_BUNDLE_ID = "com.ramapurampalanivel.germanwords"
 # Application tenant — the URL's first path segment. Later languages get their own
 # slug, bindings and databases; this value is never derived from a request.
 APP_SLUG = "german"
+SOCIAL_OUTBOX_QUEUE = "german-social-outbox-dev"
 # Dev invite links ride the workers.dev origin (interim ruling 2026-07-25).
 INVITE_LINK_BASE = ""

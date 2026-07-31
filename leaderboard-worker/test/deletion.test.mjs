@@ -26,12 +26,13 @@ try {
   );
   const deletion = await import(join(out, "deletion.mjs"));
   const source = readFileSync(join(root, "src/deletion.ts"), "utf8");
+  const outboxSource = readFileSync(join(root, "src/outbox.ts"), "utf8");
   const erasureSchema = readFileSync(
     join(root, "migrations/erasure/0001_init.sql"), "utf8",
-  );
+  ) + readFileSync(join(root, "migrations/erasure/0002_queue_recovery.sql"), "utf8");
   const socialSchema = readFileSync(
     join(root, "migrations/social/0001_init.sql"), "utf8",
-  );
+  ) + readFileSync(join(root, "migrations/social/0004_queue_dispatch.sql"), "utf8");
 
   // Provider revocation credentials are randomized authenticated ciphertext.
   const env = { IDENTITY_HMAC_KEY_V1: "test-only-identity-secret" };
@@ -53,11 +54,19 @@ try {
   assert.match(erasureSchema, /capability_hash TEXT NOT NULL/);
   assert.match(erasureSchema, /erasure_markers/);
   assert.match(erasureSchema, /expires_at INTEGER NOT NULL/);
+  assert.match(erasureSchema, /ADD COLUMN revocation BLOB/);
+  assert.match(erasureSchema, /ADD COLUMN outbox_checked_at INTEGER/);
+  assert.match(erasureSchema, /idx_saga_outbox_recovery/);
+  assert.match(source, /revocation = coalesce\(excluded\.revocation, erasure_saga\.revocation\)/);
+  assert.match(source, /SET state = 'done'.*revocation = NULL/s,
+    "terminal erasure must drop the journaled provider credential");
 
   // The status capability is random, only its hash persists, expiry participates
   // in authorization and request-rate admission is bounded.
   assert.match(source, /randomToken\(32\)/);
   assert.match(source, /sha256Hex\(capability\)/);
+  assert.match(source, /capability_hash = excluded\.capability_hash/,
+    "a repeated request must return a capability whose hash was actually stored");
   assert.doesNotMatch(source, /deletionCapability:\s*capabilityHash/);
   const statusStart = source.indexOf("export async function handleDeleteStatus");
   const statusEnd = source.indexOf("// --- R9:", statusStart);
@@ -83,20 +92,31 @@ try {
     "moderation retention needs declared deidentification");
   assert.match(source, /DELETE FROM day_state WHERE player_id/);
 
-  // Queue is limited to cleanup/erasure, coalesced by dedup key and retries with
-  // a ceiling. Cleanup work itself must be chunk-bounded.
+  // Queue is limited to cleanup/erasure, coalesced by opaque dedup key and
+  // remains durable in D1 through terminal consumer completion.
   assert.match(socialSchema, /kind IN \('erasure', 'cleanup'\)/);
-  assert.match(source, /Math\.min\(3_600_000/);
-  assert.match(source, /outbox-stuck/);
-  assert.match(source, /LIMIT \?/,
-    "standing cleanup must be bounded; whole-table sweeps can monopolize D1");
+  for (const field of [
+    "dispatched_at", "dispatch_lease_until", "processing_lease_until",
+    "last_error_code", "completed_at",
+  ]) assert.match(socialSchema, new RegExp(field));
+  assert.match(source, /erasureDedupId/);
+  assert.doesNotMatch(source, /`erasure:\$\{ctx\.playerId\}`/);
+  assert.doesNotMatch(source, /runErasureStep\(env, ctx\.playerId\)/,
+    "request path must not execute the destructive saga inline");
+  assert.match(outboxSource, /SOCIAL_OUTBOX\.send/);
+  assert.match(outboxSource, /message\.ack\(\)/);
+  assert.match(outboxSource, /message\.retry/);
+  assert.match(outboxSource, /LIMIT \?2/g,
+    "every standing cleanup must be page-bounded");
+  assert.doesNotMatch(outboxSource, /neutralLog\([^\n;]*dedupId/,
+    "logs must not contain stable identifiers");
 
   // Restore-safety markers and terminal journal age together.
   assert.match(source, /state = 'done'/);
   assert.match(source, /completed_at/);
-  assert.match(source, /DELETE FROM erasure_saga WHERE expires_at < \?1 AND state = 'done'/);
+  assert.match(outboxSource, /DELETE FROM erasure_saga WHERE player_id IN/);
 
-  console.log("deletion.test OK — crypto, journal order, inventory, status, cleanup bounds");
+  console.log("deletion.test OK — crypto, journal order, Queue handoff, inventory, cleanup bounds");
 } finally {
   rmSync(out, { recursive: true, force: true });
 }

@@ -1,27 +1,29 @@
-// W5 — profile deletion (IDENT-5b saga S1–S6), status capability, export, and
-// the queue-less outbox executor (NFR-1b: the cron IS the dispatcher).
+// W5 — profile deletion (IDENT-5b saga S1–S6), status capability and export.
 //
 // The journal in ERASURE_DB commits BEFORE any destructive work; the 202 is
-// sent only after S1; every later step is idempotent and re-driven by the cron
-// until terminal. ERASURE_DB is never restored behind SOCIAL_DB (contract T10).
+// sent only after S1; every later step is idempotent and re-driven by the Queue
+// consumer until terminal. ERASURE_DB is never restored behind SOCIAL_DB
+// (contract T10).
 
 import { randomToken, sha256Hex } from "./crypto";
-import { blobBytes, blobText } from "./blob";
+import { blobBytes } from "./blob";
 import type { SessionContext } from "./auth";
 import type { Env } from "./index";
 import type { ErrorCode } from "./contract";
+import {
+  erasureDedupId, OUTBOX_ACTIVE_CAP, OUTBOX_ERASURE_ACTIVE_CAP,
+} from "./outbox-contract";
 
 const RECENT_AUTH_MS = 10 * 60_000;          // deletion needs a fresh provider proof
 const JOURNAL_RETENTION_MS = 400 * 86_400_000; // ≥ longest recovery source, then expires
-const EXECUTOR_BATCH = 10;
-const MAX_ATTEMPTS_BEFORE_ALERT = 20;        // visible via outbox age/attempts (DLQ role)
 const DELETE_STATUS_PER_HOUR = 30;           // bounds capability-hash probing on the status route
 
 type Result = { code: ErrorCode; data?: unknown };
+type DeleteResult = Result & { status?: number; dispatchDedupId?: string };
 
 // --- R10: DELETE /profile — S1 journal-first, then 202 -----------------------
 
-export async function handleDelete(env: Env, ctx: SessionContext): Promise<Result & { status?: number }> {
+export async function handleDelete(env: Env, ctx: SessionContext): Promise<DeleteResult> {
   // Online-only + recent authentication (RELY-7/IDENT-5b): the session's family
   // must have been minted by a FRESH provider exchange, not a long-lived refresh.
   const family = await env.SOCIAL_DB.prepare(
@@ -34,32 +36,65 @@ export async function handleDelete(env: Env, ctx: SessionContext): Promise<Resul
   const capability = randomToken(32);
   const capabilityHash = await sha256Hex(capability);
   const t = Date.now();
+  // Copy the already-encrypted provider credential into the stronger journal
+  // before SOCIAL_DB deletion. A crash after S3 can then still finish S5.
+  const credential = await env.SOCIAL_DB.prepare(
+    "SELECT revocation FROM credentials WHERE player_id = ?1").bind(ctx.playerId).first();
+  const encryptedRevocation = blobBytes(credential?.revocation);
 
   // S1 — journal + marker in ERASURE_DB, atomically, BEFORE anything destructive.
   await env.ERASURE_DB.batch([
     env.ERASURE_DB.prepare(
-      `INSERT INTO erasure_saga (player_id, state, capability_hash, steps, requested_at, updated_at, expires_at)
-       VALUES (?1, 'journaled', ?2, ?3, ?4, ?4, ?5)
-       ON CONFLICT (player_id) DO UPDATE SET updated_at = ?4`)
-      .bind(ctx.playerId, capabilityHash, new TextEncoder().encode("{}"), t, t + JOURNAL_RETENTION_MS),
+      `INSERT INTO erasure_saga
+         (player_id, state, capability_hash, steps, requested_at, updated_at, expires_at, revocation)
+       VALUES (?1, 'journaled', ?2, ?3, ?4, ?4, ?5, ?6)
+       ON CONFLICT (player_id) DO UPDATE SET
+         capability_hash = excluded.capability_hash,
+         updated_at = excluded.updated_at,
+         expires_at = excluded.expires_at,
+         revocation = coalesce(excluded.revocation, erasure_saga.revocation)`)
+      .bind(
+        ctx.playerId, capabilityHash, new TextEncoder().encode("{}"),
+        t, t + JOURNAL_RETENTION_MS, encryptedRevocation,
+      ),
     env.ERASURE_DB.prepare(
       `INSERT INTO erasure_markers (player_id, requested_at, expires_at) VALUES (?1, ?2, ?3)
-       ON CONFLICT (player_id) DO NOTHING`)
+       ON CONFLICT (player_id) DO UPDATE SET expires_at = excluded.expires_at`)
       .bind(ctx.playerId, t, t + JOURNAL_RETENTION_MS),
   ]);
 
-  // S2 — durable dispatch intent (the cron re-drives it until terminal).
-  await env.SOCIAL_DB.prepare(
-    `INSERT OR IGNORE INTO outbox (dedup_id, kind, payload, due_at, created_at)
-     VALUES (?1, 'erasure', ?2, ?3, ?3)`)
-    .bind(`erasure:${ctx.playerId}`, new TextEncoder().encode(ctx.playerId), t).run();
+  // S2 — bounded durable dispatch intent. If SOCIAL_DB is temporarily
+  // unavailable or at its active cap, S1 still owns the obligation and the
+  // scheduled journal recovery recreates this exact opaque deduplication id.
+  const dispatchDedupId = await erasureDedupId(env.IDENTITY_HMAC_KEY_V1, ctx.playerId);
+  try {
+    await env.SOCIAL_DB.prepare(
+      `INSERT OR IGNORE INTO outbox (dedup_id, kind, payload, due_at, created_at)
+       SELECT ?1, 'erasure', ?2, ?3, ?3
+       WHERE (SELECT count(*) FROM outbox WHERE completed_at IS NULL) < ?4
+         AND (SELECT count(*) FROM outbox
+              WHERE completed_at IS NULL AND kind = 'erasure') < ?5`)
+      .bind(
+        dispatchDedupId, new TextEncoder().encode(ctx.playerId),
+        t, OUTBOX_ACTIVE_CAP, OUTBOX_ERASURE_ACTIVE_CAP,
+      ).run();
+    await env.ERASURE_DB.prepare(
+      "UPDATE erasure_saga SET outbox_checked_at = ?2 WHERE player_id = ?1")
+      .bind(ctx.playerId, t).run();
+  } catch {
+    // Never leak the identifier or payload. S1 is durable and stronger than S2.
+    console.error(JSON.stringify({ component: "social-outbox", outcome: "s2-write-failed", kind: "erasure" }));
+  }
 
-  // Session dies with the revocation inside the erasure transaction; the
-  // capability keeps the status route honest afterwards. Best-effort inline
-  // attempt — the cron is the durability, never this call (RELY-1).
-  try { await runErasureStep(env, ctx.playerId); } catch { /* cron re-drives */ }
-
-  return { code: "OK", status: 202, data: { deletionCapability: capability, statusPath: "/v3/leaderboard/profile/delete-status" } };
+  return {
+    code: "OK",
+    status: 202,
+    dispatchDedupId,
+    data: {
+      deletionCapability: capability,
+      statusPath: "/v3/leaderboard/profile/delete-status",
+    },
+  };
 }
 
 // --- R11: delete-status by capability (works after the session is gone) ------
@@ -124,7 +159,7 @@ export async function handleExport(env: Env, ctx: SessionContext): Promise<Resul
   };
 }
 
-// --- the erasure saga steps (idempotent; re-driven by the cron) --------------
+// --- the erasure saga steps (idempotent; re-driven by the Queue consumer) ----
 
 async function sagaState(env: Env, playerId: string, state: string): Promise<void> {
   await env.ERASURE_DB.prepare(
@@ -134,67 +169,70 @@ async function sagaState(env: Env, playerId: string, state: string): Promise<voi
 
 export async function runErasureStep(env: Env, playerId: string): Promise<boolean> {
   const saga = await env.ERASURE_DB.prepare(
-    "SELECT state FROM erasure_saga WHERE player_id = ?").bind(playerId).first();
+    "SELECT state, revocation FROM erasure_saga WHERE player_id = ?").bind(playerId).first();
   if (!saga || saga.state === "done") return true;
 
-  // S5 first-half: read the revocation credential BEFORE the rows die.
-  const credential = await env.SOCIAL_DB.prepare(
-    "SELECT revocation FROM credentials WHERE player_id = ?").bind(playerId).first();
+  // If a previous delivery already reached the external step, do not repeat
+  // the full D1 deletion on every provider retry. Any earlier state replays S3
+  // and S4 because each transaction is independently idempotent.
+  if (String(saga.state) !== "external") {
+    // S3 — SOCIAL_DB erasure transaction: every inventoried row class with a
+    // player key (data-inventory.md; moderation reports deliberately retained
+    // under their own access-controlled schedule — inventory row 21).
+    await sagaState(env, playerId, "erasing");
+    await env.SOCIAL_DB.batch([
+      env.SOCIAL_DB.prepare("DELETE FROM friendships WHERE a = ?1 OR b = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM pair_state WHERE a = ?1 OR b = ?1").bind(playerId),
+      // Both ownership directions: an invite this player CONSUMED still carries
+      // their id in consumed_by, so erasing only inviter rows would retain the
+      // deleted player's identifier on every invite they accepted (audit).
+      env.SOCIAL_DB.prepare("DELETE FROM invites WHERE inviter = ?1 OR consumed_by = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM cheers WHERE from_player = ?1 OR to_player = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM blocks WHERE owner = ?1 OR target = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM mutes WHERE owner = ?1 OR target = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM e18_receipts WHERE player_id = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM e18_pairs WHERE a = ?1 OR b = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM duo_receipts WHERE player_id = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM awards_window WHERE player_id = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM spends WHERE player_id = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM checkpoints WHERE player_id = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM registers WHERE player_id = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM quotas WHERE player_id = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM idempotency WHERE player_id = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM refresh_sessions WHERE player_id = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM credentials WHERE player_id = ?1").bind(playerId),
+      // Moderation reports are RETAINED for abuse investigation (never deleted),
+      // but the deleting player's identity as reporter is scrubbed to a tombstone
+      // — retention WITH declared deidentification, so no live identifier of an
+      // erased account survives in the reporter column (§6.4; audit).
+      env.SOCIAL_DB.prepare("UPDATE moderation_reports SET reporter = 'erased' WHERE reporter = ?1").bind(playerId),
+      env.SOCIAL_DB.prepare("DELETE FROM players WHERE player_id = ?1").bind(playerId),
+    ]);
 
-  // S3 — SOCIAL_DB erasure transaction: every inventoried row class with a
-  // player key (data-inventory.md; moderation reports deliberately retained
-  // under their own access-controlled schedule — inventory row 21).
-  await sagaState(env, playerId, "erasing");
-  await env.SOCIAL_DB.batch([
-    env.SOCIAL_DB.prepare("DELETE FROM friendships WHERE a = ?1 OR b = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM pair_state WHERE a = ?1 OR b = ?1").bind(playerId),
-    // Both ownership directions: an invite this player CONSUMED still carries
-    // their id in consumed_by, so erasing only inviter rows would retain the
-    // deleted player's identifier on every invite they accepted (audit).
-    env.SOCIAL_DB.prepare("DELETE FROM invites WHERE inviter = ?1 OR consumed_by = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM cheers WHERE from_player = ?1 OR to_player = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM blocks WHERE owner = ?1 OR target = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM mutes WHERE owner = ?1 OR target = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM e18_receipts WHERE player_id = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM e18_pairs WHERE a = ?1 OR b = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM duo_receipts WHERE player_id = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM awards_window WHERE player_id = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM spends WHERE player_id = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM checkpoints WHERE player_id = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM registers WHERE player_id = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM quotas WHERE player_id = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM idempotency WHERE player_id = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM refresh_sessions WHERE player_id = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM credentials WHERE player_id = ?1").bind(playerId),
-    // Moderation reports are RETAINED for abuse investigation (never deleted),
-    // but the deleting player's identity as reporter is scrubbed to a tombstone
-    // — retention WITH declared deidentification, so no live identifier of an
-    // erased account survives in the reporter column (§6.4; audit).
-    env.SOCIAL_DB.prepare("UPDATE moderation_reports SET reporter = 'erased' WHERE reporter = ?1").bind(playerId),
-    env.SOCIAL_DB.prepare("DELETE FROM players WHERE player_id = ?1").bind(playerId),
-  ]);
-
-  // S4 — the player's projection shard.
-  await env.PROJECTION_1.prepare("DELETE FROM day_state WHERE player_id = ?").bind(playerId).run();
+    // S4 — the player's projection shard.
+    await env.PROJECTION_1.prepare("DELETE FROM day_state WHERE player_id = ?").bind(playerId).run();
+  }
 
   // S5 — provider revocation (App Store requirement). Runs only when the SIWA
   // key secrets and a stored credential exist; the outcome is recorded either
   // way — "skipped" is a visible state, never a silent hole.
   await sagaState(env, playerId, "external");
   let revocation = "skipped-no-credential";
-  const revocationBlob = blobBytes(credential?.revocation);
+  const revocationBlob = blobBytes(saga.revocation);
   if (revocationBlob && env.APPLE_SIWA_KEY_P8 && env.APPLE_SIWA_KEY_ID) {
     try {
       revocation = (await revokeAppleToken(env, revocationBlob)) ? "revoked" : "failed";
     } catch { revocation = "failed"; }
-    if (revocation === "failed") return false; // cron retries; attempts counted
+    if (revocation === "failed") return false; // Queue/D1 recovery retries; attempts counted
   }
 
   // S6 — terminal: tombstone the journal, complete the marker.
   const t = Date.now();
   await env.ERASURE_DB.batch([
     env.ERASURE_DB.prepare(
-      "UPDATE erasure_saga SET state = 'done', steps = ?2, updated_at = ?3 WHERE player_id = ?1")
+      `UPDATE erasure_saga
+       SET state = 'done', steps = ?2, updated_at = ?3, revocation = NULL
+       WHERE player_id = ?1`)
       .bind(playerId, new TextEncoder().encode(JSON.stringify({ revocation })), t),
     env.ERASURE_DB.prepare(
       "UPDATE erasure_markers SET completed_at = ?2 WHERE player_id = ?1").bind(playerId, t),
@@ -219,6 +257,7 @@ async function revokeAppleToken(env: Env, encryptedToken: Uint8Array): Promise<b
   const response = await fetch("https://appleid.apple.com/auth/revoke", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
+    signal: AbortSignal.timeout(10_000),
     body: new URLSearchParams({
       client_id: env.APP_BUNDLE_ID, client_secret: clientSecret,
       token, token_type_hint: "refresh_token",
@@ -296,53 +335,4 @@ async function revocationKey(env: Env): Promise<CryptoKey> {
   const material = await crypto.subtle.digest(
     "SHA-256", new TextEncoder().encode(`revocation|${env.IDENTITY_HMAC_KEY_V1}`));
   return crypto.subtle.importKey("raw", material, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
-}
-
-// --- the cron executor (queue-less v1: scan → execute → retry with backoff) --
-
-export async function runOutboxTick(env: Env): Promise<void> {
-  const now = Date.now();
-  const due = await env.SOCIAL_DB.prepare(
-    "SELECT dedup_id, kind, payload, attempts FROM outbox WHERE due_at <= ?1 ORDER BY due_at LIMIT ?2")
-    .bind(now, EXECUTOR_BATCH).all();
-  for (const job of due.results ?? []) {
-    const dedupId = String(job.dedup_id);
-    let done = false;
-    try {
-      if (job.kind === "erasure") {
-        done = await runErasureStep(env, blobText(job.payload) ?? "");
-      } else {
-        done = await runCleanup(env);
-      }
-    } catch (error) {
-      console.error(JSON.stringify({ outbox: dedupId, error: String(error) }));
-    }
-    if (done) {
-      await env.SOCIAL_DB.prepare("DELETE FROM outbox WHERE dedup_id = ?").bind(dedupId).run();
-    } else {
-      const attempts = Number(job.attempts) + 1;
-      const backoffMs = Math.min(3_600_000, 60_000 * 2 ** Math.min(attempts, 6));
-      await env.SOCIAL_DB.prepare(
-        "UPDATE outbox SET attempts = ?2, due_at = ?3 WHERE dedup_id = ?1")
-        .bind(dedupId, attempts, now + backoffMs).run();
-      if (attempts >= MAX_ATTEMPTS_BEFORE_ALERT) {
-        // The DLQ role (queue-less v1): a stuck job is loud, never silent.
-        console.error(JSON.stringify({ alert: "outbox-stuck", dedupId, attempts }));
-      }
-    }
-  }
-  // Standing cleanup sweeps ride every tick, bounded.
-  await runCleanup(env);
-}
-
-async function runCleanup(env: Env): Promise<boolean> {
-  const now = Date.now();
-  await env.SOCIAL_DB.batch([
-    env.SOCIAL_DB.prepare("UPDATE invites SET state = 'expired' WHERE state = 'pending' AND expires_at < ?1").bind(now),
-    env.SOCIAL_DB.prepare("DELETE FROM nonces WHERE expires_at < ?1").bind(now),
-    env.SOCIAL_DB.prepare("DELETE FROM idempotency WHERE expires_at < ?1").bind(now),
-    env.SOCIAL_DB.prepare("DELETE FROM refresh_sessions WHERE revoked = 1 AND rotated_at < ?1").bind(now - 30 * 86_400_000),
-  ]);
-  await env.ERASURE_DB.prepare("DELETE FROM erasure_saga WHERE expires_at < ?1 AND state = 'done'").bind(now).run();
-  return true;
 }

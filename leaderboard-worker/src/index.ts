@@ -20,23 +20,16 @@ import {
   handleReceiptAck, handleReceiptsList, handleRemove, handleReport,
   handleUnblock, withIdempotency,
 } from "./social";
-import { handleDelete, handleDeleteStatus, handleExport, runOutboxTick } from "./deletion";
+import { handleDelete, handleDeleteStatus, handleExport } from "./deletion";
+import {
+  consumeOutboxBatch, dispatchOutboxByDedupId, runOutboxMaintenance,
+} from "./outbox";
+import type { SocialOutboxMessage } from "./outbox-contract";
 import { APP_STORE_BADGE_SVG } from "./app-store-badge";
 
-export interface Env {
-  SOCIAL_DB: D1Database;
-  ERASURE_DB: D1Database;
-  PROJECTION_1: D1Database;
-  ENV_NAME: string;
-  APP_BUNDLE_ID: string;
-  /** This deployment's application tenant — the URL's first path segment
-   *  ("german"; later "spanish", …). Every token, storage namespace, quota key and
-   *  log line is scoped by it. Declared per environment in wrangler.toml and NEVER
-   *  derived from a request path or client header: a request selects a backend, it
-   *  does not get to say which app's data that backend serves. */
-  APP_SLUG: string;
-  SOCIAL_JWT_SECRET: string;
-  IDENTITY_HMAC_KEY_V1: string;
+export interface Env extends GeneratedLeaderboardBindings {
+  SOCIAL_OUTBOX: Queue<SocialOutboxMessage>;
+  /** Optional deploy/runtime values that are intentionally absent from static config. */
   DEPLOY_VERSION?: string;
   APP_TEAM_ID?: string;
   /** SIWA key (owner-provisioned secrets) — S5 revocation + code exchange. */
@@ -45,11 +38,15 @@ export interface Env {
   /** Optional capability overrides (NFR-10b). */
   CAPABILITY_STATE?: string; // healthy | maintenance | disabled
   MIN_BUILD?: string;
-  /** Prod: https://learn-languages.app/german/join (owner 2026-07-25); dev: "" → worker origin. */
-  INVITE_LINK_BASE?: string;
 }
 
-type Handler = (request: Request, env: Env, requestId: string, ctx: SessionContext | null) => Promise<Response>;
+type Handler = (
+  request: Request,
+  env: Env,
+  requestId: string,
+  ctx: SessionContext | null,
+  executionContext: ExecutionContext,
+) => Promise<Response>;
 
 const STATUS: Partial<Record<ErrorCode, number>> = {
   OK: 200,
@@ -140,18 +137,29 @@ function guardRequestBody(text: string, maxBytes: number): ErrorCode | null {
 const health: Handler = async (_request, env, requestId) => {
   const missing: string[] = [];
   const probes: Array<[string, D1Database, string]> = [
-    ["SOCIAL_DB", env.SOCIAL_DB, "players"],
-    ["ERASURE_DB", env.ERASURE_DB, "erasure_saga"],
-    ["PROJECTION_1", env.PROJECTION_1, "day_state"],
+    ["SOCIAL_DB.players", env.SOCIAL_DB, "SELECT count(*) AS n FROM players"],
+    [
+      "SOCIAL_DB.outbox_queue_fields",
+      env.SOCIAL_DB,
+      "SELECT dispatch_lease_until, processing_lease_until, completed_at FROM outbox LIMIT 1",
+    ],
+    [
+      "ERASURE_DB.erasure_saga_queue_fields",
+      env.ERASURE_DB,
+      "SELECT revocation FROM erasure_saga LIMIT 1",
+    ],
+    ["PROJECTION_1.day_state", env.PROJECTION_1, "SELECT count(*) AS n FROM day_state"],
   ];
-  for (const [name, db, table] of probes) {
+  for (const [name, db, sql] of probes) {
     try {
       if (!db) throw new Error("binding absent");
-      await db.prepare(`SELECT count(*) AS n FROM ${table}`).first();
+      await db.prepare(sql).first();
     } catch {
-      missing.push(`${name}.${table}`);
+      missing.push(name);
     }
   }
+  if (!env.SOCIAL_OUTBOX) missing.push("SOCIAL_OUTBOX");
+  if (!env.SOCIAL_OUTBOX_QUEUE) missing.push("SOCIAL_OUTBOX_QUEUE");
   if (!env.ENV_NAME) missing.push("ENV_NAME");
   // A deployment with no APP_SLUG would compare an absent token claim against an
   // absent config value and PASS — the silent-default hazard. The request path
@@ -232,8 +240,19 @@ const HANDLERS: Partial<Record<string, Handler>> = {
   R24: async (_request, env, requestId, ctx) => fromResult(requestId, await handleReceiptsList(env, ctx!)),
   R25: mutation("e18/ack", (body, env, ctx) => handleReceiptAck(body, env, ctx)),
   R9: async (_request, env, requestId, ctx) => fromResult(requestId, await handleExport(env, ctx!)),
-  R10: async (_request, env, requestId, ctx) => {
+  R10: async (_request, env, requestId, ctx, executionContext) => {
     const result = await handleDelete(env, ctx!);
+    if (result.dispatchDedupId) {
+      executionContext.waitUntil(
+        dispatchOutboxByDedupId(env, result.dispatchDedupId).catch(() => {
+          console.error(JSON.stringify({
+            component: "social-outbox",
+            outcome: "request-dispatch-failed",
+            kind: "erasure",
+          }));
+        }),
+      );
+    }
     if (result.status === 202) {
       return new Response(JSON.stringify({ v: SCHEMA_VERSION, requestId, code: "OK", data: result.data }), {
         status: 202, headers: { "content-type": "application/json" },
@@ -496,14 +515,14 @@ async function authorize(
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, executionContext: ExecutionContext): Promise<Response> {
     const requestId = crypto.randomUUID();
     try {
       const url = new URL(request.url);
       // Root /health is the deploy pipeline's wire-verify convention (shared with the
       // read worker); the same handler also answers at the contract's R2 path.
       if (url.pathname === "/health" && request.method === "GET") {
-        return health(request, env, requestId, null);
+        return health(request, env, requestId, null, executionContext);
       }
       // Invite web surface (owner 2026-07-25: learn-languages.app/german/join#<token>):
       // the landing page for the not-yet-installed case and the Universal Links
@@ -544,21 +563,28 @@ export default {
 
       const handler = HANDLERS[route.id];
       if (!handler) return envelope(requestId, "NOT_IMPLEMENTED");
-      return await handler(request, env, requestId, ctx);
+      return await handler(request, env, requestId, ctx, executionContext);
     } catch (error) {
       console.error(JSON.stringify({ requestId, outcome: "INTERNAL", error: String(error) }));
       return envelope(requestId, "INTERNAL");
     }
   },
 
-  // Queue-less v1 (LB3-NFR-1b): the cron IS the outbox dispatcher — it drains
-  // due erasure jobs (idempotent saga steps, exponential backoff, loud when
-  // stuck) and runs the bounded cleanup sweeps.
+  // Recovery only: recreate missing S2 intents, enqueue due/lease-expired D1
+  // rows, age terminal rows and emit aggregate health. It never executes jobs.
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     try {
-      await runOutboxTick(env);
-    } catch (error) {
-      console.error(JSON.stringify({ cron: "tick-failed", env: env.ENV_NAME, error: String(error) }));
+      await runOutboxMaintenance(env);
+    } catch {
+      console.error(JSON.stringify({
+        component: "social-outbox",
+        outcome: "maintenance-failed",
+        env: env.ENV_NAME,
+      }));
     }
+  },
+
+  async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
+    await consumeOutboxBatch(batch, env);
   },
 } satisfies ExportedHandler<Env>;
